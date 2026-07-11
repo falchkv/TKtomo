@@ -52,7 +52,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--outputs",
         nargs="+",
         default=["attenuation"],
-        choices=["attenuation", "phase", "complex"],
+        choices=["attenuation", "phase", "intensity", "complex"],
         help="Quantities to return (any combination).",
     )
     parser.add_argument(

@@ -21,11 +21,20 @@ from __future__ import annotations
 import numpy as np
 
 from tktomo.blender_sim import scene as scene_layer
-from tktomo.blender_sim.multislice import projection_outputs
+from tktomo.blender_sim.multislice import (
+    detector_wave,
+    projection_outputs,
+    wave_outputs,
+)
 
 IMAGE_NAME = "xray_projection"
 DEFAULT_ENERGY_KEV = 17.0
 DEFAULT_RESOLUTION = 128
+DEFAULT_OUTPUT = "attenuation"  # or "phase" / "intensity"
+DEFAULT_METHOD = "fresnel"
+DEFAULT_DISTANCE = 0.05  # exit-wave → detector hop, metres
+DEFAULT_SLICE_SPACING = 0.0  # 0 = single slab (projection approximation)
+DEFAULT_R1 = 0.5  # source→sample distance for fresnel_scaling, metres
 
 _live = False
 _dirty = False
@@ -35,19 +44,45 @@ _updating = False
 def compute_projection(
     energy_kev: float = DEFAULT_ENERGY_KEV,
     resolution: int = DEFAULT_RESOLUTION,
+    output: str = DEFAULT_OUTPUT,
+    propagate: bool = False,
+    method: str = DEFAULT_METHOD,
+    distance: float = DEFAULT_DISTANCE,
+    slice_spacing: float | None = None,
+    method_kwargs: dict | None = None,
 ) -> np.ndarray:
-    """Attenuation projection (∫μ dz) of the scene at its current pose.
+    """Projection of the scene at its current pose: ``output`` map, real-valued.
 
-    Field of view and pixel grid come from the active camera's intrinsics, so the
-    image matches a camera render at this resolution — frame with the camera
-    (ortho scale / focal length), not with a pixel-size parameter.
+    ``output`` is ``"attenuation"`` (∫μ dz), ``"phase"`` (φ) or ``"intensity"``
+    (|ψ|², what a detector measures — the right view of a propagated wave). Without
+    ``propagate`` these are the exact projected line integrals; with it, the wave
+    is multislice-propagated (slab thickness ``slice_spacing``; ``None``/0 =
+    single slab) and carried to the detector over ``distance`` by the propagator
+    named ``method`` (see ``available_propagators()``), and the map is read off
+    the detector field (phase wrapped). Field of view and pixel grid come from
+    the active camera's intrinsics, so the image matches a camera render at this
+    resolution — frame with the camera, not with a pixel-size parameter.
     """
+    slice_spacing = slice_spacing or None  # 0 means single slab
     slab_delta, slab_beta = scene_layer.extract_slab_integrals(
-        detector_shape=(resolution, resolution)
+        detector_shape=(resolution, resolution),
+        slice_spacing=slice_spacing if propagate else None,
     )
-    return projection_outputs(
-        slab_delta.sum(axis=0), slab_beta.sum(axis=0), energy_kev, ("attenuation",)
-    )["attenuation"]
+    if not propagate:
+        return projection_outputs(
+            slab_delta.sum(axis=0), slab_beta.sum(axis=0), energy_kev, (output,)
+        )[output]
+    psi = detector_wave(
+        slab_delta,
+        slab_beta,
+        energy_kev=energy_kev,
+        pixel_size=scene_layer.camera_pixel_size((resolution, resolution)),
+        slice_spacing=slice_spacing,
+        distance=distance,
+        method=method,
+        method_kwargs=method_kwargs,
+    )
+    return wave_outputs(psi, (output,))[output]
 
 
 def to_image(array: np.ndarray, name: str = IMAGE_NAME):
@@ -161,29 +196,38 @@ def setup_viewer_layout() -> str:
     return "no Image Editor available for the viewer layout"
 
 
-def _settings() -> tuple[float, int]:
-    """Panel fields when registered, module defaults otherwise."""
+def _settings() -> dict:
+    """compute_projection kwargs from the panel fields (module defaults if absent)."""
     import bpy
 
     wm = bpy.context.window_manager
-    energy = float(getattr(wm, "tktomo_energy_kev", DEFAULT_ENERGY_KEV))
-    resolution = int(getattr(wm, "tktomo_resolution", DEFAULT_RESOLUTION))
-    return energy, resolution
+    method = str(getattr(wm, "tktomo_method", DEFAULT_METHOD))
+    kwargs = {
+        "energy_kev": float(getattr(wm, "tktomo_energy_kev", DEFAULT_ENERGY_KEV)),
+        "resolution": int(getattr(wm, "tktomo_resolution", DEFAULT_RESOLUTION)),
+        "output": str(getattr(wm, "tktomo_output", DEFAULT_OUTPUT)),
+        "propagate": bool(getattr(wm, "tktomo_propagate", False)),
+        "method": method,
+        "distance": float(getattr(wm, "tktomo_distance", DEFAULT_DISTANCE)),
+        "slice_spacing": float(getattr(wm, "tktomo_slice_spacing", DEFAULT_SLICE_SPACING)),
+    }
+    if method == "fresnel_scaling":
+        kwargs["method_kwargs"] = {"r1": float(getattr(wm, "tktomo_r1", DEFAULT_R1))}
+    return kwargs
 
 
-def show_projection(
-    energy_kev: float | None = None, resolution: int | None = None
-) -> np.ndarray:
-    """Compute the current-pose projection and display it; returns the array."""
+def show_projection(**overrides) -> np.ndarray:
+    """Compute the current-pose projection and display it; returns the array.
+
+    Settings come from the "X-ray Sim" panel fields (or module defaults);
+    keyword ``overrides`` are passed through to :func:`compute_projection`.
+    """
     global _updating
 
-    default_energy, default_resolution = _settings()
+    settings = {**_settings(), **overrides}
     _updating = True
     try:
-        projection = compute_projection(
-            energy_kev if energy_kev is not None else default_energy,
-            resolution if resolution is not None else default_resolution,
-        )
+        projection = compute_projection(**settings)
         ensure_image_editor(to_image(projection))
     finally:
         _updating = False
@@ -191,6 +235,17 @@ def show_projection(
 
 
 # -- live update ---------------------------------------------------------------
+
+
+def notify_settings_changed() -> None:
+    """Mark the projection dirty after a panel-setting edit.
+
+    WindowManager property edits never enter the depsgraph, so the depsgraph
+    handler cannot see them — the panel's ``update=`` callbacks call this instead.
+    The live timer picks it up on its next tick (no-op while live update is off).
+    """
+    global _dirty
+    _dirty = True
 
 
 def _mark_dirty(scene, depsgraph) -> None:  # depsgraph_update_post handler

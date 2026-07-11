@@ -243,18 +243,26 @@ def test_multislice_rejects_far_field_slab_kernel():
 def test_projection_outputs_match_wave_outputs_for_small_phase():
     delta_dz = np.full((8, 8), 1e-12)  # small enough that −arg ψ does not wrap
     beta_dz = np.full((8, 8), 1e-12)
-    direct = projection_outputs(delta_dz, beta_dz, ENERGY, ("attenuation", "phase", "complex"))
-    from_wave = wave_outputs(direct["complex"], ("attenuation", "phase"))
+    direct = projection_outputs(
+        delta_dz, beta_dz, ENERGY, ("attenuation", "phase", "intensity", "complex")
+    )
+    from_wave = wave_outputs(direct["complex"], ("attenuation", "phase", "intensity"))
     np.testing.assert_allclose(direct["attenuation"], from_wave["attenuation"], rtol=1e-9)
     np.testing.assert_allclose(direct["phase"], from_wave["phase"], rtol=1e-9)
+    np.testing.assert_allclose(direct["intensity"], from_wave["intensity"], rtol=1e-9)
     k = wavenumber(ENERGY)
     np.testing.assert_allclose(direct["attenuation"], 2 * k * beta_dz)
     np.testing.assert_allclose(direct["phase"], k * delta_dz)
+    # intensity is the squared amplitude = Beer–Lambert transmittance
+    np.testing.assert_allclose(direct["intensity"], np.exp(-2 * k * beta_dz))
+    np.testing.assert_allclose(
+        from_wave["intensity"], np.abs(direct["complex"]) ** 2, rtol=1e-12
+    )
 
 
 def test_outputs_selector_rejects_unknown_and_empty():
     with pytest.raises(ValueError):
-        projection_outputs(np.zeros((2, 2)), np.zeros((2, 2)), ENERGY, ("intensity",))
+        projection_outputs(np.zeros((2, 2)), np.zeros((2, 2)), ENERGY, ("transmission",))
     with pytest.raises(ValueError):
         wave_outputs(np.ones((2, 2), dtype=complex), ())
 

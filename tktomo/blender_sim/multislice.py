@@ -29,7 +29,7 @@ from tktomo.blender_sim.materials import wavelength, wavenumber
 from tktomo.blender_sim.propagation import get_propagator
 
 #: Quantities the output selector can return, in any combination.
-VALID_OUTPUTS = ("attenuation", "phase", "complex")
+VALID_OUTPUTS = ("attenuation", "phase", "intensity", "complex")
 
 
 def _validate_outputs(outputs: tuple[str, ...]) -> tuple[str, ...]:
@@ -141,6 +141,7 @@ def wave_outputs(
     - ``attenuation`` — absorbance ∫μ dz recovered as −2·ln|ψ|;
     - ``phase`` — accumulated phase φ = −arg ψ (wrapped to (−π, π]; for unwrapped
       values without propagation use :func:`projection_outputs`);
+    - ``intensity`` — |ψ|², what a detector measures (shows propagation fringes);
     - ``complex`` — the field itself.
     """
     outputs = _validate_outputs(outputs)
@@ -151,6 +152,8 @@ def wave_outputs(
         result["attenuation"] = -2.0 * np.log(np.clip(magnitude, np.finfo(float).tiny, None))
     if "phase" in outputs:
         result["phase"] = -np.angle(psi_det)
+    if "intensity" in outputs:
+        result["intensity"] = np.abs(psi_det) ** 2
     if "complex" in outputs:
         result["complex"] = psi_det
     return result
@@ -166,6 +169,7 @@ def projection_outputs(
 
     - ``attenuation`` — ∫μ dz = 2k·∫β dz;
     - ``phase`` — φ = k·∫δ dz;
+    - ``intensity`` — Beer–Lambert transmittance exp(−∫μ dz) = |ψ_exit|²;
     - ``complex`` — the exit wave exp(−½∫μ dz − iφ).
     """
     outputs = _validate_outputs(outputs)
@@ -175,6 +179,8 @@ def projection_outputs(
         result["attenuation"] = 2.0 * k * np.asarray(beta_dz)
     if "phase" in outputs:
         result["phase"] = k * np.asarray(delta_dz)
+    if "intensity" in outputs:
+        result["intensity"] = np.exp(-2.0 * k * np.asarray(beta_dz))
     if "complex" in outputs:
         result["complex"] = exit_wave(delta_dz, beta_dz, energy_kev)
     return result

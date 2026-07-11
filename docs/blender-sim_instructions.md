@@ -113,10 +113,16 @@ Any closed mesh becomes part of the simulation once it is tagged and parented to
    An **"X-ray Sim"** tab appears in the 3D-viewport sidebar (``N``): set default
    δ/β, select meshes, click *Include selected*. The active body's δ/β stay
    editable there, *Exclude active* removes it, and the panel lists everything
-   currently included. Its **Projection** section (energy / resolution) shows the
-   current-pose projection in an Image Editor — *Project now* for a manual
-   update, *Live update* to re-project automatically whenever the sample or its
-   pose changes.
+   currently included. Its **Projection** section shows the current-pose
+   projection in an Image Editor — *Project now* for a manual update, *Live
+   update* to re-project automatically whenever the sample, its pose, or the
+   camera changes; panel-setting edits also re-project live. Fields: energy,
+   resolution, **output** (attenuation / phase / intensity — enabling Propagate
+   switches to intensity, what a detector sees) and an optional **Propagate**
+   stage with the **method** dropdown enumerated
+   from the propagator registry (fresnel, angular_spectrum, fraunhofer,
+   fresnel_scaling), detector distance, multislice Δz, and r1 for
+   fresnel_scaling.
 
 2. **One call for the selection** (scripting window / MCP):
 
@@ -224,6 +230,9 @@ combination is allowed:
 - **accumulated phase** — φ = (2π/λ)·∫δ dz. Taken as −arg(ψ_det) (wrapped) when
   propagation is on, equal to the direct — unwrapped — line integral when off.
 - **both** — attenuation and accumulated phase together.
+- **intensity** — |ψ_det|², the transmitted intensity a detector measures. Equal to
+  the Beer–Lambert transmittance exp(−∫μ dz) when propagation is off; with
+  propagation it carries the edge-enhanced fringes.
 - **complex** — the complex field ψ_det itself: the physical exit wave
   exp(−½·∫μ dz + i·φ), or the propagated detector field when multislice propagation is
   enabled.
