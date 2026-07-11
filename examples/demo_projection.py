@@ -9,8 +9,9 @@ What it does:
 1. Uses the scene's tagged sample bodies (see :mod:`tktomo.blender_sim.scene`); if
    none exist, builds the built-in demo scene (cube + sphere) first.
 2. Rotates the sample to ``ANGLE`` and simulates one attenuation projection
-   (∫μ dz) through the full :func:`~tktomo.blender_sim.runner.simulate` pipeline,
-   with the detector auto-fitted to the sample bounds.
+   (∫μ dz) through the full :func:`~tktomo.blender_sim.runner.simulate` pipeline;
+   the field of view and pixel grid come from the camera intrinsics, matching a
+   render exactly.
 3. Displays it via :mod:`tktomo.blender_sim.viewer` as the ``xray_projection``
    image in an Image Editor; in ``blender --background`` mode it saves
    ``xray_projection.png`` instead.
@@ -22,6 +23,11 @@ For interactive use, prefer the "X-ray Sim" sidebar panel's Projection section
 from __future__ import annotations
 
 import os
+import sys
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:  # make tktomo importable from Blender's Python
+    sys.path.insert(0, _REPO_ROOT)
 
 import numpy as np
 
@@ -42,15 +48,14 @@ def main() -> None:
         xscene.build_demo_scene()
         bodies = xscene.bodies()
 
-    pixel_size = viewer.auto_pixel_size(RESOLUTION)
     results = simulate(
         np.array([ANGLE]),
         energy_kev=ENERGY_KEV,
-        pixel_size=pixel_size,
         detector_shape=(RESOLUTION, RESOLUTION),
         outputs=("attenuation",),
     )
     projection = results["attenuation"].projection(0)
+    pixel_size = results["attenuation"].metadata["pixel_size"]
     image = viewer.to_image(projection)
     if bpy.app.background:
         path = os.path.abspath(f"{viewer.IMAGE_NAME}.png")

@@ -73,8 +73,8 @@ def simulate(
     orientations: Any,
     *,
     energy_kev: float,
-    pixel_size: float,
     detector_shape: tuple[int, int] = (64, 64),
+    pixel_size: float | None = None,
     outputs: tuple[str, ...] = ("attenuation",),
     propagate: bool = False,
     slice_spacing: float | None = None,
@@ -90,9 +90,13 @@ def simulate(
     sample Empty is rotated, per-slab line integrals are extracted, and the physics
     produces the selected outputs.
 
-    ``pixel_size`` is the detector pixel pitch in metres. With
-    ``method="fresnel_scaling"`` the physics runs on the demagnified sample-plane
-    grid (pitch ``pixel_size / M``) per the Fresnel scaling theorem.
+    The field of view and pixel grid come from the **camera intrinsics** (ortho
+    scale, or focal length/sensor for cone beams), exactly matching a render at
+    ``detector_shape`` resolution. ``pixel_size`` (sample-plane pitch, metres,
+    used by the propagation physics) is derived from the camera when ``None``;
+    pass a value only to override it. For cone beams the camera-derived grid is
+    already the demagnified sample-plane grid, so ``fresnel_scaling`` uses it
+    directly.
 
     Returns one :class:`ProjectionData` per requested output, with the orientation
     stack, energy and geometry recorded in metadata. Without ``propagate`` the
@@ -102,18 +106,14 @@ def simulate(
 
     matrices, angles = normalize_orientations(orientations)
     kwargs = dict(method_kwargs or {})
-    physics_pixel_size = pixel_size
-    if propagate and method == "fresnel_scaling" and "r1" in kwargs:
-        r2 = kwargs.get("r2", distance)
-        magnification = (kwargs["r1"] + r2) / kwargs["r1"]
-        physics_pixel_size = pixel_size / magnification
+    if pixel_size is None:
+        pixel_size = scene_layer.camera_pixel_size(detector_shape)
 
     stacks: dict[str, list[np.ndarray]] = {name: [] for name in outputs}
     for matrix in matrices:
         scene_layer.set_sample_orientation(matrix)
         slab_delta_dz, slab_beta_dz = scene_layer.extract_slab_integrals(
             detector_shape=detector_shape,
-            pixel_size=pixel_size,
             slice_spacing=slice_spacing if propagate else None,
         )
         if propagate:
@@ -121,7 +121,7 @@ def simulate(
                 slab_delta_dz,
                 slab_beta_dz,
                 energy_kev=energy_kev,
-                pixel_size=physics_pixel_size,
+                pixel_size=pixel_size,
                 slice_spacing=slice_spacing,
                 distance=distance,
                 method=method,

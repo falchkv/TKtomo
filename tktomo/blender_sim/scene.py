@@ -1,4 +1,4 @@
-"""Blender scene layer: fixed camera/source, rotating sample, slab extraction.
+"""Blender scene layer: fixed camera, rotating sample, camera-matched extraction.
 
 This is the only module that touches ``bpy`` / ``mathutils``, and both are imported
 **lazily inside functions** so ``import tktomo.blender_sim.scene`` stays safe in a
@@ -6,22 +6,26 @@ Blender-free environment.
 
 Geometry convention (all lengths metres, Blender's default unit):
 
-- The beam travels along **−Y**: the source sits at +Y, the camera (detector) at
-  ``(0, −camera_distance, 0)`` looking toward the origin, up = +Z. Camera type picks
-  the beam: orthographic = parallel, perspective = cone (with an ``xray_source``
-  point at ``(0, +source_distance, 0)``).
+- The camera is the detector and defines the whole ray geometry, exactly as a
+  render would: **orthographic** = parallel beam with field of view =
+  ``ortho_scale``; **perspective** = cone beam whose apex is the camera pinhole,
+  with the field of view from the focal length / sensor (``camera.data.angle``).
+  The default setup puts it at ``(0, −camera_distance, 0)`` looking at the origin,
+  up = +Z, so the beam axis is Y.
 - All sample bodies are parented to the ``sample_root`` Empty at the world origin
-  and rotate as one rigid group; the camera and source never move. The root's
-  rotation mode is **ZYX** (Z applied first), so its X/Y euler values tilt the scan
-  axis and Z rotates about that tilted axis — hand-editing the root in Blender and
-  the API's ``(x_tilt, y_tilt, scan)`` Euler input behave identically.
+  and rotate as one rigid group; the camera never moves. The root's rotation mode
+  is **ZYX** (Z applied first), so its X/Y euler values tilt the scan axis and Z
+  rotates about that tilted axis — hand-editing the root in Blender and the API's
+  ``(x_tilt, y_tilt, scan)`` Euler input behave identically.
 - Bodies carry their optical constants as custom properties ``xray_delta`` /
   ``xray_beta`` (set via :func:`add_body`).
 
-Extraction ray-casts one ray per detector pixel through the evaluated scene and
-accumulates per-body path lengths, binned into slabs of ``slice_spacing`` along the
-beam axis. It is exact for closed meshes but O(pixels × crossings) with per-hit
-Python overhead — keep detectors modest (≲128²) for interactive use.
+Extraction samples one ray per detector pixel — **the same rays a camera render
+uses** (assuming zero lens shift and square pixel aspect) — casts it through the
+evaluated scene and accumulates per-body path lengths, binned into slabs of
+``slice_spacing`` along the camera view axis. It is exact for closed meshes but
+O(pixels × crossings) with per-hit Python overhead — keep detectors modest
+(≲128²) for interactive use.
 """
 
 from __future__ import annotations
@@ -34,7 +38,6 @@ from tktomo.blender_sim.materials import Material, beta_from_mu
 
 SAMPLE_ROOT = "sample_root"
 CAMERA = "xray_camera"
-SOURCE = "xray_source"
 PROP_DELTA = "xray_delta"
 PROP_BETA = "xray_beta"
 
@@ -42,16 +45,17 @@ PROP_BETA = "xray_beta"
 def setup_scene(
     beam: str = "parallel",
     camera_distance: float = 0.5,
-    source_distance: float = 0.5,
     detector_width: float = 0.1,
     clear: bool = True,
 ):
     """Create the fixed acquisition geometry; returns the ``sample_root`` Empty.
 
     ``beam`` is ``"parallel"`` (orthographic camera) or ``"cone"`` (perspective
-    camera plus an ``xray_source`` Empty). ``detector_width`` only sizes the camera
-    view (ortho scale / field of view) for visual inspection — the extraction uses
-    the explicit pixel grid, not the render.
+    camera — its pinhole is the cone apex). ``detector_width`` is the field of
+    view at the sample plane (through the origin) for both beam types; for cone
+    it sets the focal angle as ``2·atan(detector_width / (2·camera_distance))``.
+    The extraction derives its ray grid from these camera intrinsics, so the
+    projection matches a render exactly.
     """
     import bpy
 
@@ -69,19 +73,12 @@ def setup_scene(
         camera_data.ortho_scale = detector_width
     else:
         camera_data.type = "PERSP"
-        camera_data.angle = 2.0 * math.atan(
-            0.5 * detector_width / (camera_distance + source_distance)
-        )
+        camera_data.angle = 2.0 * math.atan(0.5 * detector_width / camera_distance)
     camera = bpy.data.objects.new(CAMERA, camera_data)
     camera.location = (0.0, -camera_distance, 0.0)
     camera.rotation_euler = (math.pi / 2.0, 0.0, 0.0)  # look along +Y, up = +Z
     bpy.context.collection.objects.link(camera)
     bpy.context.scene.camera = camera
-
-    if beam == "cone":
-        source = bpy.data.objects.new(SOURCE, None)
-        source.location = (0.0, source_distance, 0.0)
-        bpy.context.collection.objects.link(source)
 
     bpy.context.view_layer.update()
     return root
@@ -212,16 +209,59 @@ def _bodies():
     return tagged
 
 
-def _sample_y_bounds(depsgraph, bodies) -> tuple[float, float]:
-    """World-space y extent of all (evaluated) sample bodies."""
+def _camera_frame():
+    """Active camera with its world-space (position, right, up, view) frame."""
+    import bpy
     import mathutils
 
-    y_values = []
+    camera = bpy.context.scene.camera
+    if camera is None:
+        raise ValueError("The scene has no active camera (see setup_scene).")
+    rotation = camera.matrix_world.to_quaternion()
+    right = rotation @ mathutils.Vector((1.0, 0.0, 0.0))
+    up = rotation @ mathutils.Vector((0.0, 1.0, 0.0))
+    view = rotation @ mathutils.Vector((0.0, 0.0, -1.0))  # cameras look along −Z
+    return camera, camera.matrix_world.translation.copy(), right, up, view
+
+
+def camera_pixel_size(detector_shape: tuple[int, int] = (64, 64)) -> float:
+    """Sample-plane pixel pitch a render at this resolution would have, metres.
+
+    The sample plane is the plane through the world origin perpendicular to the
+    camera axis. ORTHO: field of view = ``ortho_scale`` everywhere. PERSP: field
+    of view at the sample plane = ``2·d·tan(angle/2)`` with ``d`` the camera→
+    origin distance and ``angle`` the focal angle (from focal length + sensor).
+    Square pixels, sized by the larger detector dimension (Blender AUTO fit).
+    """
+    import math as _math
+
+    camera, position, _, _, view = _camera_frame()
+    if camera.data.type == "ORTHO":
+        width = camera.data.ortho_scale
+    else:
+        distance = (-position).dot(view)
+        if distance <= 0:
+            raise ValueError("The camera must look toward the world origin.")
+        width = 2.0 * distance * _math.tan(camera.data.angle / 2.0)
+    return width / max(detector_shape)
+
+
+def _sample_axis_bounds(depsgraph, bodies, view) -> tuple[float, float]:
+    """Extent of all (evaluated) sample bodies along the camera view axis.
+
+    Coordinates are signed distances s = P·view from the plane through the world
+    origin perpendicular to the view axis (the sample plane).
+    """
+    import mathutils
+
+    s_values = []
     for obj in bodies:
         evaluated = obj.evaluated_get(depsgraph)
         for corner in evaluated.bound_box:
-            y_values.append((evaluated.matrix_world @ mathutils.Vector(corner)).y)
-    return min(y_values), max(y_values)
+            s_values.append(
+                (evaluated.matrix_world @ mathutils.Vector(corner)).dot(view)
+            )
+    return min(s_values), max(s_values)
 
 
 def _ray_segments(scene, depsgraph, origin, direction, t_max, epsilon):
@@ -253,21 +293,25 @@ def _ray_segments(scene, depsgraph, origin, direction, t_max, epsilon):
 
 def extract_slab_integrals(
     detector_shape: tuple[int, int] = (64, 64),
-    pixel_size: float = 1e-3,
     slice_spacing: float | None = None,
     margin: float = 1e-3,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Per-slab projected line integrals (∫δ dz, ∫β dz) for the current pose.
 
-    Returns two ``(n_slabs, height, width)`` arrays in metres, slabs ordered
-    entrance → exit along the beam. ``slice_spacing=None`` yields a single slab
-    (the projection approximation). Beam type follows the active camera: ORTHO
-    casts parallel rays; PERSP casts diverging rays from the ``xray_source`` point,
-    so the maps are sampled on the demagnified sample-plane grid the Fresnel
-    scaling propagator expects.
+    The rays are exactly the active camera's render rays for a ``detector_shape``
+    image (assuming zero lens shift and square pixel aspect): ORTHO casts parallel
+    rays across ``ortho_scale``; PERSP casts diverging rays from the camera
+    pinhole with the field of view given by the focal length/sensor. The pixel
+    grid lies on the sample plane through the world origin, with the pitch
+    reported by :func:`camera_pixel_size` — for cone beams that is already the
+    demagnified sample-plane grid the Fresnel scaling propagator expects.
+
+    Returns two ``(n_slabs, height, width)`` arrays in metres, slabs of
+    ``slice_spacing`` along the camera view axis ordered entrance → exit (the far
+    side first, matching the physical beam travelling toward the camera).
+    ``slice_spacing=None`` yields a single slab (the projection approximation).
     """
     import bpy
-    import mathutils
 
     scene = bpy.context.scene
     depsgraph = bpy.context.evaluated_depsgraph_get()
@@ -275,59 +319,58 @@ def extract_slab_integrals(
     constants = {
         obj.name: (float(obj[PROP_DELTA]), float(obj[PROP_BETA])) for obj in bodies
     }
-    y_min, y_max = _sample_y_bounds(depsgraph, bodies)
-    extent = max(y_max - y_min, 0.0)
 
+    camera, camera_position, right, up, view = _camera_frame()
+    cone = camera.data.type == "PERSP"
+    camera_distance = (-camera_position).dot(view)
+    if cone and camera_distance <= 0:
+        raise ValueError("The camera must look toward the world origin.")
+    pixel_size = camera_pixel_size(detector_shape)
+    plane_center = camera_position + camera_distance * view  # s = 0 on the axis
+
+    s_min, s_max = _sample_axis_bounds(depsgraph, bodies, view)
+    extent = max(s_max - s_min, 0.0)
     if slice_spacing is None or slice_spacing >= extent or extent == 0.0:
-        n_slabs = 1
-        slab_edges = [(y_max, y_min)]
+        slab_edges = [(s_max, s_min)]
     else:
         n_slabs = math.ceil(extent / slice_spacing)
         slab_edges = [
-            (y_max - k * slice_spacing, y_max - (k + 1) * slice_spacing)
+            (s_max - k * slice_spacing, s_max - (k + 1) * slice_spacing)
             for k in range(n_slabs)
         ]
 
-    camera = scene.camera
-    cone = camera is not None and camera.data.type == "PERSP"
-    if cone:
-        try:
-            source_location = bpy.data.objects[SOURCE].location.copy()
-        except KeyError:
-            raise ValueError(
-                "Perspective camera needs an 'xray_source' object (see setup_scene)."
-            ) from None
-    detector_y = camera.location.y if camera is not None else y_min - margin
-
     height, width = detector_shape
-    slab_delta = np.zeros((n_slabs, height, width))
-    slab_beta = np.zeros((n_slabs, height, width))
-    y_start = y_max + margin
-    epsilon = max(1e-9, 1e-6 * (y_max - detector_y + margin))
+    slab_delta = np.zeros((len(slab_edges), height, width))
+    slab_beta = np.zeros((len(slab_edges), height, width))
+    epsilon = max(1e-9, 1e-6 * (extent + abs(camera_distance) + margin))
 
     for i in range(height):
-        z = ((height - 1) / 2.0 - i) * pixel_size
+        v = ((height - 1) / 2.0 - i) * pixel_size  # row 0 = top of the render
         for j in range(width):
-            x = (j - (width - 1) / 2.0) * pixel_size
+            u = (j - (width - 1) / 2.0) * pixel_size
+            pixel_point = plane_center + u * right + v * up
             if cone:
-                origin = source_location.copy()
-                target = mathutils.Vector((x, detector_y, z))
-                direction = (target - origin).normalized()
+                origin = camera_position.copy()
+                direction = (pixel_point - origin).normalized()
+                cosine = direction.dot(view)  # ray obliquity: ds = cosine · dt
+                s_origin = -camera_distance
             else:
-                origin = mathutils.Vector((x, y_start, z))
-                direction = mathutils.Vector((0.0, -1.0, 0.0))
-            t_max = (origin.y - (y_min - margin)) / -direction.y
+                direction = view.copy()
+                cosine = 1.0
+                s_origin = s_min - margin
+                origin = pixel_point + s_origin * view
+            # t(s): arc length along the ray at which it crosses axis-coordinate s
+            t_max = (s_max + margin - s_origin) / cosine
             segments = _ray_segments(scene, depsgraph, origin, direction, t_max, epsilon)
             for name, intervals in segments.items():
                 if name not in constants:
                     continue  # non-sample object in the beam path
                 delta, beta = constants[name]
                 for t_enter, t_exit in intervals:
-                    for k, (y_hi, y_lo) in enumerate(slab_edges):
-                        # t range where the ray's y is inside [y_lo, y_hi]
-                        t_hi = (origin.y - y_hi) / -direction.y
-                        t_lo = (origin.y - y_lo) / -direction.y
-                        overlap = min(t_exit, t_lo) - max(t_enter, t_hi)
+                    for k, (s_hi, s_lo) in enumerate(slab_edges):
+                        t_lo = (s_lo - s_origin) / cosine
+                        t_hi = (s_hi - s_origin) / cosine
+                        overlap = min(t_exit, t_hi) - max(t_enter, t_lo)
                         if overlap > 0:
                             slab_delta[k, i, j] += delta * overlap
                             slab_beta[k, i, j] += beta * overlap
@@ -337,7 +380,6 @@ def extract_slab_integrals(
 def build_demo_scene(
     beam: str = "parallel",
     camera_distance: float = 0.5,
-    source_distance: float = 0.5,
     detector_width: float = 0.1,
 ):
     """Self-contained demo: a cube and a sphere with plausible X-ray constants.
@@ -350,7 +392,6 @@ def build_demo_scene(
     setup_scene(
         beam=beam,
         camera_distance=camera_distance,
-        source_distance=source_distance,
         detector_width=detector_width,
     )
     bpy.ops.mesh.primitive_cube_add(size=0.03, location=(0.008, 0.0, 0.0))

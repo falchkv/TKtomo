@@ -39,7 +39,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--energy", type=float, default=17.0, help="Photon energy, keV.")
     parser.add_argument(
-        "--pixel-size", type=float, default=1e-3, help="Detector pixel pitch, metres."
+        "--detector-width", type=float, default=0.1,
+        help="Demo-scene field of view at the sample plane, metres (sets the "
+        "camera's ortho scale / focal angle; ignored with --use-scene, where the "
+        "loaded camera's intrinsics define the field of view).",
     )
     parser.add_argument(
         "--detector", type=int, nargs=2, default=(64, 64), metavar=("H", "W"),
@@ -96,7 +99,7 @@ def main(argv: list[str] | None = None) -> None:
     from tktomo.blender_sim import scene, simulate
 
     if not args.use_scene:
-        scene.build_demo_scene(beam=args.beam)
+        scene.build_demo_scene(beam=args.beam, detector_width=args.detector_width)
 
     start, stop, n_angles = args.angles
     angles = np.linspace(np.radians(start), np.radians(stop), int(n_angles), endpoint=False)
@@ -105,7 +108,6 @@ def main(argv: list[str] | None = None) -> None:
     results = simulate(
         angles,
         energy_kev=args.energy,
-        pixel_size=args.pixel_size,
         detector_shape=tuple(args.detector),
         outputs=tuple(args.outputs),
         propagate=args.propagate,
@@ -121,7 +123,7 @@ def main(argv: list[str] | None = None) -> None:
             group.create_dataset("data", data=projection_data.data)
             group.create_dataset("angles", data=projection_data.angles)
             group.attrs["energy_kev"] = args.energy
-            group.attrs["pixel_size"] = args.pixel_size
+            group.attrs["pixel_size"] = projection_data.metadata["pixel_size"]
             group.attrs["method"] = args.method
     print(f"Wrote {', '.join(results)} to {args.output}")
 

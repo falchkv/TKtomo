@@ -7,7 +7,8 @@ Image Editor, as the image datablock ``xray_projection``:
 - :func:`show_projection` — one shot: compute, write the image, make sure an Image
   Editor shows it (splitting the 3D viewport on first use);
 - :func:`enable_live_update` / :func:`disable_live_update` — a depsgraph handler
-  marks the projection dirty whenever a sample body or the sample root changes, and
+  marks the projection dirty whenever a sample body, the sample root, or the
+  camera (pose *or* intrinsics such as focal length / ortho scale) changes, and
   a ~0.3 s timer re-projects outside the handler (cheap when nothing changed).
 
 Defaults (photon energy, resolution) come from the "X-ray Sim" panel's fields when
@@ -25,39 +26,24 @@ from tktomo.blender_sim.multislice import projection_outputs
 IMAGE_NAME = "xray_projection"
 DEFAULT_ENERGY_KEV = 17.0
 DEFAULT_RESOLUTION = 128
-FIELD_MARGIN = 1.3  # detector field of view = margin × sample bounding radius
 
 _live = False
 _dirty = False
 _updating = False
 
 
-def auto_pixel_size(resolution: int, margin: float = FIELD_MARGIN) -> float:
-    """Pixel pitch so the detector covers the sample at any rotation."""
-    import bpy
-    import mathutils
-
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-    corners = []
-    for obj in scene_layer._bodies():  # raises with guidance when nothing is tagged
-        evaluated = obj.evaluated_get(depsgraph)
-        corners += [
-            evaluated.matrix_world @ mathutils.Vector(c) for c in evaluated.bound_box
-        ]
-    radius = max(corner.length for corner in corners)
-    return margin * 2.0 * radius / resolution
-
-
 def compute_projection(
     energy_kev: float = DEFAULT_ENERGY_KEV,
     resolution: int = DEFAULT_RESOLUTION,
-    pixel_size: float | None = None,
 ) -> np.ndarray:
-    """Attenuation projection (∫μ dz) of the scene at its current pose."""
-    if pixel_size is None:
-        pixel_size = auto_pixel_size(resolution)
+    """Attenuation projection (∫μ dz) of the scene at its current pose.
+
+    Field of view and pixel grid come from the active camera's intrinsics, so the
+    image matches a camera render at this resolution — frame with the camera
+    (ortho scale / focal length), not with a pixel-size parameter.
+    """
     slab_delta, slab_beta = scene_layer.extract_slab_integrals(
-        detector_shape=(resolution, resolution), pixel_size=pixel_size
+        detector_shape=(resolution, resolution)
     )
     return projection_outputs(
         slab_delta.sum(axis=0), slab_beta.sum(axis=0), energy_kev, ("attenuation",)
@@ -213,6 +199,11 @@ def _mark_dirty(scene, depsgraph) -> None:  # depsgraph_update_post handler
         return
     relevant = {obj.name for obj in scene_layer.bodies()}
     relevant.add(scene_layer.SAMPLE_ROOT)
+    if scene.camera is not None:
+        # the camera defines FOV/pixel grid: re-project on moves (object update)
+        # and on intrinsics edits like focal length / ortho scale (data update)
+        relevant.add(scene.camera.name)
+        relevant.add(scene.camera.data.name)
     for update in depsgraph.updates:
         if getattr(update.id, "name", None) in relevant:
             _dirty = True
