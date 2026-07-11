@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+*.h5
+*.hdf5
+!tests/**/*.h5
+.idea/workspace.xml
+xray_projection.png

@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tktomo"
+version = "0.1.0"
+description = "Pre-processing and inspection toolkit for ptycho-tomography reconstruction"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Ken Vidar Falch" }]
+
+# Core runtime deps needed for the non-GUI library layer (io, align, recon
+# interfaces, messaging). Kept intentionally light so the package imports and
+# unit tests run without the GUI / heavy reconstruction stack.
+dependencies = [
+    "numpy>=1.24",
+    "h5py>=3.9",
+    "hdf5plugin>=4.0",
+    "scikit-image>=0.22",
+    "pyzmq>=25.0",
+    "msgpack>=1.0",
+]
+
+[project.optional-dependencies]
+# Desktop UIs (PySide6 + pyqtgraph) and colormap collections.
+ui = [
+    "PySide6>=6.6",
+    "pyqtgraph>=0.13",
+    "colorcet>=3.0",
+    "cmocean>=3.0",
+    "cmasher>=1.6",
+]
+# Tomographic reconstruction / reprojection + alignment backends.
+# tomopy is best installed via conda-forge; listed here for completeness.
+recon = [
+    "tomopy>=1.14",
+    "pystackreg>=0.2.7",
+]
+# Optional GPU projectors (install astra-toolbox via conda-forge).
+gpu = [
+    "astra-toolbox>=2.1",
+]
+# Blender-as-a-module for the X-ray simulator (tktomo.blender_sim). Note each bpy
+# release pins an exact Python version; running inside `blender --background`
+# with Blender's bundled Python is the dependency-free alternative.
+blender = [
+    "bpy>=4.2",
+]
+dev = [
+    "pytest>=7.4",
+    "pytest-qt>=4.3",
+]
+
+[project.scripts]
+tktomo-sinogram = "tktomo.ui.sinogram_app:main"
+tktomo-tomogram = "tktomo.ui.tomogram_app:main"
+tktomo-projection = "tktomo.ui.projection_app:main"
+tktomo-alignment = "tktomo.ui.alignment_app:main"
+tktomo-feature-alignment = "tktomo.ui.feature_alignment_app:main"
+tktomo-blender-sim = "tktomo.blender_sim.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["tktomo*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
