@@ -206,22 +206,24 @@ def register() -> None:
         items=[(name, name, "") for name in available_propagators()],
         default=viewer.DEFAULT_METHOD, update=_settings_changed,
     )
+    unit = scene_layer.UNIT_SCALE  # panel lengths in Blender units (mm)
     bpy.types.WindowManager.tktomo_distance = bpy.props.FloatProperty(
-        name="Distance (m)",
-        description="Sample → detector free-space propagation distance z",
-        default=viewer.DEFAULT_DISTANCE, min=0.0, update=_settings_changed,
+        name="Distance (mm)",
+        description="Sample → detector free-space propagation distance z "
+        "(Blender units = mm)",
+        default=viewer.DEFAULT_DISTANCE / unit, min=0.0, update=_settings_changed,
     )
     bpy.types.WindowManager.tktomo_slice_spacing = bpy.props.FloatProperty(
-        name="Slice Δz (m)",
-        description="Multislice slab thickness along the beam; 0 = single slab "
-        "(projection approximation)",
-        default=viewer.DEFAULT_SLICE_SPACING, min=0.0, update=_settings_changed,
+        name="Slice Δz (mm)",
+        description="Multislice slab thickness along the beam (Blender units = mm); "
+        "0 = single slab (projection approximation)",
+        default=viewer.DEFAULT_SLICE_SPACING / unit, min=0.0, update=_settings_changed,
     )
     bpy.types.WindowManager.tktomo_r1 = bpy.props.FloatProperty(
-        name="r1 (m)",
-        description="Source → sample distance for fresnel_scaling (cone beam); "
-        "≈ the camera distance in this geometry",
-        default=viewer.DEFAULT_R1, min=1e-9, update=_settings_changed,
+        name="r1 (mm)",
+        description="Source → sample distance for fresnel_scaling (cone beam), "
+        "Blender units = mm; ≈ the camera distance in this geometry",
+        default=viewer.DEFAULT_R1 / unit, min=1e-6, update=_settings_changed,
     )
     bpy.types.WindowManager.tktomo_live = bpy.props.BoolProperty(
         name="Live update",

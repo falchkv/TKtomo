@@ -197,9 +197,14 @@ def setup_viewer_layout() -> str:
 
 
 def _settings() -> dict:
-    """compute_projection kwargs from the panel fields (module defaults if absent)."""
+    """compute_projection kwargs from the panel fields (module defaults if absent).
+
+    The panel's length fields are in Blender units (**mm**, matching the scene);
+    they are converted to the physics layer's metres here via ``UNIT_SCALE``.
+    """
     import bpy
 
+    unit = scene_layer.UNIT_SCALE
     wm = bpy.context.window_manager
     method = str(getattr(wm, "tktomo_method", DEFAULT_METHOD))
     kwargs = {
@@ -208,11 +213,16 @@ def _settings() -> dict:
         "output": str(getattr(wm, "tktomo_output", DEFAULT_OUTPUT)),
         "propagate": bool(getattr(wm, "tktomo_propagate", False)),
         "method": method,
-        "distance": float(getattr(wm, "tktomo_distance", DEFAULT_DISTANCE)),
-        "slice_spacing": float(getattr(wm, "tktomo_slice_spacing", DEFAULT_SLICE_SPACING)),
+        "distance": float(getattr(wm, "tktomo_distance", DEFAULT_DISTANCE / unit)) * unit,
+        "slice_spacing": float(
+            getattr(wm, "tktomo_slice_spacing", DEFAULT_SLICE_SPACING / unit)
+        )
+        * unit,
     }
     if method == "fresnel_scaling":
-        kwargs["method_kwargs"] = {"r1": float(getattr(wm, "tktomo_r1", DEFAULT_R1))}
+        kwargs["method_kwargs"] = {
+            "r1": float(getattr(wm, "tktomo_r1", DEFAULT_R1 / unit)) * unit
+        }
     return kwargs
 
 

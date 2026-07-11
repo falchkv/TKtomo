@@ -25,8 +25,12 @@ features below — not a single script pasted into Blender's scripting window.
      interactive scene building and inspection.
 - **Output** remains `ProjectionData`, so results plug directly into the existing
   viewers.
-- **Units**: all lengths in metres (Blender's default unit), photon energy in keV,
-  μ in 1/m.
+- **Units**: **Blender coordinates are millimetres** — one Blender unit = 1 mm
+  (`scene.UNIT_SCALE = 1e-3` metres), so samples are modelled at a comfortable
+  viewport scale; the panel's length fields (distance, Δz, r1) are mm too. The
+  **physics-layer APIs stay SI**: line integrals, pixel pitch, propagation
+  distances and μ are metres / 1/m (conversion happens inside the scene layer),
+  photon energy in keV.
 
 ### Module map (as implemented)
 
