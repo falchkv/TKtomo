@@ -59,13 +59,13 @@ def _setup_inside_blender(argv: list[str]) -> None:
         scene.build_demo_scene(beam=args.beam)
 
     if not bpy.app.background:
-        # first projection via a one-shot timer, once the UI is fully built, so the
-        # viewer can split the viewport and show it in an Image Editor
+        # build the viewer layout via a one-shot timer, once the UI is fully up:
+        # projection Image Editor on top, camera's-eye 3D view below it
         def _first_projection():
             from tktomo.blender_sim import viewer
 
             try:
-                viewer.show_projection()
+                print(f"Viewer layout: {viewer.setup_viewer_layout()}")
             except Exception as exc:  # noqa: BLE001  (startup must not crash)
                 print(f"Initial projection failed: {exc}")
             return None

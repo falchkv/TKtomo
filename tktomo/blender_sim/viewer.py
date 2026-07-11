@@ -86,6 +86,20 @@ def to_image(array: np.ndarray, name: str = IMAGE_NAME):
     return image
 
 
+def _split_area(window, area, direction: str, factor: float):
+    """Split ``area``; return the newly created area (or None on failure)."""
+    import bpy
+
+    screen = window.screen
+    before = set(screen.areas[:])
+    try:
+        with bpy.context.temp_override(window=window, area=area):
+            bpy.ops.screen.area_split(direction=direction, factor=factor)
+        return next(a for a in screen.areas if a not in before)
+    except Exception:  # noqa: BLE001  (window-manager quirks: caller falls back)
+        return None
+
+
 def ensure_image_editor(image) -> str:
     """Make an Image Editor show ``image``, splitting the 3D viewport if needed."""
     import bpy
@@ -104,16 +118,11 @@ def ensure_image_editor(image) -> str:
     viewports = [area for area in screen.areas if area.type == "VIEW_3D"]
     if viewports:
         viewport = max(viewports, key=lambda a: a.width * a.height)
-        before = set(screen.areas[:])
-        try:
-            with bpy.context.temp_override(window=window, area=viewport):
-                bpy.ops.screen.area_split(direction="VERTICAL", factor=0.4)
-            new_area = next(a for a in screen.areas if a not in before)
+        new_area = _split_area(window, viewport, "VERTICAL", 0.4)
+        if new_area is not None:
             new_area.type = "IMAGE_EDITOR"
             new_area.spaces.active.image = image
             return "opened a new Image Editor next to the viewport"
-        except Exception:  # noqa: BLE001  (window-manager quirks: fall through)
-            pass
 
     others = [area for area in screen.areas if area.type != "VIEW_3D"]
     if others:
@@ -122,6 +131,48 @@ def ensure_image_editor(image) -> str:
         area.spaces.active.image = image
         return "converted an area to an Image Editor"
     return f"no editor area available — open an Image Editor and pick {image.name!r}"
+
+
+def setup_viewer_layout() -> str:
+    """Launcher layout: projection Image Editor on top, camera's-eye view below.
+
+    Shows the first projection (creating the side Image Editor if needed), then
+    splits that editor with a horizontal line: the top pane keeps the projection,
+    the bottom pane becomes a 3D viewport locked to the scene camera's view — the
+    beam's-eye preview of what is being projected. GUI only (no-op headless).
+    """
+    import bpy
+
+    show_projection()  # creates/updates the image and an Image Editor area
+    if bpy.app.background:
+        return "background mode: no layout"
+
+    for window in bpy.context.window_manager.windows:
+        editors = [a for a in window.screen.areas if a.type == "IMAGE_EDITOR"]
+        if not editors:
+            continue
+        editor = max(editors, key=lambda a: a.width * a.height)
+        # already stacked above a camera view? (idempotent across re-runs)
+        for area in window.screen.areas:
+            if (
+                area.type == "VIEW_3D"
+                and area.x == editor.x
+                and area.spaces.active.region_3d.view_perspective == "CAMERA"
+            ):
+                return "viewer layout already present"
+        new_area = _split_area(window, editor, "HORIZONTAL", 0.5)
+        if new_area is None:
+            return "could not split the Image Editor; projection shown alone"
+        top, bottom = (
+            (editor, new_area) if editor.y > new_area.y else (new_area, editor)
+        )
+        image = bpy.data.images.get(IMAGE_NAME)
+        top.type = "IMAGE_EDITOR"
+        top.spaces.active.image = image
+        bottom.type = "VIEW_3D"
+        bottom.spaces.active.region_3d.view_perspective = "CAMERA"
+        return "projection above, camera view below"
+    return "no Image Editor available for the viewer layout"
 
 
 def _settings() -> tuple[float, int]:

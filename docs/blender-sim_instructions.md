@@ -48,9 +48,10 @@ the sample bounds, and displays the attenuation map in a Blender Image Editor
 
 `examples/launch_blender.py` is the session starter: `python
 examples/launch_blender.py [--beam cone]` opens the Blender GUI with the demo
-scene built, the "X-ray Sim" sidebar panel registered, and an Image Editor opened
-next to the viewport showing an initial projection (nothing persists in Blender
-between sessions, so run this after every restart). It keeps already
+scene built, the "X-ray Sim" sidebar panel registered, and a viewer column opened
+next to the viewport — the projection image on top, a camera's-eye 3D view (what
+the X-ray camera sees) below it (nothing persists in Blender between sessions, so
+run this after every restart). It keeps already
 tagged bodies when given an existing `.blend`
 (`blender my_scene.blend --python examples/launch_blender.py`), and finds Blender
 via `--blender`, `$BLENDER`, or PATH.
