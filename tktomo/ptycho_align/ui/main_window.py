@@ -15,7 +15,7 @@ import logging
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QDockWidget,
@@ -64,16 +64,28 @@ from tktomo.ptycho_align.ui.worker import AlignmentRun
 logger = logging.getLogger("tktomo.ptycho_align")
 
 
-class _LogDock(logging.Handler):
-    """Mirror the engine's log into a dock, so a run is reconstructable after the fact."""
+class _LogDock(QObject, logging.Handler):
+    """Mirror the engine's log into a dock, so a run is reconstructable after the fact.
+
+    The engine logs one line per iteration from **inside** ``step()``, which runs on the
+    worker thread. Qt widgets may only be touched from the GUI thread, so writing
+    straight into the QPlainTextEdit from here corrupts Qt's internal state and
+    segfaults the process later, inside an unrelated paint event -- nowhere near the
+    actual culprit. Hop threads via a queued signal instead: ``message`` is emitted on
+    whichever thread logged, and Qt delivers it to the widget on the GUI thread.
+    """
+
+    message = Signal(str)
 
     def __init__(self, widget: QPlainTextEdit) -> None:
-        super().__init__(level=logging.INFO)
-        self._widget = widget
+        QObject.__init__(self)
+        logging.Handler.__init__(self, level=logging.INFO)
         self.setFormatter(logging.Formatter("%(asctime)s  %(message)s", "%H:%M:%S"))
+        # AutoConnection: same-thread logs go direct, worker-thread logs get queued.
+        self.message.connect(widget.appendPlainText)
 
     def emit(self, record: logging.LogRecord) -> None:
-        self._widget.appendPlainText(self.format(record))
+        self.message.emit(self.format(record))
 
 
 def bin_stack(stack: np.ndarray, factor: int) -> np.ndarray:
@@ -142,12 +154,13 @@ class PtychoAlignWindow(QMainWindow):
         log_dock = QDockWidget("Log", self)
         log_dock.setWidget(self.log_widget)
         self.addDockWidget(Qt.BottomDockWidgetArea, log_dock)
-        logger.addHandler(_LogDock(self.log_widget))
+        # The engine's logger ("...core.engine") is a child of this one and propagates,
+        # so a single handler catches both. Kept on self so closeEvent can detach it --
+        # the logger is module-global, and a handler left pointing at a destroyed widget
+        # would fire again the next time a window is opened.
+        self._log_handler = _LogDock(self.log_widget)
+        logger.addHandler(self._log_handler)
         logger.setLevel(logging.INFO)
-        logging.getLogger("tktomo.ptycho_align.core.engine").addHandler(
-            _LogDock(self.log_widget)
-        )
-        logging.getLogger("tktomo.ptycho_align.core.engine").setLevel(logging.INFO)
 
         self._connect()
         self._build_menus()
@@ -258,6 +271,8 @@ class PtychoAlignWindow(QMainWindow):
         if self.raw is None:
             self._error("No data", "Load a projection stack first.")
             return
+        if self._busy():
+            return
 
         array = np.asarray(self.raw.data, dtype=np.float32)
         roi = self.projection_view.roi_bounds()
@@ -313,9 +328,27 @@ class PtychoAlignWindow(QMainWindow):
 
     # -- COM ---------------------------------------------------------------------------
 
+    def _busy(self) -> bool:
+        """True (with a nag) if a run is in flight.
+
+        Anything that calls into tomopy must refuse to start while the worker thread is
+        already inside tomopy -- it is not thread-safe and the process segfaults.
+        """
+        if self._run is not None and self._run.running:
+            QMessageBox.information(
+                self,
+                "Alignment is running",
+                "Stop the current run first. TomoPy cannot safely run two "
+                "reconstructions at once.",
+            )
+            return True
+        return False
+
     def _run_com(self, reference: str) -> None:
         if self.engine is None:
             self._error("No data", "Load a projection stack first.")
+            return
+        if self._busy():
             return
 
         try:
@@ -332,6 +365,7 @@ class PtychoAlignWindow(QMainWindow):
         self.engine.state.center = result.center
         self.engine.state.history.clear()
         self.engine.state.volume = None
+        self.engine.invalidate_cache()
 
         self.com_panel.show_result(result.center, result.fit_residual, result.amplitude)
         self.shift_view.update_com(
@@ -351,6 +385,8 @@ class PtychoAlignWindow(QMainWindow):
 
     def _estimate_center(self, method: str) -> None:
         if self.engine is None:
+            return
+        if self._busy():
             return
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
@@ -394,6 +430,7 @@ class PtychoAlignWindow(QMainWindow):
         if self.engine is None:
             return
         self.engine.state.center = center
+        self.engine.invalidate_cache()
         self.sinogram_view.set_com(
             self.com.com_u if self.com else None,
             self.com.fitted_u if self.com else None,
@@ -504,6 +541,7 @@ class PtychoAlignWindow(QMainWindow):
         except ValueError as exc:
             self._error("Cannot revert", str(exc))
             return
+        self.engine.invalidate_cache()
         logger.info("Reverted to iteration %d", iteration)
         self._refresh_views()
         self.action_bar.show_status(f"Reverted to iteration {iteration}.")
@@ -511,15 +549,31 @@ class PtychoAlignWindow(QMainWindow):
     # -- views -------------------------------------------------------------------------
 
     def _refresh_views(self) -> None:
-        """Recompute the cached stacks once, then hand them to every viewer."""
+        """Feed every viewer from the stacks the last iteration already produced.
+
+        This must NOT call tomopy. TomoPy is not thread-safe -- ``tomopy.util.mproc``
+        holds its shared arrays in module-level globals -- so running ``project()``
+        here on the GUI thread while the worker thread is inside ``recon()`` corrupts
+        those globals and segfaults the process. With "live update views" on, that is
+        exactly what would happen every iteration. The engine caches the aligned stack
+        and the reprojection it already computed, so use those.
+        """
         if self.engine is None:
             return
 
         state = self.engine.state
-        aligned = self.engine.aligned_projections()
+        running = self._run is not None and self._run.running
 
-        simulated = None
-        if state.volume is not None:
+        aligned = self.engine.last_aligned
+        simulated = self.engine.last_simulated
+
+        if aligned is None:
+            if running:
+                return  # nothing cached yet and we must not compute; wait for the step
+            # shift_images is pure skimage/numpy, so it is safe off the worker thread.
+            aligned = self.engine.aligned_projections()
+
+        if simulated is None and state.volume is not None and not running:
             try:
                 simulated = self.engine.reproject()
             except Exception as exc:  # a missing backend must not break the viewers
@@ -671,6 +725,7 @@ class PtychoAlignWindow(QMainWindow):
         if self._run is not None and self._run.running:
             self._run.cancel()
             self._run.wait()
+        logger.removeHandler(self._log_handler)
         super().closeEvent(event)
 
 

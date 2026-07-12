@@ -133,8 +133,35 @@ class AlignmentEngine:
             metadata=dict(getattr(self.dataset, "metadata", {})),
         )
         self._pending_config_change = False
+        # step() already computes both of these; cache them so a display never has to
+        # re-run tomopy. See `last_simulated` for why that matters beyond speed.
+        self._last_aligned: np.ndarray | None = None
+        self._last_simulated: np.ndarray | None = None
 
     # -- accessors the GUI leans on -------------------------------------------------
+
+    @property
+    def last_aligned(self) -> np.ndarray | None:
+        """The aligned stack from the most recent :meth:`step`, or None."""
+        return self._last_aligned
+
+    @property
+    def last_simulated(self) -> np.ndarray | None:
+        """The reprojection from the most recent :meth:`step`, or None.
+
+        Callers displaying the reprojection must prefer this over calling
+        :meth:`reproject` again. **TomoPy is not thread-safe**: ``tomopy.util.mproc``
+        keeps its shared arrays in module-level globals, so a ``project()`` on one
+        thread while ``recon()`` runs on another corrupts memory and segfaults. The
+        GUI refreshes its views while the worker thread is mid-run, so it must read
+        this cache rather than re-derive it.
+        """
+        return self._last_simulated
+
+    def invalidate_cache(self) -> None:
+        """Drop the cached aligned/simulated stacks (after a revert, or new shifts)."""
+        self._last_aligned = None
+        self._last_simulated = None
 
     @property
     def iteration(self) -> int:
@@ -245,6 +272,8 @@ class AlignmentEngine:
             config_changed=self._pending_config_change,
         )
         self._pending_config_change = False
+        self._last_aligned = prj_aligned
+        self._last_simulated = sim
 
         logger.info(
             "iter %d: shift RMS %.4f px, residual %.4f, centre %.2f, %.1f s (%s/%s)",
@@ -302,7 +331,7 @@ class AlignmentEngine:
                 kwargs["init_recon"] = self.state.volume
 
         try:
-            return backend.reconstruct(prj_aligned, self.state.angles, **kwargs)
+            return _owned(backend.reconstruct(prj_aligned, self.state.angles, **kwargs))
         except (TypeError, ValueError) as exc:
             # e.g. gridrec rejects num_iter/init_recon. Degrade to a fresh
             # reconstruction rather than killing a long run.
@@ -314,18 +343,22 @@ class AlignmentEngine:
                 cfg.recon_algorithm,
                 exc,
             )
-            return backend.reconstruct(
-                prj_aligned,
-                self.state.angles,
-                algorithm=cfg.recon_algorithm,
-                center=self.state.center,
+            return _owned(
+                backend.reconstruct(
+                    prj_aligned,
+                    self.state.angles,
+                    algorithm=cfg.recon_algorithm,
+                    center=self.state.center,
+                )
             )
 
     def _reproject(self, volume: np.ndarray) -> np.ndarray:
         kwargs: dict[str, Any] = {"center": self.state.center}
         if self.config.ncore is not None:
             kwargs["ncore"] = self.config.ncore
-        return self._backend().reproject(volume, self.state.angles, **kwargs)
+        simulated = self._backend().reproject(volume, self.state.angles, **kwargs)
+
+        return _owned(simulated)
 
     def _condition_update(
         self, dsx: np.ndarray, dsy: np.ndarray
@@ -362,6 +395,19 @@ class AlignmentEngine:
         except Exception as exc:  # centre finding is a nicety, never fatal
             logger.warning("Centre refinement failed (%s); keeping centre %.2f", exc, fallback)
             return fallback
+
+
+def _owned(array: np.ndarray) -> np.ndarray:
+    """Return an array that owns its memory.
+
+    ``tomopy.project`` hands back a **view** onto tomopy's multiprocessing
+    shared-memory buffer (``owndata`` is False), and tomopy recycles that buffer on its
+    next call. Anything still holding the view is then reading freed memory. The GUI
+    caches these arrays and pyqtgraph paints them lazily, so the process segfaults
+    inside a paint event -- intermittently, and nowhere near the real culprit. Copy on
+    the way out of the engine and the whole class of bug disappears.
+    """
+    return array if array.flags.owndata else np.array(array, copy=True)
 
 
 def _match_shape(sim: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:

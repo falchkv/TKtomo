@@ -175,6 +175,51 @@ def test_align_toggles_reach_the_engine(window):
     np.testing.assert_array_equal(result.dsx, np.zeros_like(result.dsx))
 
 
+def test_engine_log_reaches_the_dock_from_the_worker_thread(window, qtbot):
+    """The engine logs from inside step(), i.e. on the worker thread.
+
+    Touching a QWidget off the GUI thread is undefined behaviour: it corrupted Qt's
+    state and segfaulted the process inside a later, unrelated paint event. The handler
+    must hop threads via a queued signal, so this asserts the line actually arrives.
+    """
+    window._run_com("mean")
+    _run(window, 1)
+    qtbot.wait(100)  # let the queued log signal be delivered
+
+    text = window.log_widget.toPlainText()
+    assert "iter 1:" in text, f"the worker thread's log never reached the dock: {text!r}"
+    assert "COM pre-alignment" in text
+
+
+def test_log_handler_is_detached_when_the_window_closes(qtbot, phantom_file):
+    """The logger is module-global; a handler left pointing at a destroyed widget
+    would fire again the next time a window opens."""
+    import logging
+
+    logger = logging.getLogger("tktomo.ptycho_align")
+    before = len(logger.handlers)
+
+    win = PtychoAlignWindow()
+    qtbot.addWidget(win)
+    assert len(logger.handlers) == before + 1
+
+    win.close()
+    assert len(logger.handlers) == before
+
+
+def test_reprojection_owns_its_memory(window):
+    """tomopy.project returns a view onto its shared-memory buffer, which it recycles.
+
+    The GUI caches these arrays and pyqtgraph paints them lazily, so a borrowed buffer
+    is read after tomopy has reused it.
+    """
+    window._run_com("mean")
+    _run(window, 1)
+
+    assert window.engine.last_simulated.flags.owndata
+    assert window.engine.state.volume.flags.owndata
+
+
 def test_export_without_a_volume_reports_clearly(window, tmp_path):
     # Nothing has been reconstructed yet, so there is no volume to write.
     with pytest.raises(ValueError, match="no volume to export"):
