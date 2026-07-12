@@ -9,6 +9,7 @@ from tktomo.ptycho_align.ui.panels.data_panel import (
     PreprocessOptions,
     PreprocessPanel,
 )
+from tktomo.ptycho_align.ui.panels.hdf5_browser import Hdf5BrowserDialog
 from tktomo.ptycho_align.ui.panels.projection_view import ProjectionView
 from tktomo.ptycho_align.ui.panels.shift_view import ShiftView
 from tktomo.ptycho_align.ui.panels.sinogram_view import SinogramView
@@ -19,6 +20,7 @@ __all__ = [
     "AlignPanel",
     "ComPanel",
     "DataPanel",
+    "Hdf5BrowserDialog",
     "PreprocessOptions",
     "PreprocessPanel",
     "ProjectionView",

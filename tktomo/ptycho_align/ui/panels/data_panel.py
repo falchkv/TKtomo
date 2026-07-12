@@ -36,13 +36,27 @@ class DataPanel(QWidget):
     """Load a dataset and show what came back."""
 
     load_requested = Signal()
+    browse_requested = Signal()
     session_load_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
 
         self.load_button = QPushButton("Load projections...")
+        self.load_button.setToolTip(
+            "Load a file, probing the conventional layouts (NXtomo, DXchange). If none "
+            "of them fit, the HDF5 dataset browser opens instead."
+        )
         self.load_button.clicked.connect(self.load_requested)
+
+        self.browse_button = QPushButton("Browse HDF5...")
+        self.browse_button.setToolTip(
+            "Open an HDF5 file and navigate its tree to the projection stack yourself. "
+            "Use this when the file holds several 3-D arrays, or when the automatic "
+            "probe picked the wrong one."
+        )
+        self.browse_button.clicked.connect(self.browse_requested)
+
         self.session_button = QPushButton("Open session...")
         self.session_button.clicked.connect(self.session_load_requested)
 
@@ -51,19 +65,22 @@ class DataPanel(QWidget):
 
         buttons = QHBoxLayout()
         buttons.addWidget(self.load_button)
-        buttons.addWidget(self.session_button)
+        buttons.addWidget(self.browse_button)
 
         layout = QVBoxLayout(self)
         layout.addLayout(buttons)
+        layout.addWidget(self.session_button)
         layout.addWidget(self.summary)
 
     def show_dataset(self, data: ProjectionData) -> None:
         array = data.data
         angles = np.rad2deg(data.angles)
         step = float(np.mean(np.diff(angles))) if len(angles) > 1 else 0.0
+        source = data.metadata.get("data_path")
         self.summary.setText(
             f"<b>{data.metadata.get('name', 'dataset')}</b><br>"
-            f"shape {array.shape} (angles, v, u)<br>"
+            + (f"<tt>{source}</tt><br>" if source else "")
+            + f"shape {array.shape} (angles, v, u)<br>"
             f"angles {angles.min():.1f}..{angles.max():.1f} deg, step {step:.2f} deg<br>"
             f"min {array.min():.4g}, max {array.max():.4g}, mean {array.mean():.4g}"
         )

@@ -21,7 +21,9 @@ from make_phantom import make_misaligned_dataset  # noqa: E402
 
 from tktomo.io import save_projections  # noqa: E402
 from tktomo.ptycho_align.core import io as session_io  # noqa: E402
+from tktomo.ptycho_align.core import load_dataset  # noqa: E402
 from tktomo.ptycho_align.ui.main_window import PtychoAlignWindow, bin_stack  # noqa: E402
+from tktomo.ptycho_align.ui.panels import Hdf5BrowserDialog  # noqa: E402
 from tktomo.ptycho_align.ui.panels.base import (  # noqa: E402
     MODE_ALIGNED,
     MODE_DIFFERENCE,
@@ -246,3 +248,92 @@ def test_export_without_a_volume_reports_clearly(window, tmp_path):
     # Nothing has been reconstructed yet, so there is no volume to write.
     with pytest.raises(ValueError, match="no volume to export"):
         session_io.export_volume(tmp_path / "v.h5", window.engine.state.volume)
+
+
+# -- HDF5 dataset browser ---------------------------------------------------------------
+
+
+def _ok(dialog):
+    from PySide6.QtWidgets import QDialogButtonBox
+
+    return dialog.buttons.button(QDialogButtonBox.StandardButton.Ok)
+
+
+@pytest.fixture
+def odd_file(tmp_path):
+    """A file no layout probe recognises: the stack is nested and oddly named."""
+    import h5py
+
+    path = tmp_path / "beamline.h5"
+    data, _sx, _sy = make_misaligned_dataset(size=24, n_angles=20, max_shift=1.0, seed=5)[:3]
+    with h5py.File(path, "w") as f:
+        group = f.create_group("recon/ptycho")
+        group.create_dataset("object_phase", data=data.data)
+        group.create_dataset("rotation", data=np.rad2deg(data.angles))
+    return path
+
+
+def test_browser_preselects_the_stack_and_its_angles(qtbot, odd_file):
+    win = PtychoAlignWindow()
+    qtbot.addWidget(win)
+    dialog = Hdf5BrowserDialog(str(odd_file), win)
+    qtbot.addWidget(dialog)
+
+    selection = dialog.selection()
+    assert selection["data_path"] == "/recon/ptycho/object_phase"
+    assert selection["angle_path"] == "/recon/ptycho/rotation"
+    assert selection["axis_order"] == (0, 1, 2)
+    assert _ok(dialog).isEnabled()
+
+
+def test_browser_selection_loads_into_the_window(qtbot, odd_file):
+    """The whole point: a file the automatic probe cannot read still loads."""
+    win = PtychoAlignWindow()
+    qtbot.addWidget(win)
+
+    # The conventional loader does not find it...
+    with pytest.raises(KeyError):
+        load_dataset(str(odd_file))
+
+    # ...but an explicit dataset path does.
+    dialog = Hdf5BrowserDialog(str(odd_file), win)
+    qtbot.addWidget(dialog)
+    assert win.load_path(str(odd_file), **dialog.selection())
+
+    assert win.raw is not None
+    assert win.raw.data.shape == (20, 24 + 16, 24 + 16)  # margin-padded phantom
+    assert win.engine is not None
+
+
+def test_browser_blocks_ok_on_an_angle_length_mismatch(qtbot, odd_file):
+    """Right stack, wrong angle array: say so instead of loading garbage."""
+    import h5py
+
+    with h5py.File(odd_file, "a") as f:
+        f.create_dataset("meta/ring_current", data=np.arange(99.0))
+
+    win = PtychoAlignWindow()
+    qtbot.addWidget(win)
+    dialog = Hdf5BrowserDialog(str(odd_file), win)
+    qtbot.addWidget(dialog)
+
+    wrong = next(e for e in dialog.entries if e.path == "/meta/ring_current")
+    dialog._set_angles(wrong)
+    dialog._validate()
+
+    assert not _ok(dialog).isEnabled()
+    assert "99 angles but 20" in dialog.status.text()
+
+
+def test_browser_axis_order_offers_every_permutation(qtbot, odd_file):
+    win = PtychoAlignWindow()
+    qtbot.addWidget(win)
+    dialog = Hdf5BrowserDialog(str(odd_file), win)
+    qtbot.addWidget(dialog)
+
+    orders = [dialog.axis_combo.itemData(i) for i in range(dialog.axis_combo.count())]
+    assert sorted(orders) == sorted(
+        [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)]
+    )
+    # Each is labelled by the shape it produces, so the right one is obvious.
+    assert "angles=20" in dialog.axis_combo.itemText(orders.index((0, 1, 2)))

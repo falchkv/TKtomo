@@ -19,6 +19,7 @@ from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QDockWidget,
     QFileDialog,
     QMainWindow,
@@ -49,6 +50,7 @@ from tktomo.ptycho_align.ui.panels import (
     AlignPanel,
     ComPanel,
     DataPanel,
+    Hdf5BrowserDialog,
     PreprocessOptions,
     PreprocessPanel,
     ProjectionView,
@@ -62,9 +64,16 @@ from tktomo.ptycho_align.ui.panels.base import (
     MODE_RAW,
     MODE_REPROJECTION,
 )
+from tktomo.ptycho_align.ui.panels.hdf5_browser import preview_text
 from tktomo.ptycho_align.ui.worker import AlignmentRun
 
 logger = logging.getLogger("tktomo.ptycho_align")
+
+_HDF5_SUFFIXES = (".h5", ".hdf5", ".nxs", ".nx5", ".hdf")
+
+
+def _is_hdf5(path: str) -> bool:
+    return Path(path).suffix.lower() in _HDF5_SUFFIXES
 
 
 class _LogDock(QObject, logging.Handler):
@@ -229,6 +238,7 @@ class PtychoAlignWindow(QMainWindow):
 
     def _connect(self) -> None:
         self.data_panel.load_requested.connect(self._choose_dataset)
+        self.data_panel.browse_requested.connect(self._browse_hdf5)
         self.data_panel.session_load_requested.connect(self._open_session)
 
         self.preprocess_panel.apply_requested.connect(self._apply_preprocessing)
@@ -250,6 +260,7 @@ class PtychoAlignWindow(QMainWindow):
     def _build_menus(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
         file_menu.addAction("Load projections...", self._choose_dataset)
+        file_menu.addAction("Browse HDF5 datasets...", self._browse_hdf5)
         file_menu.addAction("Open session...", self._open_session)
         file_menu.addAction("Save session...", self._save_session)
         file_menu.addSeparator()
@@ -280,12 +291,45 @@ class PtychoAlignWindow(QMainWindow):
         if path:
             self.load_path(path)
 
-    def load_path(self, path: str) -> None:
+    def _browse_hdf5(self) -> None:
+        """Pick the datasets by hand, for a file that follows no known layout."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Browse HDF5 datasets", "", "HDF5 (*.h5 *.hdf5 *.nxs *.hdf);;All files (*)"
+        )
+        if path:
+            self._load_via_browser(path)
+
+    def _load_via_browser(self, path: str) -> bool:
+        """Open the dataset browser on ``path``; return whether a dataset was loaded."""
         try:
-            data = load_dataset(path)
+            dialog = Hdf5BrowserDialog(path, self)
+        except Exception as exc:
+            self._error("Could not read the HDF5 file", str(exc))
+            return False
+
+        logger.info("Browsing %s: %s", path, preview_text(path))
+        if dialog.exec() != QDialog.Accepted:
+            return False
+        return self.load_path(path, **dialog.selection())
+
+    def load_path(self, path: str, **load_kwargs) -> bool:
+        """Load a dataset. Extra keywords go straight to :func:`load_dataset`.
+
+        With no keywords this probes the conventional layouts; when that finds nothing
+        in an HDF5 file, the dataset browser opens rather than the user being told
+        "no projection dataset found" and left there.
+        """
+        try:
+            data = load_dataset(path, **load_kwargs)
+        except KeyError as exc:
+            if not load_kwargs and _is_hdf5(path):
+                logger.info("No conventional layout in %s; opening the browser", path)
+                return self._load_via_browser(path)
+            self._error("Could not load the dataset", str(exc))
+            return False
         except Exception as exc:
             self._error("Could not load the dataset", str(exc))
-            return
+            return False
 
         problems = inspect_dataset(data)
         if problems:
@@ -299,16 +343,17 @@ class PtychoAlignWindow(QMainWindow):
                 QMessageBox.No,
             )
             if answer != QMessageBox.Yes:
-                return
+                return False
 
         self.raw = data
         self.preprocessed = data
         self.com = None
         self.data_panel.show_dataset(data)
-        logger.info("Loaded %s %s", path, data.data.shape)
+        logger.info("Loaded %s %s from %s", path, data.data.shape, data.metadata.get("data_path"))
 
         self._rebuild_engine()
         self.action_bar.show_status("Loaded. Apply preprocessing, then run COM pre-alignment.")
+        return True
 
     # -- preprocessing -----------------------------------------------------------------
 

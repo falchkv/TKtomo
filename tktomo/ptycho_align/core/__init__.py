@@ -15,8 +15,12 @@ from tktomo.ptycho_align.core.com import (
 )
 from tktomo.ptycho_align.core.dataset import (
     DatasetProblem,
+    Hdf5Entry,
     inspect_dataset,
+    list_hdf5_datasets,
     load_dataset,
+    load_hdf5,
+    suggest_hdf5_paths,
 )
 from tktomo.ptycho_align.core.engine import (
     AlignConfig,
@@ -33,6 +37,7 @@ __all__ = [
     "ComResult",
     "center_is_plausible",
     "DatasetProblem",
+    "Hdf5Entry",
     "IterationResult",
     "VolumePolicy",
     "algorithm_rejects_negatives",
@@ -40,5 +45,8 @@ __all__ = [
     "com_prealign",
     "find_center",
     "inspect_dataset",
+    "list_hdf5_datasets",
     "load_dataset",
+    "load_hdf5",
+    "suggest_hdf5_paths",
 ]

@@ -31,7 +31,8 @@ the caller, so the GUI — or a notebook — decides what happens between iterat
 ## The workflow
 
 1. **Load** a stack of ptychographic phase projections and their angles (HDF5,
-   `.npy`/`.npz`, or a TIFF directory plus an angles file).
+   `.npy`/`.npz`, or a TIFF directory plus an angles file). See
+   [Loading an HDF5 file of any layout](#loading-an-hdf5-file-of-any-layout).
 2. **Preprocess** — phase-ramp and offset removal, optional unwrap, invert, pad.
 3. **COM pre-alignment** — a centre-of-mass initial guess of the shifts and the
    rotation-axis position.
@@ -44,6 +45,46 @@ forward-projects it at every measured angle, cross-correlates each measured
 projection against its own reprojection to get a subpixel shift, accumulates that
 shift and re-shifts the data — always from the pristine original, never by
 re-warping already-warped data.
+
+## Loading an HDF5 file of any layout
+
+"Load projections…" probes the conventional locations (NXtomo `/entry/data/data`,
+DXchange `/exchange/data`, the blender-sim per-output groups). Real ptycho pipelines
+routinely write somewhere else entirely, so when the probe finds nothing — or when it
+finds the *wrong* array, because the file holds several 3-D datasets — use
+**"Browse HDF5…"** (also `File → Browse HDF5 datasets…`). It shows the file's actual
+tree and you point at the array you mean:
+
+- Pick the **projection stack**: any 3-D dataset, at any depth. Datasets that can be
+  neither a stack nor an angle array are still listed, but greyed out.
+- Pick the **angle array**: any 1-D dataset, or "None" to assume a uniform 0–180° scan.
+  Units are auto-detected (a span above 2π is degrees) or forced.
+- Pick the **axis order**. The alignment needs `(angle, v, u)`; a file saved as
+  `(v, u, angle)` is read with `(2, 0, 1)`. Each option is labelled with the shape it
+  produces — `angles=721, v=512, u=512` — so the right one is obvious.
+
+OK stays disabled until the angle count and the stack's leading axis agree, which is
+the mistake this dialog exists to catch: the right stack paired with the wrong 1-D
+array loads silently and then aligns garbage.
+
+The browser opens automatically if "Load projections…" is given an HDF5 file whose
+layout it cannot recognise.
+
+Headless, this is `data_path` / `angle_path` / `axis_order` on `load_dataset`:
+
+```python
+from tktomo.ptycho_align.core import list_hdf5_datasets, load_dataset
+
+for entry in list_hdf5_datasets("beamline.h5"):
+    print(entry.path, entry.shape, entry.dtype)
+
+data = load_dataset(
+    "beamline.h5",
+    data_path="/recon/2024_08/ptycho/object_phase",
+    angle_path="/recon/2024_08/ptycho/rotation",
+    axis_order=(2, 0, 1),  # stored as (v, u, angle)
+)
+```
 
 ## Scripting it
 
