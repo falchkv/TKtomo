@@ -128,3 +128,112 @@ def test_a_non_3d_dataset_is_rejected(odd_file):
 def test_a_missing_dataset_names_the_file(odd_file):
     with pytest.raises(KeyError, match="beamline.h5"):
         load_hdf5(odd_file, data_path="/nope")
+
+
+# -- complex projections and cropping ----------------------------------------------------
+
+
+@pytest.fixture
+def complex_file(tmp_path):
+    """A ptycho reconstruction as it really arrives: complex, angle-in-degrees, huge."""
+    path = tmp_path / "recon.h5"
+    v, u = np.mgrid[0:20, 0:30]
+    # A stack whose phase and amplitude are different, so a mix-up is visible.
+    phase = (v / 20.0 - 0.5).astype(np.float32)
+    amplitude = (1.0 + u / 30.0).astype(np.float32)
+    stack = (amplitude * np.exp(1j * phase))[None].repeat(9, axis=0).astype(np.complex64)
+    with h5py.File(path, "w") as f:
+        f.create_dataset("obj", data=stack)
+        f.create_dataset("angle", data=np.linspace(0.0, 180.0, 9, endpoint=False))
+        f.create_dataset("pr", data=np.zeros((9, 1, 4, 4), dtype=np.complex64))  # to be ignored
+    return path, phase, amplitude
+
+
+def test_a_4d_dataset_is_not_offered_as_a_stack(complex_file):
+    """The 'pr' probe array is 4-D; it must never be mistaken for the projections."""
+    path, _phase, _amplitude = complex_file
+    entries = {e.path: e for e in list_hdf5_datasets(path)}
+
+    assert not entries["/pr"].is_stack
+    assert suggest_hdf5_paths(list_hdf5_datasets(path)) == ("/obj", "/angle")
+
+
+def test_complex_projections_load_as_phase_or_amplitude(complex_file):
+    path, phase, amplitude = complex_file
+
+    as_phase = load_hdf5(path, data_path="/obj", angle_path="/angle", component="phase")
+    as_amplitude = load_hdf5(path, data_path="/obj", angle_path="/angle", component="amplitude")
+
+    assert as_phase.data.dtype == np.float32
+    np.testing.assert_allclose(as_phase.data[0], phase, atol=1e-6)
+    np.testing.assert_allclose(as_amplitude.data[0], amplitude, atol=1e-6)
+    assert as_phase.metadata["component"] == "phase"
+
+
+def test_complex_data_is_never_silently_cast(complex_file):
+    """numpy only *warns* on complex -> float and keeps the real part, which for a
+    ptycho object is meaningless. Every path must choose a component explicitly."""
+    from tktomo.ptycho_align.core.dataset import _finalise
+
+    path, _phase, _amplitude = complex_file
+    with pytest.raises(ValueError, match="complex"):
+        _finalise(np.zeros((2, 2, 2), dtype=np.complex64), np.zeros(2), name="x")
+
+    with pytest.raises(ValueError, match="Unknown component"):
+        load_hdf5(path, data_path="/obj", component="magnitude")
+
+
+def test_crop_reads_only_the_requested_region(complex_file):
+    path, phase, _amplitude = complex_file
+
+    cropped = load_hdf5(
+        path, data_path="/obj", angle_path="/angle", component="phase", crop=(4, 12, 6, 20)
+    )
+
+    assert cropped.data.shape == (9, 8, 14)
+    np.testing.assert_allclose(cropped.data[0], phase[4:12, 6:20], atol=1e-6)
+    assert cropped.metadata["crop"] == (4, 12, 6, 20)
+    assert cropped.metadata["full_shape"] == (9, 20, 30)
+
+
+def test_crop_is_clipped_to_the_stack_rather_than_reading_out_of_bounds(complex_file):
+    path, _phase, _amplitude = complex_file
+    data = load_hdf5(path, data_path="/obj", crop=(0, 999, 0, 999))
+    assert data.data.shape == (9, 20, 30)
+
+
+def test_crop_and_axis_order_compose(tmp_path):
+    """The crop is in the post-axis-order frame, and is still a hyperslab in the file."""
+    path = tmp_path / "angle_last.h5"
+    stored = np.arange(20 * 30 * 9, dtype=np.float32).reshape(20, 30, 9)  # (v, u, angle)
+    with h5py.File(path, "w") as f:
+        f.create_dataset("stack", data=stored)
+
+    data = load_hdf5(path, data_path="/stack", axis_order=(2, 0, 1), crop=(4, 12, 6, 20))
+
+    assert data.data.shape == (9, 8, 14)
+    np.testing.assert_allclose(data.data, np.transpose(stored, (2, 0, 1))[:, 4:12, 6:20])
+
+
+def test_progress_is_reported_and_cancelling_raises(complex_file):
+    from tktomo.ptycho_align.core import DatasetProblem
+
+    path, _phase, _amplitude = complex_file
+
+    seen = []
+    load_hdf5(path, data_path="/obj", progress=lambda done, total: seen.append((done, total)) is None)
+    assert seen[0] == (1, 9) and seen[-1] == (9, 9)
+
+    # A cancelled read must not return a half-filled stack.
+    with pytest.raises(DatasetProblem, match="cancelled"):
+        load_hdf5(path, data_path="/obj", progress=lambda done, total: done < 3)
+
+
+def test_crop_rejects_an_empty_region():
+    from tktomo.ptycho_align.core import Crop
+
+    with pytest.raises(ValueError, match="Empty crop"):
+        Crop(10, 10, 0, 5)
+
+    assert Crop(2, 6, 3, 9).shifted_by(10, 100).as_tuple() == (12, 16, 103, 109)
+    assert Crop.full((5, 20, 30)).as_tuple() == (0, 20, 0, 30)

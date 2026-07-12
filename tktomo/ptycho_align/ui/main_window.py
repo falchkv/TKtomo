@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressDialog,
     QScrollArea,
     QSplitter,
     QVBoxLayout,
@@ -35,11 +36,14 @@ from tktomo.io import ProjectionData
 from tktomo.ptycho_align.core import (
     AlignConfig,
     AlignmentEngine,
+    Crop,
+    DatasetProblem,
     algorithm_rejects_negatives,
     center_is_plausible,
     com_prealign,
     find_center,
     inspect_dataset,
+    list_hdf5_datasets,
     load_dataset,
 )
 from tktomo.ptycho_align.core import io as session_io
@@ -64,6 +68,7 @@ from tktomo.ptycho_align.ui.panels.base import (
     MODE_RAW,
     MODE_REPROJECTION,
 )
+from tktomo.ptycho_align.ui.panels.crop import CropDialog
 from tktomo.ptycho_align.ui.panels.hdf5_browser import preview_text
 from tktomo.ptycho_align.ui.worker import AlignmentRun
 
@@ -74,6 +79,10 @@ _HDF5_SUFFIXES = (".h5", ".hdf5", ".nxs", ".nx5", ".hdf")
 
 def _is_hdf5(path: str) -> bool:
     return Path(path).suffix.lower() in _HDF5_SUFFIXES
+
+
+class _Cancelled(Exception):
+    """The user cancelled the load. Not an error, so it gets no dialog."""
 
 
 class _LogDock(QObject, logging.Handler):
@@ -132,6 +141,8 @@ class PtychoAlignWindow(QMainWindow):
         self.preprocessed: ProjectionData | None = None  # engine input, before binning
         self.engine: AlignmentEngine | None = None
         self.com = None
+        # How the current stack was read, so a different crop can go back to the file.
+        self._source: dict | None = None
         self._run: AlignmentRun | None = None
         self._bin_factor = 1
         self._stacks: dict[str, np.ndarray | None] = {}
@@ -239,6 +250,7 @@ class PtychoAlignWindow(QMainWindow):
     def _connect(self) -> None:
         self.data_panel.load_requested.connect(self._choose_dataset)
         self.data_panel.browse_requested.connect(self._browse_hdf5)
+        self.data_panel.crop_requested.connect(self._adjust_crop)
         self.data_panel.session_load_requested.connect(self._open_session)
 
         self.preprocess_panel.apply_requested.connect(self._apply_preprocessing)
@@ -261,6 +273,7 @@ class PtychoAlignWindow(QMainWindow):
         file_menu = self.menuBar().addMenu("&File")
         file_menu.addAction("Load projections...", self._choose_dataset)
         file_menu.addAction("Browse HDF5 datasets...", self._browse_hdf5)
+        file_menu.addAction("Adjust crop / component...", self._adjust_crop)
         file_menu.addAction("Open session...", self._open_session)
         file_menu.addAction("Save session...", self._save_session)
         file_menu.addSeparator()
@@ -312,6 +325,104 @@ class PtychoAlignWindow(QMainWindow):
             return False
         return self.load_path(path, **dialog.selection())
 
+    def _read_with_progress(self, path: str, load_kwargs: dict) -> ProjectionData:
+        """Load, showing a cancellable progress dialog for the big HDF5 reads.
+
+        Reading 410 cropped projections off a 5 GB file takes long enough that a frozen
+        window looks like a hang. ``load_hdf5`` calls back once per projection, which is
+        also where cancellation is honoured.
+        """
+        if "data_path" not in load_kwargs:
+            return load_dataset(path, **load_kwargs)
+
+        progress = QProgressDialog("Reading projections...", "Cancel", 0, 100, self)
+        progress.setWindowTitle("Loading")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(300)  # don't flash up for a small crop
+
+        def tick(done: int, total: int) -> bool:
+            progress.setMaximum(total)
+            progress.setValue(done)
+            QApplication.processEvents()
+            return not progress.wasCanceled()
+
+        try:
+            return load_dataset(path, progress=tick, **load_kwargs)
+        except DatasetProblem as exc:
+            if progress.wasCanceled():
+                raise _Cancelled from exc
+            raise
+        finally:
+            progress.close()
+
+    def _adjust_crop(self) -> None:
+        """Re-read the stack over a different detector region, or a different component.
+
+        The crop is an HDF5 hyperslab, so widening it means going back to the file --
+        the discarded region was never in memory to begin with. That resets the
+        alignment, hence the confirmation.
+        """
+        if self.raw is None or not self._source:
+            self._error("No data", "Load a projection stack from an HDF5 file first.")
+            return
+        if self._busy():
+            return
+
+        meta = self.raw.metadata
+        full_shape = tuple(meta["full_shape"])
+        dialog = CropDialog(
+            full_shape,
+            Crop(*meta["crop"]),
+            meta.get("component", "phase"),
+            complex_source=self._source_is_complex(),
+            roi=self._roi_as_file_crop(),
+            parent=self,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        selection = dialog.selection()
+        if selection["crop"] == Crop(*meta["crop"]) and selection["component"] == meta.get(
+            "component"
+        ):
+            return  # nothing changed
+
+        if self.engine is not None and self.engine.iteration > 0:
+            answer = QMessageBox.question(
+                self,
+                "Re-read the data?",
+                f"Re-reading discards the {self.engine.iteration} completed iteration(s) "
+                "and their shifts.\n\nContinue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+
+        self.load_path(self._source["path"], **{**self._source["kwargs"], **selection})
+
+    def _source_is_complex(self) -> bool:
+        """Is the source dataset complex? (Only then is the component combo meaningful.)"""
+        entries = {e.path: e for e in list_hdf5_datasets(self._source["path"])}
+        entry = entries.get(self._source["kwargs"].get("data_path", ""))
+        return bool(entry and entry.is_complex)
+
+    def _roi_as_file_crop(self) -> Crop | None:
+        """The projection view's ROI, re-expressed in the *file's* row/column numbers.
+
+        Only meaningful while the displayed stack still has the shape it was loaded
+        with: preprocessing pads, and the bin factor shrinks, so after either of those
+        the ROI's numbers no longer index the file.
+        """
+        roi = self.projection_view.roi_bounds()
+        if roi is None or self.raw is None or not self._source:
+            return None
+        displayed = self._stacks.get(MODE_RAW)
+        if displayed is None or displayed.shape != self.raw.data.shape:
+            return None
+        v0, u0 = self.raw.metadata["crop"][0], self.raw.metadata["crop"][2]
+        return Crop(*roi).shifted_by(v0, u0)
+
     def load_path(self, path: str, **load_kwargs) -> bool:
         """Load a dataset. Extra keywords go straight to :func:`load_dataset`.
 
@@ -320,16 +431,24 @@ class PtychoAlignWindow(QMainWindow):
         "no projection dataset found" and left there.
         """
         try:
-            data = load_dataset(path, **load_kwargs)
+            data = self._read_with_progress(path, load_kwargs)
         except KeyError as exc:
             if not load_kwargs and _is_hdf5(path):
                 logger.info("No conventional layout in %s; opening the browser", path)
                 return self._load_via_browser(path)
             self._error("Could not load the dataset", str(exc))
             return False
+        except _Cancelled:
+            self.action_bar.show_status("Loading cancelled.")
+            return False
         except Exception as exc:
             self._error("Could not load the dataset", str(exc))
             return False
+
+        # Only an explicitly-addressed HDF5 stack can be re-read with a different crop.
+        self._source = (
+            {"path": path, "kwargs": load_kwargs} if "data_path" in load_kwargs else None
+        )
 
         problems = inspect_dataset(data)
         if problems:

@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from tktomo.ptycho_align.core import Hdf5Entry, list_hdf5_datasets, suggest_hdf5_paths
+from tktomo.ptycho_align.ui.panels.crop import ComponentCombo, CropBox
 
 _AXIS_ORDERS: tuple[tuple[int, int, int], ...] = (
     (0, 1, 2),
@@ -80,11 +81,16 @@ class Hdf5BrowserDialog(QDialog):
             "Which stored axis is the rotation axis. The alignment needs "
             "(angle, v, u); a file saved as (v, u, angle) is read with (2, 0, 1)."
         )
-        self.axis_combo.currentIndexChanged.connect(self._validate)
+        self.axis_combo.currentIndexChanged.connect(self._axis_order_changed)
 
         self.units_combo = QComboBox()
         self.units_combo.addItems(["Auto-detect", "Degrees", "Radians"])
         self.units_combo.setToolTip("Auto-detect treats a span above 2*pi as degrees.")
+
+        self.component_combo = ComponentCombo()
+
+        self.crop_box = CropBox()
+        self.crop_box.changed.connect(self._validate)
 
         self.status = QLabel()
         self.status.setWordWrap(True)
@@ -98,11 +104,13 @@ class Hdf5BrowserDialog(QDialog):
         form.addRow("Angles:", _row(self.angle_label, self.angle_button, self.angle_clear))
         form.addRow("Axis order:", self.axis_combo)
         form.addRow("Angle units:", self.units_combo)
+        form.addRow("Component:", self.component_combo)
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Select the 3-D projection stack, then its angle array."))
         layout.addWidget(self.tree)
         layout.addLayout(form)
+        layout.addWidget(self.crop_box)
         layout.addWidget(self.status)
         layout.addWidget(self.buttons)
 
@@ -179,8 +187,18 @@ class Hdf5BrowserDialog(QDialog):
 
     def _set_data(self, entry: Hdf5Entry) -> None:
         self._data = entry
-        self.data_label.setText(f"{entry.path}  [{' x '.join(str(n) for n in entry.shape)}]")
+        self.data_label.setText(
+            f"{entry.path}  [{' x '.join(str(n) for n in entry.shape)}, {entry.dtype}]"
+        )
         self._rebuild_axis_combo(entry)
+        # Only a complex stack has a component to choose; a real one has nothing to pick.
+        self.component_combo.setEnabled(entry.is_complex)
+        self._reshape_crop_box()
+
+    def _reshape_crop_box(self) -> None:
+        if self._data is not None:
+            order = self.axis_combo.currentData() or (0, 1, 2)
+            self.crop_box.set_full_shape(self._data.stack_shape(order))
 
     def _set_angles(self, entry: Hdf5Entry) -> None:
         self._angles = entry
@@ -207,6 +225,11 @@ class Hdf5BrowserDialog(QDialog):
 
     # -- validation ------------------------------------------------------------------
 
+    def _axis_order_changed(self) -> None:
+        # The crop is expressed in the post-axis-order frame, so it must be re-based.
+        self._reshape_crop_box()
+        self._validate()
+
     def _validate(self) -> None:
         ok = self.buttons.button(QDialogButtonBox.Ok)
 
@@ -232,7 +255,12 @@ class Hdf5BrowserDialog(QDialog):
             return
 
         source = self._angles.path if self._angles else "a uniform 0-180 deg scan"
-        self.status.setText(f"{n_angles} projections, angles from {source}.")
+        component = (
+            f", {self.component_combo.currentText()} of the complex values"
+            if self._data.is_complex
+            else ""
+        )
+        self.status.setText(f"{n_angles} projections, angles from {source}{component}.")
         ok.setEnabled(True)
 
     # -- result ----------------------------------------------------------------------
@@ -247,6 +275,8 @@ class Hdf5BrowserDialog(QDialog):
             "angle_path": self._angles.path if self._angles else None,
             "axis_order": self.axis_combo.currentData() or (0, 1, 2),
             "angles_in_degrees": {"Degrees": True, "Radians": False}.get(units),
+            "component": self.component_combo.currentText(),
+            "crop": self.crop_box.crop(),
         }
 
 

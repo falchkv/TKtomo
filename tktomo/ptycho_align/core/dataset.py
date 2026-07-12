@@ -18,14 +18,18 @@ rather than a traceback.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
 from tktomo.io import ProjectionData, load_projections
 
 __all__ = [
+    "COMPONENTS",
+    "Crop",
     "DatasetProblem",
     "Hdf5Entry",
     "angles_to_radians",
@@ -36,6 +40,7 @@ __all__ = [
     "load_npy",
     "load_tiff_directory",
     "suggest_hdf5_paths",
+    "to_real",
 ]
 
 # Above this, an angle array cannot plausibly be radians (a full turn is 2*pi).
@@ -73,14 +78,28 @@ def _finalise(
         raise ValueError(
             f"Expected a 3-D projection stack (n_theta, n_v, n_u); got shape {projections.shape}"
         )
+    if np.iscomplexobj(projections):
+        # Casting complex -> float32 only warns, and silently keeps the real part, which
+        # for a ptycho reconstruction is meaningless. Every caller must choose.
+        raise ValueError(
+            "The projections are complex. Choose a component (phase, amplitude, real, "
+            "imaginary) -- see load_hdf5(component=...)."
+        )
     metadata = {"name": name, "pixel_size_nm": pixel_size_nm}
     metadata.update(extra or {})
+    # asarray, not astype: the HDF5 reader already builds a float32 array, and a
+    # gratuitous copy of a multi-gigabyte stack doubles peak memory for nothing.
     return ProjectionData(
-        data=projections.astype(np.float32), angles=angles, metadata=metadata
+        data=np.asarray(projections, dtype=np.float32), angles=angles, metadata=metadata
     )
 
 
-def load_npy(path: str | Path, *, angles_in_degrees: bool | None = None) -> ProjectionData:
+def load_npy(
+    path: str | Path,
+    *,
+    angles_in_degrees: bool | None = None,
+    component: str = "phase",
+) -> ProjectionData:
     """Load ``.npy`` (projections only) or ``.npz`` (``projections`` + ``angles``)."""
     path = Path(path)
     if path.suffix == ".npz":
@@ -100,7 +119,9 @@ def load_npy(path: str | Path, *, angles_in_degrees: bool | None = None) -> Proj
         angles = _default_angles(len(projections))
 
     return _finalise(
-        projections, angles_to_radians(angles, angles_in_degrees), name=path.stem
+        to_real(projections, component),
+        angles_to_radians(angles, angles_in_degrees),
+        name=path.stem,
     )
 
 
@@ -167,6 +188,15 @@ class Hdf5Entry:
         """Could this be an angle array? (1-D with more than one entry.)"""
         return self.ndim == 1 and self.shape[0] > 1
 
+    @property
+    def is_complex(self) -> bool:
+        """Complex projections need a component (phase/amplitude) chosen on load."""
+        return self.dtype.startswith("complex")
+
+    def stack_shape(self, axis_order: tuple[int, int, int] = (0, 1, 2)) -> tuple[int, int, int]:
+        """The ``(angle, v, u)`` shape this dataset has under ``axis_order``."""
+        return tuple(self.shape[axis] for axis in axis_order)  # type: ignore[return-value]
+
 
 def list_hdf5_datasets(path: str | Path) -> list[Hdf5Entry]:
     """Enumerate every dataset in an HDF5 file, at any depth.
@@ -227,6 +257,78 @@ def suggest_hdf5_paths(entries: list[Hdf5Entry]) -> tuple[str | None, str | None
     return stack.path, best.path
 
 
+class Crop:
+    """A rectangular detector region, in the ``(v, u)`` frame *after* ``axis_order``.
+
+    Cropping is not a convenience here, it is what makes a large file openable at all:
+    a 410 x 733 x 1950 complex64 stack is 4.7 GB on disk and 2.3 GB as float32 in RAM,
+    and the alignment holds several copies of it. The crop is applied as an HDF5
+    hyperslab *during* the read, so the discarded region is never in memory.
+    """
+
+    __slots__ = ("v0", "v1", "u0", "u1")
+
+    def __init__(self, v0: int, v1: int, u0: int, u1: int) -> None:
+        if v1 <= v0 or u1 <= u0:
+            raise ValueError(f"Empty crop: rows {v0}:{v1}, columns {u0}:{u1}")
+        self.v0, self.v1, self.u0, self.u1 = int(v0), int(v1), int(u0), int(u1)
+
+    @classmethod
+    def full(cls, shape: tuple[int, int, int]) -> Crop:
+        """The whole detector of a stack of ``(angle, v, u)`` shape."""
+        return cls(0, shape[1], 0, shape[2])
+
+    def clipped_to(self, shape: tuple[int, int, int]) -> Crop:
+        """Clamp to a stack's bounds, so a stale crop cannot read out of range."""
+        v1 = min(self.v1, shape[1])
+        u1 = min(self.u1, shape[2])
+        return Crop(min(self.v0, v1 - 1), v1, min(self.u0, u1 - 1), u1)
+
+    def shifted_by(self, dv: int, du: int) -> Crop:
+        """Translate the crop, e.g. to re-express an ROI drawn on already-cropped data."""
+        return Crop(self.v0 + dv, self.v1 + dv, self.u0 + du, self.u1 + du)
+
+    @property
+    def height(self) -> int:
+        return self.v1 - self.v0
+
+    @property
+    def width(self) -> int:
+        return self.u1 - self.u0
+
+    def as_tuple(self) -> tuple[int, int, int, int]:
+        return (self.v0, self.v1, self.u0, self.u1)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Crop) and self.as_tuple() == other.as_tuple()
+
+    def __repr__(self) -> str:
+        return f"Crop(v={self.v0}:{self.v1}, u={self.u0}:{self.u1})"
+
+
+# How a complex projection becomes the real image the alignment works on. Phase is the
+# default: this is a phase-contrast tool, and ptycho reconstructions are complex.
+COMPONENTS: dict[str, Any] = {
+    "phase": np.angle,
+    "amplitude": np.abs,
+    "real": np.real,
+    "imaginary": np.imag,
+}
+
+
+def to_real(array: np.ndarray, component: str = "phase") -> np.ndarray:
+    """Reduce a complex array to the named real component. Real input passes through."""
+    if not np.iscomplexobj(array):
+        return np.asarray(array, dtype=np.float32)
+    try:
+        reducer = COMPONENTS[component]
+    except KeyError:
+        raise ValueError(
+            f"Unknown component {component!r}; choose one of {sorted(COMPONENTS)}"
+        ) from None
+    return np.asarray(reducer(array), dtype=np.float32)
+
+
 def load_hdf5(
     path: str | Path,
     *,
@@ -234,6 +336,9 @@ def load_hdf5(
     angle_path: str | None = None,
     axis_order: tuple[int, int, int] = (0, 1, 2),
     angles_in_degrees: bool | None = None,
+    component: str = "phase",
+    crop: Crop | tuple[int, int, int, int] | None = None,
+    progress: Callable[[int, int], bool] | None = None,
 ) -> ProjectionData:
     """Load explicitly-named datasets out of an HDF5 file of any layout.
 
@@ -247,43 +352,113 @@ def load_hdf5(
     axis_order:
         Which stored axis becomes ``(angle, v, u)``. ``(0, 1, 2)`` leaves the array
         as stored; ``(2, 0, 1)`` reads a stack saved as ``(v, u, angle)``.
+    component:
+        For complex projections (a ptycho reconstruction is complex), which real
+        component to align: ``phase`` (default), ``amplitude``, ``real``, ``imaginary``.
+        Ignored for real-valued data.
+    crop:
+        Detector region to keep, in the post-``axis_order`` ``(v, u)`` frame. Read as a
+        hyperslab one projection at a time, so the rest of the file never enters memory.
+    progress:
+        Called as ``progress(done, total)`` after each projection. Return ``False`` to
+        abort the read -- which raises :class:`DatasetProblem`, so a half-read stack can
+        never be mistaken for a whole one.
     """
     h5py = _import_h5py()
     path = Path(path)
 
+    if sorted(axis_order) != [0, 1, 2]:
+        raise ValueError(f"axis_order must be a permutation of (0, 1, 2); got {axis_order}")
+
     with h5py.File(path, "r") as f:
         if data_path not in f:
             raise KeyError(f"{data_path!r} is not in {path.name}")
-        array = np.asarray(f[data_path][()])
-        angles = np.asarray(f[angle_path][()]) if angle_path else None
-        if angle_path and angles is None:  # pragma: no cover - defensive
-            raise KeyError(f"{angle_path!r} is not in {path.name}")
+        dataset = f[data_path]
 
-    if array.ndim != 3:
-        raise ValueError(
-            f"{data_path!r} has shape {array.shape}; a projection stack must be 3-D."
-        )
-    if sorted(axis_order) != [0, 1, 2]:
-        raise ValueError(f"axis_order must be a permutation of (0, 1, 2); got {axis_order}")
-    array = np.transpose(array, axis_order)
-
-    if angles is None:
-        angles = _default_angles(array.shape[0])
-    else:
-        angles = angles_to_radians(angles, angles_in_degrees)
-        if len(angles) != array.shape[0]:
+        if dataset.ndim != 3:
             raise ValueError(
-                f"{angle_path!r} holds {len(angles)} angles but {data_path!r} has "
-                f"{array.shape[0]} projections along its leading axis. Either the angle "
-                "dataset is the wrong one, or the stack's axis order is."
+                f"{data_path!r} has shape {dataset.shape}; a projection stack must be 3-D."
             )
+
+        stack_shape = tuple(int(dataset.shape[axis]) for axis in axis_order)
+        n_angles = stack_shape[0]
+
+        if crop is None:
+            crop = Crop.full(stack_shape)  # type: ignore[arg-type]
+        elif not isinstance(crop, Crop):
+            crop = Crop(*crop)
+        crop = crop.clipped_to(stack_shape)  # type: ignore[arg-type]
+
+        angles = _read_angles(
+            f, path, data_path, angle_path, n_angles, angles_in_degrees=angles_in_degrees
+        )
+
+        array = np.empty((n_angles, crop.height, crop.width), dtype=np.float32)
+        read_plane = _plane_reader(dataset, axis_order, crop)
+        for i in range(n_angles):
+            array[i] = to_real(read_plane(i), component)
+            if progress is not None and not progress(i + 1, n_angles):
+                raise DatasetProblem(f"Loading {data_path!r} was cancelled.")
 
     return _finalise(
         array,
         angles,
         name=f"{path.stem}{data_path}",
-        extra={"source_path": str(path), "data_path": data_path, "angle_path": angle_path},
+        extra={
+            "source_path": str(path),
+            "data_path": data_path,
+            "angle_path": angle_path,
+            "axis_order": tuple(axis_order),
+            "component": component,
+            "crop": crop.as_tuple(),
+            "full_shape": stack_shape,
+        },
     )
+
+
+def _read_angles(
+    f,
+    path: Path,
+    data_path: str,
+    angle_path: str | None,
+    n_angles: int,
+    *,
+    angles_in_degrees: bool | None,
+) -> np.ndarray:
+    if not angle_path:
+        return _default_angles(n_angles)
+    if angle_path not in f:
+        raise KeyError(f"{angle_path!r} is not in {path.name}")
+    angles = angles_to_radians(np.asarray(f[angle_path][()]), angles_in_degrees)
+    if len(angles) != n_angles:
+        raise ValueError(
+            f"{angle_path!r} holds {len(angles)} angles but {data_path!r} has "
+            f"{n_angles} projections along its leading axis. Either the angle "
+            "dataset is the wrong one, or the stack's axis order is."
+        )
+    return angles
+
+
+def _plane_reader(dataset, axis_order: tuple[int, int, int], crop: Crop):
+    """Return ``read(i) -> (v, u) plane``, slicing in the file rather than in memory.
+
+    The index is built in the *stored* frame so h5py reads only the cropped hyperslab;
+    the returned plane is then transposed into the ``(v, u)`` frame ``axis_order`` asks
+    for. For the usual ``(0, 1, 2)`` this is just ``dataset[i, v0:v1, u0:u1]``.
+    """
+    angle_axis, v_axis, u_axis = axis_order
+    rest = [axis for axis in (0, 1, 2) if axis != angle_axis]
+    plane_order = (rest.index(v_axis), rest.index(u_axis))
+
+    def read(i: int) -> np.ndarray:
+        index: list[Any] = [None, None, None]
+        index[angle_axis] = i
+        index[v_axis] = slice(crop.v0, crop.v1)
+        index[u_axis] = slice(crop.u0, crop.u1)
+        plane = dataset[tuple(index)]
+        return plane if plane_order == (0, 1) else np.transpose(plane, plane_order)
+
+    return read
 
 
 def _import_h5py():

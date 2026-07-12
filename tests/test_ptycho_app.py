@@ -337,3 +337,140 @@ def test_browser_axis_order_offers_every_permutation(qtbot, odd_file):
     )
     # Each is labelled by the shape it produces, so the right one is obvious.
     assert "angles=20" in dialog.axis_combo.itemText(orders.index((0, 1, 2)))
+
+
+# -- crop and complex component ---------------------------------------------------------
+
+
+@pytest.fixture
+def auto_accept(monkeypatch):
+    """Answer the modal warnings load_path raises (phase data has a negative integral)."""
+    from PySide6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: QMessageBox.Yes))
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.Yes))
+
+
+@pytest.fixture
+def complex_file(tmp_path):
+    """A complex stack under non-standard names, with a 4-D probe array to ignore."""
+    import h5py
+
+    path = tmp_path / "recon.h5"
+    data, _sx, _sy = make_misaligned_dataset(size=24, n_angles=16, max_shift=1.0, seed=7)[:3]
+    # Scale into (-pi, pi] so exp(1j*phase) does not wrap and np.angle round-trips.
+    phase = data.data.astype(np.float32)
+    phase = phase / (np.abs(phase).max() * 1.05) * np.pi
+    with h5py.File(path, "w") as f:
+        f.create_dataset("obj", data=(np.exp(1j * phase)).astype(np.complex64))
+        f.create_dataset("angle", data=np.rad2deg(data.angles))
+        f.create_dataset("pr", data=np.zeros((16, 1, 8, 8), dtype=np.complex64))
+    return path, phase
+
+
+def test_browser_enables_the_component_choice_only_for_complex_data(qtbot, complex_file, odd_file):
+    win = PtychoAlignWindow()
+    qtbot.addWidget(win)
+
+    complex_dialog = Hdf5BrowserDialog(str(complex_file[0]), win)
+    qtbot.addWidget(complex_dialog)
+    assert complex_dialog.component_combo.isEnabled()
+    assert complex_dialog.selection()["component"] == "phase"
+    assert complex_dialog.selection()["data_path"] == "/obj"  # not the 4-D /pr
+
+    real_dialog = Hdf5BrowserDialog(str(odd_file), win)
+    qtbot.addWidget(real_dialog)
+    assert not real_dialog.component_combo.isEnabled()
+
+
+def test_loading_a_crop_of_a_complex_stack(qtbot, complex_file, auto_accept):
+    from tktomo.ptycho_align.core import Crop
+
+    path, phase = complex_file
+    win = PtychoAlignWindow()
+    qtbot.addWidget(win)
+
+    assert win.load_path(
+        str(path),
+        data_path="/obj",
+        angle_path="/angle",
+        component="phase",
+        crop=Crop(8, 24, 10, 30),
+    )
+
+    assert win.raw.data.shape == (16, 16, 20)
+    # exp(1j*phase) round-trips through np.angle for |phase| < pi.
+    np.testing.assert_allclose(win.raw.data[0], phase[0][8:24, 10:30], atol=1e-5)
+    assert win.raw.metadata["crop"] == (8, 24, 10, 30)
+    assert win.data_panel.crop_button.isEnabled()
+    assert win._source["kwargs"]["data_path"] == "/obj"
+    assert win._source_is_complex()
+
+
+def test_crop_box_reports_the_size_and_clamps_to_the_stack(qtbot):
+    from tktomo.ptycho_align.core import Crop
+    from tktomo.ptycho_align.ui.panels import CropBox
+
+    box = CropBox()
+    qtbot.addWidget(box)
+    box.set_full_shape((100, 200, 300))
+
+    assert box.is_full_frame()
+    assert box.crop() == Crop(0, 200, 0, 300)
+    assert "100 x 200 x 300" in box.size_label.text()
+
+    box.set_crop(Crop(10, 50, 20, 90))
+    assert box.crop() == Crop(10, 50, 20, 90)
+    assert not box.is_full_frame()
+
+    # A crop from a bigger stack must be clamped, never allowed to read out of range.
+    box.set_crop(Crop(0, 5000, 0, 5000))
+    assert box.crop() == Crop(0, 200, 0, 300)
+
+    box.reset_to_full()
+    assert box.is_full_frame()
+
+
+def test_crop_dialog_round_trips_the_selection(qtbot):
+    from tktomo.ptycho_align.core import Crop
+    from tktomo.ptycho_align.ui.panels import CropDialog
+
+    dialog = CropDialog(
+        (16, 64, 64), Crop(4, 40, 8, 56), "phase", complex_source=True, roi=Crop(1, 9, 2, 10)
+    )
+    qtbot.addWidget(dialog)
+
+    assert dialog.selection()["crop"] == Crop(4, 40, 8, 56)
+    assert dialog.component_combo.isEnabled()
+
+    # The ROI drawn in the projection view becomes the crop.
+    dialog.roi_button.click()
+    assert dialog.selection()["crop"] == Crop(1, 9, 2, 10)
+
+    dialog.component_combo.setCurrentText("amplitude")
+    assert dialog.selection()["component"] == "amplitude"
+
+
+def test_the_roi_maps_back_into_file_coordinates(qtbot, complex_file, auto_accept):
+    """An ROI drawn on a cropped view indexes the crop, not the file."""
+    from tktomo.ptycho_align.core import Crop
+
+    path, _phase = complex_file
+    win = PtychoAlignWindow()
+    qtbot.addWidget(win)
+    win.load_path(
+        str(path), data_path="/obj", angle_path="/angle", crop=Crop(8, 24, 10, 30)
+    )
+
+    assert win._roi_as_file_crop() is None  # no ROI drawn yet
+
+    win.projection_view.roi_check.setChecked(True)
+    win.projection_view.roi.setPos((4, 2))  # (x=column, y=row) in pyqtgraph
+    win.projection_view.roi.setSize((6, 5))
+    win.projection_view.roi.show()
+
+    mapped = win._roi_as_file_crop()
+    assert mapped is not None
+    # The ROI sits at row 2, column 4 of the crop, which starts at row 8, column 10.
+    assert mapped.v0 == 2 + 8
+    assert mapped.u0 == 4 + 10

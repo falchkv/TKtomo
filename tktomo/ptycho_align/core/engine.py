@@ -87,10 +87,19 @@ def apply_shifts(prj: np.ndarray, sy: np.ndarray, sx: np.ndarray) -> np.ndarray:
 
     The input is **mutated** by TomoPy's internal rescaling, so pass a copy.
     """
+    sy = np.asarray(sy, dtype=np.float64)
+    sx = np.asarray(sx, dtype=np.float64)
+
+    if not sy.any() and not sx.any():
+        # An identity warp, but TomoPy would still run a 5th-order spline resample over
+        # the whole stack to compute it -- 30 s for a 410 x 300 x 600 ptycho stack, on
+        # the GUI thread, every time the views refresh before the first iteration.
+        return prj
+
     from tomopy.prep.alignment import shift_images  # noqa: PLC0415
 
     # shift_images' first positional arg is applied as the row translation.
-    return shift_images(prj, np.asarray(sy, dtype=np.float64), np.asarray(sx, dtype=np.float64))
+    return shift_images(prj, sy, sx)
 
 
 @dataclass

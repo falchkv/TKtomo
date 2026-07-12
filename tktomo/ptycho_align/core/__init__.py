@@ -14,6 +14,8 @@ from tktomo.ptycho_align.core.com import (
     find_center,
 )
 from tktomo.ptycho_align.core.dataset import (
+    COMPONENTS,
+    Crop,
     DatasetProblem,
     Hdf5Entry,
     inspect_dataset,
@@ -21,6 +23,7 @@ from tktomo.ptycho_align.core.dataset import (
     load_dataset,
     load_hdf5,
     suggest_hdf5_paths,
+    to_real,
 )
 from tktomo.ptycho_align.core.engine import (
     AlignConfig,
@@ -31,10 +34,12 @@ from tktomo.ptycho_align.core.engine import (
 from tktomo.ptycho_align.core.state import AlignmentState, IterationResult, VolumePolicy
 
 __all__ = [
+    "COMPONENTS",
     "AlignConfig",
     "AlignmentEngine",
     "AlignmentState",
     "ComResult",
+    "Crop",
     "center_is_plausible",
     "DatasetProblem",
     "Hdf5Entry",
@@ -49,4 +54,5 @@ __all__ = [
     "load_dataset",
     "load_hdf5",
     "suggest_hdf5_paths",
+    "to_real",
 ]

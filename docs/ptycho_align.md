@@ -62,6 +62,8 @@ tree and you point at the array you mean:
 - Pick the **axis order**. The alignment needs `(angle, v, u)`; a file saved as
   `(v, u, angle)` is read with `(2, 0, 1)`. Each option is labelled with the shape it
   produces — `angles=721, v=512, u=512` — so the right one is obvious.
+- Pick the **component**, for a complex stack (see below).
+- Pick the **crop** — the detector region to read (see below).
 
 OK stays disabled until the angle count and the stack's leading axis agree, which is
 the mistake this dialog exists to catch: the right stack paired with the wrong 1-D
@@ -70,20 +72,56 @@ array loads silently and then aligns garbage.
 The browser opens automatically if "Load projections…" is given an HDF5 file whose
 layout it cannot recognise.
 
-Headless, this is `data_path` / `angle_path` / `axis_order` on `load_dataset`:
+### Complex projections
+
+A ptycho reconstruction is complex. Choose which real image to align:
+
+| component | what it is |
+| --- | --- |
+| `phase` (default) | the projected refractive-index decrement — what this tool is built for |
+| `amplitude` | the absorption channel; often easier to register when the phase is badly wrapped |
+| `real` / `imaginary` | escape hatches |
+
+Nothing casts complex data silently. NumPy's complex→float cast only *warns* and keeps
+the real part, which for a ptycho object is meaningless, so every load path refuses
+until a component is named.
+
+Note that the phase comes out wrapped to (−π, π]. If it is wrapped over the sample,
+enable "Unwrap phase" in the Preprocess panel — a wrapped phase is not a line integral,
+and neither the reconstruction nor the centre of mass will make sense without it.
+
+### Cropping a large stack
+
+Cropping is not a nicety on this data: a real graphite scan's `obj` is
+410 × 733 × 1950 complex64 — 4.7 GB on disk, 2.3 GB as float32 in RAM, and the
+alignment holds several copies of it. So the crop is applied as an **HDF5 hyperslab
+during the read**: the discarded region never enters memory, and reading a
+410 × 300 × 600 window off that 5 GB file takes under a second.
+
+Set it in the browser at load time, and change it afterwards with
+**"Adjust crop / component…"** in the Data panel (or `File →` the same). That dialog
+re-reads from the file — which is why widening the crop works at all — and therefore
+restarts the alignment; it asks first if you have iterations to lose. If you have a
+rectangular ROI drawn in the projection view, "Use the ROI drawn in the projection
+view" turns it into the crop, converting the ROI's coordinates back into the file's.
 
 ```python
-from tktomo.ptycho_align.core import list_hdf5_datasets, load_dataset
+from tktomo.ptycho_align.core import Crop, list_hdf5_datasets, load_dataset
 
-for entry in list_hdf5_datasets("beamline.h5"):
+for entry in list_hdf5_datasets("graphite_recon.h5"):
     print(entry.path, entry.shape, entry.dtype)
+# /angle  (410,)                float64
+# /obj    (410, 733, 1950)      complex64
+# /pr     (410, 1, 512, 512)    complex64   <- 4-D: never offered as a stack
 
 data = load_dataset(
-    "beamline.h5",
-    data_path="/recon/2024_08/ptycho/object_phase",
-    angle_path="/recon/2024_08/ptycho/rotation",
-    axis_order=(2, 0, 1),  # stored as (v, u, angle)
+    "graphite_recon.h5",
+    data_path="/obj",
+    angle_path="/angle",       # degrees; converted to radians on load
+    component="phase",
+    crop=Crop(200, 500, 700, 1300),   # rows 200:500, columns 700:1300
 )
+data.data.shape  # (410, 300, 600), float32
 ```
 
 ## Scripting it
@@ -180,9 +218,14 @@ comparing; without that, a perfectly correct alignment still "scores" ~0.2 px.
 
 ## Performance
 
-- **Bin first.** The single biggest win on a large dataset: run at 2× or 4× binning
-  until it converges, then set the bin factor back to 1 — the existing shifts are
-  rescaled automatically, and you finish at full resolution from a good starting point.
+- **Crop, then bin.** On a real ptycho stack these are the two things that decide
+  whether the tool is usable. Crop to the region that actually holds the sample (it is
+  a hyperslab read, so it costs nothing), then run at 2× or 4× binning until it
+  converges and set the bin factor back to 1 — the existing shifts are rescaled
+  automatically, and you finish at full resolution from a good starting point.
+- Every warp of the stack goes through TomoPy's `shift_images`, which is a 5th-order
+  spline resample of every projection: ~30 s for a 410 × 300 × 600 stack. That is the
+  floor on how fast an iteration can be at that size, and the reason to crop and bin.
 - The aligned stack, the reprojection and their difference are cached once per
   iteration, so scrubbing the angle slider does not recompute a reprojection.
 - Volumes are large, so only the last few iterations' volumes are kept in memory (plus

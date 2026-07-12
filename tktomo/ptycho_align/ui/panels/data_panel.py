@@ -37,6 +37,7 @@ class DataPanel(QWidget):
 
     load_requested = Signal()
     browse_requested = Signal()
+    crop_requested = Signal()
     session_load_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -57,6 +58,14 @@ class DataPanel(QWidget):
         )
         self.browse_button.clicked.connect(self.browse_requested)
 
+        self.crop_button = QPushButton("Adjust crop / component...")
+        self.crop_button.setEnabled(False)
+        self.crop_button.setToolTip(
+            "Change the detector region -- or which component of a complex stack -- and "
+            "re-read it from the file. Only available for a stack loaded from HDF5."
+        )
+        self.crop_button.clicked.connect(self.crop_requested)
+
         self.session_button = QPushButton("Open session...")
         self.session_button.clicked.connect(self.session_load_requested)
 
@@ -69,6 +78,7 @@ class DataPanel(QWidget):
 
         layout = QVBoxLayout(self)
         layout.addLayout(buttons)
+        layout.addWidget(self.crop_button)
         layout.addWidget(self.session_button)
         layout.addWidget(self.summary)
 
@@ -76,14 +86,28 @@ class DataPanel(QWidget):
         array = data.data
         angles = np.rad2deg(data.angles)
         step = float(np.mean(np.diff(angles))) if len(angles) > 1 else 0.0
-        source = data.metadata.get("data_path")
-        self.summary.setText(
-            f"<b>{data.metadata.get('name', 'dataset')}</b><br>"
-            + (f"<tt>{source}</tt><br>" if source else "")
-            + f"shape {array.shape} (angles, v, u)<br>"
-            f"angles {angles.min():.1f}..{angles.max():.1f} deg, step {step:.2f} deg<br>"
-            f"min {array.min():.4g}, max {array.max():.4g}, mean {array.mean():.4g}"
-        )
+        meta = data.metadata
+
+        self.crop_button.setEnabled(meta.get("data_path") is not None)
+
+        lines = [f"<b>{meta.get('name', 'dataset')}</b>"]
+        if meta.get("data_path"):
+            lines.append(f"<tt>{meta['data_path']}</tt>")
+        lines.append(f"shape {array.shape} (angles, v, u)")
+        if meta.get("crop") and meta.get("full_shape"):
+            v0, v1, u0, u1 = meta["crop"]
+            full = meta["full_shape"]
+            whole = (v0, v1, u0, u1) == (0, full[1], 0, full[2])
+            lines.append(
+                f"crop rows {v0}:{v1}, cols {u0}:{u1}"
+                + (" (full frame)" if whole else f" of {full[1]} x {full[2]}")
+            )
+        if meta.get("component"):
+            lines.append(f"component: <b>{meta['component']}</b>")
+        lines.append(f"angles {angles.min():.1f}..{angles.max():.1f} deg, step {step:.2f} deg")
+        lines.append(f"min {array.min():.4g}, max {array.max():.4g}, mean {array.mean():.4g}")
+
+        self.summary.setText("<br>".join(lines))
 
 
 class PreprocessPanel(QWidget):

@@ -9,6 +9,7 @@ from tktomo.ptycho_align.ui.panels.data_panel import (
     PreprocessOptions,
     PreprocessPanel,
 )
+from tktomo.ptycho_align.ui.panels.crop import ComponentCombo, CropBox, CropDialog
 from tktomo.ptycho_align.ui.panels.hdf5_browser import Hdf5BrowserDialog
 from tktomo.ptycho_align.ui.panels.projection_view import ProjectionView
 from tktomo.ptycho_align.ui.panels.shift_view import ShiftView
@@ -19,6 +20,9 @@ __all__ = [
     "ActionBar",
     "AlignPanel",
     "ComPanel",
+    "ComponentCombo",
+    "CropBox",
+    "CropDialog",
     "DataPanel",
     "Hdf5BrowserDialog",
     "PreprocessOptions",
