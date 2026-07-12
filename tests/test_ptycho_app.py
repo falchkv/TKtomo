@@ -220,6 +220,28 @@ def test_reprojection_owns_its_memory(window):
     assert window.engine.state.volume.flags.owndata
 
 
+def test_window_fits_on_a_small_screen(qtbot):
+    """The action bar must stay reachable on a 1080p display.
+
+    The four left docks stacked demanded ~1000 px of height, which pushed the window's
+    minimum past the screen and put Step/Run/Stop off the bottom edge, where they could
+    not be clicked or dragged back into view.
+    """
+    win = PtychoAlignWindow()
+    qtbot.addWidget(win)
+    win.show()
+
+    minimum = win.minimumSizeHint()
+    assert minimum.height() <= 700, f"minimum height {minimum.height()} px is too tall"
+    assert minimum.width() <= 1280, f"minimum width {minimum.width()} px is too wide"
+
+    # And it must actually shrink that far, with the action bar still inside the window.
+    win.resize(1000, 620)
+    qtbot.wait(50)
+    bottom = win.action_bar.mapTo(win, win.action_bar.rect().bottomLeft()).y()
+    assert bottom <= win.height(), "the action bar is below the bottom of the window"
+
+
 def test_export_without_a_volume_reports_clearly(window, tmp_path):
     # Nothing has been reconstructed yet, so there is no volume to write.
     with pytest.raises(ValueError, match="no volume to export"):

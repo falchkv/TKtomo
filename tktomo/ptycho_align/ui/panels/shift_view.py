@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtWidgets import QVBoxLayout, QWidget
+from PySide6.QtWidgets import QScrollArea, QVBoxLayout, QWidget
 
 from tktomo.ptycho_align.core.state import IterationResult
 
@@ -20,7 +20,18 @@ class ShiftView(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
 
-        layout = QVBoxLayout(self)
+        # Five stacked plots have a large combined minimum height, which would force the
+        # whole window taller than a 1080p screen. Scroll them instead.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QScrollArea.NoFrame)
+        outer.addWidget(area)
+
+        content = QWidget()
+        area.setWidget(content)
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(0, 0, 0, 0)
 
         self.sx_plot = pg.PlotWidget(title="Cumulative sx vs angle")
@@ -41,6 +52,7 @@ class ShiftView(QWidget):
             plot.setLabel("bottom", x_label)
             plot.setLabel("left", y_label)
             plot.showGrid(x=True, y=True, alpha=0.3)
+            plot.setMinimumHeight(130)
             layout.addWidget(plot)
 
         self._config_markers: list[pg.InfiniteLine] = []

@@ -16,6 +16,7 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
     QDockWidget,
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QScrollArea,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -88,6 +90,15 @@ class _LogDock(QObject, logging.Handler):
         self.message.emit(self.format(record))
 
 
+def _scrollable(widget: QWidget) -> QScrollArea:
+    """Wrap a panel so it can be scrolled instead of forcing the window taller."""
+    area = QScrollArea()
+    area.setWidget(widget)
+    area.setWidgetResizable(True)
+    area.setFrameShape(QScrollArea.NoFrame)
+    return area
+
+
 def bin_stack(stack: np.ndarray, factor: int) -> np.ndarray:
     """Mean-pool the detector axes by ``factor`` (angles are left alone)."""
     if factor <= 1:
@@ -105,7 +116,7 @@ class PtychoAlignWindow(QMainWindow):
     def __init__(self, path: str | None = None) -> None:
         super().__init__()
         self.setWindowTitle("ptycho-align -- reprojection alignment")
-        self.resize(1500, 950)
+        self._fit_to_screen(1500, 950)
 
         self.raw: ProjectionData | None = None  # exactly as loaded
         self.preprocessed: ProjectionData | None = None  # engine input, before binning
@@ -151,6 +162,8 @@ class PtychoAlignWindow(QMainWindow):
 
         self.log_widget = QPlainTextEdit(readOnly=True)
         self.log_widget.setMaximumBlockCount(5000)
+        self.log_widget.setMinimumHeight(60)
+        self.log_widget.setMaximumHeight(150)
         log_dock = QDockWidget("Log", self)
         log_dock.setWidget(self.log_widget)
         self.addDockWidget(Qt.BottomDockWidgetArea, log_dock)
@@ -170,17 +183,48 @@ class PtychoAlignWindow(QMainWindow):
 
     # -- construction ------------------------------------------------------------------
 
+    def _fit_to_screen(self, width: int, height: int) -> None:
+        """Open at the requested size, but never larger than the screen actually is.
+
+        A window taller than the display puts the action bar -- Step / Run / Stop --
+        off the bottom edge, where it cannot be reached or dragged back.
+        """
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:  # offscreen platform in the tests
+            self.resize(width, height)
+            return
+
+        available = screen.availableGeometry()
+        self.resize(min(width, available.width()), min(height, available.height()))
+        self.move(available.topLeft())
+
     def _add_left_docks(self) -> None:
+        docks = []
+        # Short titles: these become tab labels in a narrow dock, and anything longer
+        # gets elided to "Alignme...".
         for title, widget in (
             ("Data", self.data_panel),
-            ("Preprocess", self.preprocess_panel),
-            ("COM pre-alignment", self.com_panel),
-            ("Alignment parameters", self.align_panel),
+            ("Prep", self.preprocess_panel),
+            ("COM", self.com_panel),
+            ("Align", self.align_panel),
         ):
             dock = QDockWidget(title, self)
-            dock.setWidget(widget)
-            dock.setMinimumWidth(300)
+            # Each panel goes in a scroll area. Stacked, their natural minimum heights
+            # add up to ~1000 px, which -- with the log dock and the action bar -- pushed
+            # the window's minimum height past a 1080p screen, so the action bar could
+            # not be reached at all. Scrolling lets a dock shrink below its content.
+            dock.setWidget(_scrollable(widget))
             self.addDockWidget(Qt.LeftDockWidgetArea, dock)
+            docks.append(dock)
+
+        # Tabbed rather than stacked: four panels sharing one column leaves each of them
+        # a few scrollbar-ridden centimetres. Tabs give whichever one you are using the
+        # full height. They are still ordinary docks, so any of them can be torn off and
+        # placed side by side on a bigger screen.
+        for previous, dock in zip(docks, docks[1:]):
+            self.tabifyDockWidget(previous, dock)
+        docks[0].raise_()
+        self._left_docks = docks
 
     def _connect(self) -> None:
         self.data_panel.load_requested.connect(self._choose_dataset)
