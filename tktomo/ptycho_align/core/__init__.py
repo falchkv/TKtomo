@@ -18,7 +18,12 @@ from tktomo.ptycho_align.core.dataset import (
     inspect_dataset,
     load_dataset,
 )
-from tktomo.ptycho_align.core.engine import AlignConfig, AlignmentEngine, apply_shifts
+from tktomo.ptycho_align.core.engine import (
+    AlignConfig,
+    AlignmentEngine,
+    algorithm_rejects_negatives,
+    apply_shifts,
+)
 from tktomo.ptycho_align.core.state import AlignmentState, IterationResult, VolumePolicy
 
 __all__ = [
@@ -30,6 +35,7 @@ __all__ = [
     "DatasetProblem",
     "IterationResult",
     "VolumePolicy",
+    "algorithm_rejects_negatives",
     "apply_shifts",
     "com_prealign",
     "find_center",

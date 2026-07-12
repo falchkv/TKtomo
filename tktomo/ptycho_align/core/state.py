@@ -32,6 +32,7 @@ class IterationResult:
     wallclock_s: float
     volume: np.ndarray | None = None  # dropped for old iterations, see VolumePolicy
     config_changed: bool = False  # marks iterations where the user edited AlignConfig
+    diverging: bool = False  # residual climbed well above the best seen so far
 
     @property
     def has_volume(self) -> bool:

@@ -43,10 +43,39 @@ from tktomo.ptycho_align.core.state import AlignmentState, IterationResult, Volu
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["AlignConfig", "AlignmentEngine", "apply_shifts"]
+__all__ = [
+    "AlignConfig",
+    "AlignmentEngine",
+    "algorithm_rejects_negatives",
+    "apply_shifts",
+]
 
 # Algorithms that take neither `num_iter` nor a warm-start `init_recon`.
 _DIRECT_ALGORITHMS = frozenset({"gridrec", "fbp"})
+
+# Emission algorithms: they model photon counts with a *multiplicative* update, so they
+# assume the data is non-negative. Phase projections routinely are not (~20% of voxels
+# are negative after ramp/offset removal), and feeding them negatives makes the update
+# flip sign and diverge explosively -- residual 0.05 -> 62 within five iterations.
+_EMISSION_ALGORITHMS = frozenset({"mlem", "osem"})
+
+# How far above its own best residual a run may climb before we call it diverging.
+_DIVERGENCE_FACTOR = 2.0
+
+
+def algorithm_rejects_negatives(algorithm: str, projections: np.ndarray) -> str | None:
+    """Return a reason string if this algorithm cannot cope with this data, else None."""
+    if algorithm not in _EMISSION_ALGORITHMS:
+        return None
+    negative = int((projections < 0).sum())
+    if not negative:
+        return None
+    fraction = negative / projections.size
+    return (
+        f"'{algorithm}' is an emission algorithm and assumes non-negative data, but "
+        f"{fraction:.0%} of the projection values are negative. It will diverge. Use "
+        f"'sirt', 'art' or 'gridrec', or enable 'Invert' and re-check the preprocessing."
+    )
 
 
 def apply_shifts(prj: np.ndarray, sy: np.ndarray, sx: np.ndarray) -> np.ndarray:
@@ -137,6 +166,8 @@ class AlignmentEngine:
         # re-run tomopy. See `last_simulated` for why that matters beyond speed.
         self._last_aligned: np.ndarray | None = None
         self._last_simulated: np.ndarray | None = None
+        self._best_residual = float("inf")
+        self._warned_algorithm = False
 
     # -- accessors the GUI leans on -------------------------------------------------
 
@@ -270,7 +301,18 @@ class AlignmentEngine:
             center=center,
             wallclock_s=time.perf_counter() - started,
             config_changed=self._pending_config_change,
+            diverging=self._is_diverging(residual),
         )
+        if result.diverging:
+            logger.warning(
+                "Iteration %d is DIVERGING: residual %.4g is far above the best so far "
+                "(%.4g). Common causes: a residual phase ramp, an emission algorithm "
+                "(mlem/osem) on data with negative values, or a bad rotation centre. "
+                "Stop, revert to a good iteration, and fix the cause.",
+                result.iteration,
+                residual,
+                self._best_residual,
+            )
         self._pending_config_change = False
         self._last_aligned = prj_aligned
         self._last_simulated = sim
@@ -311,6 +353,19 @@ class AlignmentEngine:
 
     # -- internals ------------------------------------------------------------------
 
+    def _is_diverging(self, residual: float) -> bool:
+        """A run whose residual climbs well past its own best is not converging.
+
+        Iteration 1 always has a poor residual (the volume has barely formed), so only
+        judge against the best seen so far, and only once there is a history to compare
+        against.
+        """
+        if not np.isfinite(residual):
+            return True
+        diverging = self.state.history and residual > _DIVERGENCE_FACTOR * self._best_residual
+        self._best_residual = min(self._best_residual, residual)
+        return bool(diverging)
+
     def _backend(self):
         from tktomo.recon import get_backend  # noqa: PLC0415
 
@@ -323,6 +378,11 @@ class AlignmentEngine:
         kwargs: dict[str, Any] = {"algorithm": cfg.recon_algorithm, "center": self.state.center}
         if cfg.ncore is not None:
             kwargs["ncore"] = cfg.ncore
+
+        reason = algorithm_rejects_negatives(cfg.recon_algorithm, prj_aligned)
+        if reason and not self._warned_algorithm:
+            logger.warning("%s", reason)
+            self._warned_algorithm = True
 
         direct = cfg.recon_algorithm in _DIRECT_ALGORITHMS
         if not direct:

@@ -34,6 +34,7 @@ from tktomo.io import ProjectionData
 from tktomo.ptycho_align.core import (
     AlignConfig,
     AlignmentEngine,
+    algorithm_rejects_negatives,
     center_is_plausible,
     com_prealign,
     find_center,
@@ -541,6 +542,22 @@ class PtychoAlignWindow(QMainWindow):
         if self._run is not None and self._run.running:
             return
 
+        # mlem/osem on phase data (which is ~20% negative) diverges explosively rather
+        # than failing, so say so before burning a run on it.
+        reason = algorithm_rejects_negatives(
+            self.engine.config.recon_algorithm, self.engine.state.original
+        )
+        if reason:
+            answer = QMessageBox.warning(
+                self,
+                "This algorithm will diverge",
+                f"{reason}<br><br>Run it anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+
         self.action_bar.set_running(True)
         self._run = AlignmentRun(self.engine, n)
         self._run.worker.iteration_finished.connect(self._iteration_finished)
@@ -571,11 +588,26 @@ class PtychoAlignWindow(QMainWindow):
         self._refresh_views()
         if self.engine is not None and self.engine.history:
             last = self.engine.history[-1]
-            self.action_bar.show_status(
+            status = (
                 f"Iteration {last.iteration}  |  shift RMS {last.error:.4f} px  |  "
                 f"residual {last.residual:.4f}  |  {last.wallclock_s:.1f} s"
             )
+            if any(r.diverging for r in self.engine.history):
+                status = "DIVERGING -- " + status
+            self.action_bar.show_status(status)
             self.action_bar.revert_spin.setMaximum(last.iteration)
+
+            if last.diverging:
+                QMessageBox.warning(
+                    self,
+                    "The alignment is diverging",
+                    f"The residual has climbed to {last.residual:.4g}, well above the "
+                    "best this run achieved. It is not converging.<br><br>"
+                    "Usual causes: a residual phase ramp (enable 'Remove phase ramp'), "
+                    "an emission algorithm (mlem/osem) on data with negative values, a "
+                    "bad rotation centre, or too few inner reconstruction iterations."
+                    "<br><br>Revert to a good iteration before continuing.",
+                )
 
     def _revert(self, iteration: int) -> None:
         if self.engine is None:

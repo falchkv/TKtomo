@@ -231,6 +231,43 @@ def test_volume_memory_policy_drops_old_volumes(phantom):
     assert all(r.sx is not None for r in engine.history)
 
 
+def test_emission_algorithms_are_rejected_on_negative_data(phantom):
+    """mlem/osem diverge explosively on phase data instead of failing.
+
+    Observed in a real session: switching to mlem drove the residual from 0.045 to 62
+    and the shifts to 21 px within five iterations. Phase projections are ~20% negative
+    after ramp/offset removal, and an emission algorithm's multiplicative update cannot
+    cope with that.
+    """
+    from tktomo.ptycho_align.core import algorithm_rejects_negatives
+
+    data, _sx, _sy = phantom
+    negative = np.array([[[-1.0, 2.0]]], dtype=np.float32)
+    positive = np.abs(negative)
+
+    reason = algorithm_rejects_negatives("mlem", negative)
+    assert reason is not None and "diverge" in reason
+
+    assert algorithm_rejects_negatives("mlem", positive) is None
+    assert algorithm_rejects_negatives("sirt", negative) is None
+    # The real phantom is negative-valued, so the guard must fire on it.
+    assert algorithm_rejects_negatives("mlem", data.data) is not None
+
+
+def test_divergence_is_flagged(phantom):
+    """A run whose residual climbs far above its own best must say so."""
+    data, _sx, _sy = phantom
+    engine = AlignmentEngine(dataset=data, config=AlignConfig(recon_inner_iters=1))
+    engine.run(2)
+
+    assert not any(r.diverging for r in engine.history)
+
+    # Force the detector's hand: a residual far above the best seen so far.
+    best = min(r.residual for r in engine.history)
+    assert engine._is_diverging(best * 10)
+    assert engine._is_diverging(float("nan"))
+
+
 def test_alignment_config_can_change_mid_run(phantom):
     data, _sx, _sy = phantom
     engine = AlignmentEngine(dataset=data, config=AlignConfig(recon_inner_iters=1))

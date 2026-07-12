@@ -116,9 +116,18 @@ comparing; without that, a perfectly correct alignment still "scores" ~0.2 px.
 - **A bad centre.** Check the COM sinusoid fit plot. If the measured points do not sit
   on a clean sinusoid, something upstream is broken (usually the offset removal or the
   sign of the phase) and no centre estimate will save you. Try the Vo estimator.
+- **An emission algorithm on phase data.** `mlem` and `osem` model photon *counts* with
+  a multiplicative update and assume non-negative data. Phase projections are typically
+  ~20% negative after ramp/offset removal, and feeding those to `mlem` makes it diverge
+  explosively — measured on the demo phantom: residual 0.045 → 62 and shifts to 21 px
+  within five iterations. Use `sirt`, `art`, or `gridrec`. The app now warns before
+  starting such a run.
 - **Too few inner reconstruction iterations.** With `recon_inner_iters` too low the
   reprojection is too blurry to register against, and the updates are noise. Raise it,
-  or switch to `sequential` mode.
+  or switch to `sequential` mode. Note that `sequential` reconstructs from scratch every
+  outer iteration, so it needs *considerably* more inner iterations than `joint` to
+  reach the same reprojection quality — with only 2, the residual will sit stubbornly
+  high and barely move.
 - **Missing-wedge artifacts** biasing the reprojection. If the angular range is well
   under 180°, the reconstruction is elongated along the missing direction and the
   reprojection inherits that bias. Constrain the fit: switch off `align_horizontal` or
