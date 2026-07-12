@@ -50,6 +50,29 @@ def _first_present(h5file, candidates: tuple[str, ...]) -> str | None:
     return None
 
 
+def _projection_groups(h5file) -> list[str]:
+    """Top-level groups holding a 3-D ``data`` dataset (blender-sim layout)."""
+    groups = []
+    for name, item in h5file.items():
+        data = item.get("data") if hasattr(item, "get") else None
+        if data is not None and getattr(data, "ndim", 0) == 3:
+            groups.append(name)
+    return groups
+
+
+def list_projection_groups(path: str | os.PathLike[str]) -> list[str]:
+    """List per-output projection groups in an HDF5 file.
+
+    The blender-sim scripts write one top-level group per requested output
+    (``attenuation``, ``phase``, …), each with ``data`` and ``angles`` datasets.
+    Returns the names of such groups so a caller can pick one and pass
+    ``data_path=f"/{name}/data"`` to :func:`load_projections`.
+    """
+    h5py = _import_h5py()
+    with h5py.File(path, "r") as f:
+        return _projection_groups(f)
+
+
 def load_projections(
     path: str | os.PathLike[str],
     *,
@@ -74,13 +97,24 @@ def load_projections(
     with h5py.File(path, "r") as f:
         dpath = data_path or _first_present(f, _DATA_CANDIDATES)
         if dpath is None:
+            # Fall back to the blender-sim layout: one group per output, each
+            # holding "data" + "angles". Take the first (alphabetical) group.
+            groups = _projection_groups(f)
+            if groups:
+                dpath = f"/{groups[0]}/data"
+        if dpath is None:
             raise KeyError(
-                f"No projection dataset found in {path!s}. Tried {_DATA_CANDIDATES}. "
+                f"No projection dataset found in {path!s}. Tried {_DATA_CANDIDATES} "
+                "and per-output groups with a 3-D 'data' dataset. "
                 "Pass data_path=... explicitly."
             )
         data = np.asarray(f[dpath][()])
 
         apath = angle_path or _first_present(f, _ANGLE_CANDIDATES)
+        if apath is None:
+            sibling = dpath.rsplit("/", 1)[0] + "/angles"
+            if sibling.lstrip("/") in f:
+                apath = sibling
         if apath is not None:
             angles = np.asarray(f[apath][()], dtype=np.float64)
         else:
@@ -121,5 +155,31 @@ def save_projections(
         grp.create_dataset("data", data=proj.data, compression=compression)
         grp.create_dataset("theta", data=proj.angles)
         for key, value in proj.metadata.items():
+            if isinstance(value, (str, int, float, bool)):
+                grp.attrs[key] = value
+
+
+def save_volume(
+    path: str | os.PathLike[str],
+    volume: np.ndarray,
+    *,
+    angles: np.ndarray | None = None,
+    metadata: dict[str, Any] | None = None,
+    compression: str | None = "gzip",
+) -> None:
+    """Write a reconstructed volume to HDF5 at ``/tomogram/data``.
+
+    ``angles`` (radians, the projection angles the volume was reconstructed
+    from) are stored alongside at ``/tomogram/angles``; scalar/string
+    ``metadata`` entries become group attributes.
+    """
+    h5py = _import_h5py()
+    with h5py.File(path, "w") as f:
+        grp = f.create_group("tomogram")
+        grp.create_dataset("data", data=np.asarray(volume), compression=compression)
+        if angles is not None:
+            grp.create_dataset("angles", data=np.asarray(angles))
+            grp["angles"].attrs["units"] = "radians"
+        for key, value in (metadata or {}).items():
             if isinstance(value, (str, int, float, bool)):
                 grp.attrs[key] = value

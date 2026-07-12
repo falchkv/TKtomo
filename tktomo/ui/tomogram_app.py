@@ -30,11 +30,19 @@ from tktomo.ui.common import SliceViewer, run_app
 
 
 class TomogramWindow(QMainWindow):
-    def __init__(self, volume: np.ndarray | None = None) -> None:
+    def __init__(
+        self,
+        volume: np.ndarray | None = None,
+        angles: np.ndarray | None = None,
+    ) -> None:
         super().__init__()
         self.setWindowTitle("TKtomo — Tomogram")
         self.volume = generate_volume() if volume is None else np.asarray(volume)
-        self.angles = np.linspace(0.0, np.pi, 180, endpoint=False)
+        self.angles = (
+            np.linspace(0.0, np.pi, 180, endpoint=False)
+            if angles is None
+            else np.asarray(angles)
+        )
 
         self.volume_viewer = SliceViewer(self.volume, slice_label="Z")
         self.reproj_viewer = SliceViewer(slice_label="Projection")
