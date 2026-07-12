@@ -16,9 +16,11 @@ authors = [{ name = "Ken Vidar Falch" }]
 # unit tests run without the GUI / heavy reconstruction stack.
 dependencies = [
     "numpy>=1.24",
+    "scipy>=1.10",
     "h5py>=3.9",
     "hdf5plugin>=4.0",
     "scikit-image>=0.22",
+    "tifffile>=2023.7",
     "pyzmq>=25.0",
     "msgpack>=1.0",
 ]
@@ -60,6 +62,7 @@ tktomo-projection = "tktomo.ui.projection_app:main"
 tktomo-alignment = "tktomo.ui.alignment_app:main"
 tktomo-feature-alignment = "tktomo.ui.feature_alignment_app:main"
 tktomo-blender-sim = "tktomo.blender_sim.cli:main"
+ptycho-align = "tktomo.ptycho_align.ui.main_window:main"
 
 [tool.setuptools.packages.find]
 include = ["tktomo*"]

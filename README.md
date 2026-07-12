@@ -49,10 +49,31 @@ python -m tktomo.ui.tomogram_app
 python -m tktomo.ui.projection_app
 python -m tktomo.ui.alignment_app
 python -m tktomo.ui.feature_alignment_app   # align a pair of images by manual marks
+ptycho-align [projections.h5]               # interactive reprojection alignment
 ```
 
 The feature-alignment method (labelled marks → least squares, unlabelled marks →
 RANSAC) is described in [`docs/feature_alignment.md`](docs/feature_alignment.md).
+
+### `ptycho-align` — interactive reprojection alignment
+
+`tktomo.ptycho_align` drives the iterative reprojection alignment workflow for
+ptychographic tomography (Gürsoy et al., *Sci. Rep.* **7**, 11818, 2017): load phase
+projections → preprocess (phase-ramp removal) → centre-of-mass pre-alignment →
+reconstruct / reproject / register, **one inspectable iteration at a time**.
+
+TomoPy's own `align_joint`/`align_seq` run their loop internally with no way to pause,
+so the loop is re-implemented on TomoPy's primitives and exposed one iteration at a
+time. `tktomo.ptycho_align.core` is headless and scriptable; the PySide6 GUI is a thin
+shell over it, with all computation on a `QThread`.
+
+```bash
+python examples/make_phantom.py --output phantom.h5 --noise 0.02
+ptycho-align phantom.h5
+```
+
+See [`docs/ptycho_align.md`](docs/ptycho_align.md) — including the sign conventions
+(the single most likely source of a diverging alignment) and a troubleshooting guide.
 
 ## Build order
 

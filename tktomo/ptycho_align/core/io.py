@@ -185,6 +185,14 @@ def export_tiff_stack(path: str | Path, array: np.ndarray) -> None:
 
 def export_volume(path: str | Path, volume: np.ndarray, angles: np.ndarray | None = None) -> None:
     """Write a volume as TIFF or HDF5, chosen by the file suffix."""
+    if volume is None:
+        # Reverting to an iteration whose volume the memory policy dropped leaves no
+        # volume to export. Say so, rather than letting h5py complain about dtype('O').
+        raise ValueError(
+            "There is no volume to export. The memory policy keeps only the most "
+            "recent iterations' volumes, so reverting to an older one leaves none -- "
+            "run one more iteration to reconstruct it."
+        )
     path = Path(path)
     if path.suffix.lower() in (".tif", ".tiff"):
         export_tiff_stack(path, volume)
