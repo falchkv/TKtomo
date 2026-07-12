@@ -95,6 +95,32 @@ def test_com_prealign_median_variant_ignores_an_outlier():
     assert np.abs(mean_based.sy[good]).max() > 0.2
 
 
+def test_center_is_plausible_catches_a_failed_estimator():
+    """TomoPy's find_center_vo returns a number even when it has failed.
+
+    Observed on a 104 px wide padded phantom whose true axis is at 52.0: Vo returned
+    96.5 (and 0.0 with a different `ind`). A bad centre silently ruins a long run, so
+    an implausible estimate must be caught before it reaches the engine.
+    """
+    from tktomo.ptycho_align.core.com import center_is_plausible
+
+    ok, _ = center_is_plausible(52.5, width=104, reference=51.97)
+    assert ok
+
+    ok, reason = center_is_plausible(96.5, width=104, reference=51.97)
+    assert not ok and "differs from the expected" in reason
+
+    ok, reason = center_is_plausible(0.0, width=104, reference=51.97)
+    assert not ok and "outside the detector" in reason
+
+    ok, reason = center_is_plausible(float("nan"), width=104)
+    assert not ok and "finite" in reason
+
+    # With no independent reference, the detector midpoint is the fallback.
+    assert center_is_plausible(53.0, width=104)[0]
+    assert not center_is_plausible(90.0, width=104)[0]
+
+
 def test_com_prealign_rejects_zero_mass_data():
     angles = np.linspace(0.0, np.pi, 4, endpoint=False)
     with pytest.raises(ValueError, match="zero positive mass"):

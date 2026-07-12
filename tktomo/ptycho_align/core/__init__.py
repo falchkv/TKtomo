@@ -7,7 +7,12 @@ from a notebook. tomopy/skimage/scipy are imported lazily inside functions, so
 
 from __future__ import annotations
 
-from tktomo.ptycho_align.core.com import ComResult, com_prealign, find_center
+from tktomo.ptycho_align.core.com import (
+    ComResult,
+    center_is_plausible,
+    com_prealign,
+    find_center,
+)
 from tktomo.ptycho_align.core.dataset import (
     DatasetProblem,
     inspect_dataset,
@@ -21,6 +26,7 @@ __all__ = [
     "AlignmentEngine",
     "AlignmentState",
     "ComResult",
+    "center_is_plausible",
     "DatasetProblem",
     "IterationResult",
     "VolumePolicy",

@@ -131,6 +131,12 @@ def find_center(
 
     ``method`` is ``"vo"`` (:func:`tomopy.find_center_vo`) or ``"pc"``
     (:func:`tomopy.find_center_pc`, phase correlation of the 0/180 pair).
+
+    Caveat, learned the hard way: ``find_center_vo`` is tuned for real attenuation
+    sinograms and is **unreliable on zero-padded phase projections** -- on a 104 px
+    wide padded phantom it has been observed to return 96.5 or even 0.0 where the true
+    axis is 52.0. Always run the answer past :func:`center_is_plausible` before using
+    it; the COM fit and ``"pc"`` are usually the more trustworthy estimates here.
     """
     import tomopy  # noqa: PLC0415
 
@@ -140,3 +146,31 @@ def find_center(
         # find_center_pc compares two opposing projections, not the whole stack.
         return float(tomopy.find_center_pc(prj[0], prj[-1], **kwargs))
     raise ValueError(f"Unknown centre-finding method {method!r}; use 'vo' or 'pc'.")
+
+
+def center_is_plausible(
+    center: float, width: int, reference: float | None = None, *, tolerance: float = 0.1
+) -> tuple[bool, str]:
+    """Sanity-check a rotation-axis estimate. Returns ``(ok, reason)``.
+
+    A centre-finder that has failed does not say so -- it returns a number, and a bad
+    number silently ruins a long run. Two cheap checks catch the failures actually
+    seen: an axis outside the detector is impossible, and an axis far from an
+    independent estimate (the COM fit, or failing that the detector midpoint) means
+    the two disagree and at least one of them is wrong.
+
+    ``tolerance`` is a fraction of the detector width.
+    """
+    if not np.isfinite(center):
+        return False, "the estimate is not a finite number"
+    if not 0.0 < center < width:
+        return False, f"{center:.2f} px lies outside the detector (0..{width} px)"
+
+    reference = width / 2.0 if reference is None else reference
+    limit = tolerance * width
+    if abs(center - reference) > limit:
+        return False, (
+            f"{center:.2f} px differs from the expected {reference:.2f} px by more than "
+            f"{limit:.1f} px ({tolerance:.0%} of the detector width)"
+        )
+    return True, ""

@@ -32,6 +32,7 @@ from tktomo.io import ProjectionData
 from tktomo.ptycho_align.core import (
     AlignConfig,
     AlignmentEngine,
+    center_is_plausible,
     com_prealign,
     find_center,
     inspect_dataset,
@@ -362,8 +363,32 @@ class PtychoAlignWindow(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
 
-        self.com_panel.set_center(center)
         logger.info("Centre estimate (%s): %.3f px", method, center)
+
+        # A failed centre-finder returns a number rather than an error, and a bad centre
+        # quietly ruins a long run. find_center_vo in particular is unreliable on padded
+        # phase data. Check it against the COM fit before letting it anywhere near the
+        # engine.
+        width = self.engine.state.original.shape[2]
+        reference = self.com.center if self.com else None
+        ok, reason = center_is_plausible(center, width, reference)
+        if not ok:
+            logger.warning("Rejected centre estimate (%s): %s", method, reason)
+            answer = QMessageBox.warning(
+                self,
+                "Implausible centre estimate",
+                f"The '{method}' estimator returned <b>{center:.3f} px</b>, but {reason}."
+                "<br><br>TomoPy's Vo estimator is tuned for attenuation sinograms and is "
+                "unreliable on zero-padded phase projections. The COM fit and the "
+                "phase-correlation estimator are usually more trustworthy here."
+                "<br><br>Use it anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+
+        self.com_panel.set_center(center)
 
     def _set_center(self, center: float) -> None:
         if self.engine is None:

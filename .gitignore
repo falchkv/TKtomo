@@ -11,3 +11,7 @@ dist/
 .idea/workspace.xml
 xray_projection.png
 *.blend1
+
+# ptycho-align scratch data
+phantom.h5
+phantom_truth.npz
