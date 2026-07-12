@@ -10,3 +10,4 @@ dist/
 !tests/**/*.h5
 .idea/workspace.xml
 xray_projection.png
+*.blend1

@@ -53,8 +53,8 @@ UNIT_SCALE = 1e-3
 
 def setup_scene(
     beam: str = "parallel",
-    camera_distance: float = 500.0,
-    detector_width: float = 100.0,
+    camera_distance: float = 10.0,
+    detector_width: float = 0.1,
     clear: bool = True,
 ):
     """Create the fixed acquisition geometry; returns the ``sample_root`` Empty.
@@ -393,16 +393,40 @@ def extract_slab_integrals(
     return slab_delta, slab_beta
 
 
+def slab_count(slice_spacing: float | None) -> int:
+    """Number of multislice slabs at the current pose (1 = single slab).
+
+    ``slice_spacing`` is in **metres** (physics-side, like everywhere else);
+    the count adapts to the sample's extent along the camera view axis, exactly
+    as :func:`extract_slab_integrals` will slice it.
+    """
+    import bpy
+
+    if not slice_spacing:
+        return 1
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    bodies = _bodies()
+    _, _, _, _, view = _camera_frame()
+    s_min, s_max = _sample_axis_bounds(depsgraph, bodies, view)
+    extent = max(s_max - s_min, 0.0)
+    scene_spacing = slice_spacing / UNIT_SCALE
+    if extent == 0.0 or scene_spacing >= extent:
+        return 1
+    return math.ceil(extent / scene_spacing)
+
+
 def build_demo_scene(
     beam: str = "parallel",
-    camera_distance: float = 500.0,
-    detector_width: float = 100.0,
+    camera_distance: float = 10.0,
+    detector_width: float = 0.1,
 ):
     """Self-contained demo: a cube and a sphere with plausible X-ray constants.
 
     Lets every run mode work with no scene prepared, mirroring the phantom
-    fallback the UIs use. All coordinates are Blender units = **mm** (a 30 mm
-    cube, 12 mm sphere, camera 0.5 m away). Returns the created bodies.
+    fallback the UIs use. All coordinates are Blender units = **mm**: a 30 µm
+    cube and a 24 µm sphere inside a 100 µm × 100 µm orthographic field of view,
+    camera 10 mm from the origin — a scale at which near-field propagation
+    fringes are visible. Returns the created bodies.
     """
     import bpy
 
@@ -411,12 +435,12 @@ def build_demo_scene(
         camera_distance=camera_distance,
         detector_width=detector_width,
     )
-    bpy.ops.mesh.primitive_cube_add(size=30.0, location=(8.0, 0.0, 0.0))
+    bpy.ops.mesh.primitive_cube_add(size=0.03, location=(0.008, 0.0, 0.0))
     cube = bpy.context.active_object
     cube.name = "demo_cube"
     add_body(cube, Material("demo_dense", delta=2e-6, beta=2e-9))
 
-    bpy.ops.mesh.primitive_uv_sphere_add(radius=12.0, location=(-15.0, 0.0, 8.0))
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=0.012, location=(-0.015, 0.0, 0.008))
     sphere = bpy.context.active_object
     sphere.name = "demo_sphere"
     add_body(sphere, Material("demo_light", delta=5e-7, beta=4e-10))

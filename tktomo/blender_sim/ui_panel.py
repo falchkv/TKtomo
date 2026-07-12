@@ -146,9 +146,18 @@ def register() -> None:
                 column = box.column(align=True)
                 column.prop(wm, "tktomo_method")
                 column.prop(wm, "tktomo_distance")
-                column.prop(wm, "tktomo_slice_spacing")
                 if wm.tktomo_method == "fresnel_scaling":
                     column.prop(wm, "tktomo_r1")
+                column.prop(wm, "tktomo_multislice")
+                if wm.tktomo_multislice:
+                    column.prop(wm, "tktomo_slice_spacing")
+                    try:
+                        count = scene_layer.slab_count(
+                            wm.tktomo_slice_spacing * scene_layer.UNIT_SCALE
+                        )
+                        column.label(text=f"Slices: {count}")
+                    except ValueError:
+                        column.label(text="Slices: –")
             box.operator(TKTOMO_OT_project_now.bl_idname, icon="RENDER_STILL")
             box.prop(wm, "tktomo_live", toggle=True, icon="FILE_REFRESH")
 
@@ -213,11 +222,17 @@ def register() -> None:
         "(Blender units = mm)",
         default=viewer.DEFAULT_DISTANCE / unit, min=0.0, update=_settings_changed,
     )
+    bpy.types.WindowManager.tktomo_multislice = bpy.props.BoolProperty(
+        name="Multislice",
+        description="Propagate slab-by-slab through the sample instead of the "
+        "single-slab projection approximation",
+        default=False, update=_settings_changed,
+    )
     bpy.types.WindowManager.tktomo_slice_spacing = bpy.props.FloatProperty(
         name="Slice Δz (mm)",
         description="Multislice slab thickness along the beam (Blender units = mm); "
-        "0 = single slab (projection approximation)",
-        default=viewer.DEFAULT_SLICE_SPACING / unit, min=0.0, update=_settings_changed,
+        "the slice count adapts to the sample extent",
+        default=viewer.DEFAULT_SLICE_SPACING / unit, min=1e-9, update=_settings_changed,
     )
     bpy.types.WindowManager.tktomo_r1 = bpy.props.FloatProperty(
         name="r1 (mm)",
@@ -260,7 +275,7 @@ def unregister() -> None:
     _classes.clear()
     for prop in ("tktomo_delta", "tktomo_beta", "tktomo_energy_kev",
                  "tktomo_resolution", "tktomo_output", "tktomo_propagate",
-                 "tktomo_method", "tktomo_distance", "tktomo_slice_spacing",
-                 "tktomo_r1", "tktomo_live"):
+                 "tktomo_method", "tktomo_distance", "tktomo_multislice",
+                 "tktomo_slice_spacing", "tktomo_r1", "tktomo_live"):
         if hasattr(bpy.types.WindowManager, prop):
             delattr(bpy.types.WindowManager, prop)

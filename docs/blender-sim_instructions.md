@@ -52,10 +52,20 @@ the sample bounds, and displays the attenuation map in a Blender Image Editor
 
 `examples/launch_blender.py` is the session starter: `python
 examples/launch_blender.py [--beam cone]` opens the Blender GUI with the demo
-scene built, the "X-ray Sim" sidebar panel registered, and a viewer column opened
-next to the viewport — the projection image on top, a camera's-eye 3D view (what
-the X-ray camera sees) below it (nothing persists in Blender between sessions, so
-run this after every restart). It keeps already
+scene built (100 µm × 100 µm orthographic field of view, camera 10 mm from the
+origin, micro-scale bodies — near-field fringes are visible at this scale), the
+"X-ray Sim" sidebar panel registered **and opened**, and a viewer column next to
+the viewport — the projection image on top, a camera's-eye 3D view (what the
+X-ray camera sees) below it (nothing persists in Blender between sessions, so
+run this after every restart).
+
+`examples/headless_projections.py` generates projections headlessly from a
+`.blend` file: it feeds in **z rotation angles only** (single-axis scan) and
+writes the results plus metadata (energy, pixel size, propagation settings,
+source file) to HDF5 via h5py — `blender --background my_scene.blend --python
+examples/headless_projections.py -- --angles 0 180 64 --output proj.h5`, or
+`python examples/headless_projections.py --blend my_scene.blend …` under pip
+`bpy`. It keeps already
 tagged bodies when given an existing `.blend`
 (`blender my_scene.blend --python examples/launch_blender.py`), and finds Blender
 via `--blender`, `$BLENDER`, or PATH.
@@ -125,8 +135,10 @@ Any closed mesh becomes part of the simulation once it is tagged and parented to
    switches to intensity, what a detector sees) and an optional **Propagate**
    stage with the **method** dropdown enumerated
    from the propagator registry (fresnel, angular_spectrum, fraunhofer,
-   fresnel_scaling), detector distance, multislice Δz, and r1 for
-   fresnel_scaling.
+   fresnel_scaling), detector distance, r1 for fresnel_scaling, and an explicit
+   **Multislice** tick box (off by default — single-slab projection
+   approximation) revealing the Δz field and a read-only **slice count** for the
+   current pose.
 
 2. **One call for the selection** (scripting window / MCP):
 

@@ -60,7 +60,8 @@ def _setup_inside_blender(argv: list[str]) -> None:
 
     if not bpy.app.background:
         # build the viewer layout via a one-shot timer, once the UI is fully up:
-        # projection Image Editor on top, camera's-eye 3D view below it
+        # projection Image Editor on top, camera's-eye 3D view below it, and the
+        # "X-ray Sim" sidebar opened in the main viewport
         def _first_projection():
             from tktomo.blender_sim import viewer
 
@@ -68,7 +69,21 @@ def _setup_inside_blender(argv: list[str]) -> None:
                 print(f"Viewer layout: {viewer.setup_viewer_layout()}")
             except Exception as exc:  # noqa: BLE001  (startup must not crash)
                 print(f"Initial projection failed: {exc}")
+            _open_sidebar()
             return None
+
+        def _open_sidebar():
+            for window in bpy.context.window_manager.windows:
+                for area in window.screen.areas:
+                    if area.type != "VIEW_3D":
+                        continue
+                    area.spaces.active.show_region_ui = True  # the N sidebar
+                    for region in area.regions:  # best effort: focus our tab
+                        if region.type == "UI":
+                            try:
+                                region.active_panel_category = "X-ray Sim"
+                            except (AttributeError, TypeError):
+                                pass
 
         bpy.app.timers.register(_first_projection, first_interval=0.5)
 

@@ -39,7 +39,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--energy", type=float, default=17.0, help="Photon energy, keV.")
     parser.add_argument(
-        "--detector-width", type=float, default=100.0,
+        "--detector-width", type=float, default=0.1,
         help="Demo-scene field of view at the sample plane, Blender units = mm "
         "(sets the camera's ortho scale / focal angle; ignored with --use-scene, "
         "where the loaded camera's intrinsics define the field of view).",

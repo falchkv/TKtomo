@@ -32,9 +32,9 @@ DEFAULT_ENERGY_KEV = 17.0
 DEFAULT_RESOLUTION = 128
 DEFAULT_OUTPUT = "attenuation"  # or "phase" / "intensity"
 DEFAULT_METHOD = "fresnel"
-DEFAULT_DISTANCE = 0.05  # exit-wave → detector hop, metres
-DEFAULT_SLICE_SPACING = 0.0  # 0 = single slab (projection approximation)
-DEFAULT_R1 = 0.5  # source→sample distance for fresnel_scaling, metres
+DEFAULT_DISTANCE = 1e-3  # exit-wave → detector hop, metres
+DEFAULT_SLICE_SPACING = 1e-5  # multislice Δz, metres (used only when enabled)
+DEFAULT_R1 = 1e-2  # source→sample distance for fresnel_scaling, metres
 
 _live = False
 _dirty = False
@@ -214,10 +214,13 @@ def _settings() -> dict:
         "propagate": bool(getattr(wm, "tktomo_propagate", False)),
         "method": method,
         "distance": float(getattr(wm, "tktomo_distance", DEFAULT_DISTANCE / unit)) * unit,
-        "slice_spacing": float(
-            getattr(wm, "tktomo_slice_spacing", DEFAULT_SLICE_SPACING / unit)
-        )
-        * unit,
+        # multislice is an explicit opt-in: Δz only counts when the box is ticked
+        "slice_spacing": (
+            float(getattr(wm, "tktomo_slice_spacing", DEFAULT_SLICE_SPACING / unit))
+            * unit
+            if bool(getattr(wm, "tktomo_multislice", False))
+            else 0.0
+        ),
     }
     if method == "fresnel_scaling":
         kwargs["method_kwargs"] = {
