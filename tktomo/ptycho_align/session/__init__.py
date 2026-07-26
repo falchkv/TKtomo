@@ -21,6 +21,8 @@ from tktomo.ptycho_align.session.engine_host import (
     EngineHost,
 )
 from tktomo.ptycho_align.session.local import LocalSession
+from tktomo.ptycho_align.session.remote import Disconnected, RemoteSession
+from tktomo.ptycho_align.session.server import DEFAULT_ADDRESS, SessionServer
 from tktomo.ptycho_align.session.protocol import (
     AlignmentSession,
     Busy,
@@ -49,9 +51,11 @@ __all__ = [
     "STACK_KEYS",
     "STACK_RAW",
     "STACK_REPROJECTION",
+    "DEFAULT_ADDRESS",
     "AlignmentSession",
     "Busy",
     "DatasetSummary",
+    "Disconnected",
     "EngineHost",
     "Event",
     "EventBatch",
@@ -63,9 +67,11 @@ __all__ = [
     "NoEngine",
     "PlaneRef",
     "PreprocessReport",
+    "RemoteSession",
     "ResourceSample",
     "RunPreflight",
     "SessionError",
+    "SessionServer",
     "SessionSummary",
     "StackSpec",
 ]

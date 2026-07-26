@@ -295,6 +295,18 @@ class EngineHost:
     def job_state(self, job_id: str) -> JobState | None:
         return self._jobs.get(job_id)
 
+    def job_settled(self, job_id: str) -> bool:
+        """Has the job finished *and* had its terminal event emitted?
+
+        Not the same question as ``job_state(...).done``, which ``_execute`` sets one
+        statement before the emit. Local ``wait`` blocks on this flag, so by the time it
+        returns every subscriber has already seen the job's events; a client polling
+        ``done`` instead would return in that window and miss them. Same guarantee,
+        askable from the other side of a socket.
+        """
+        event = self._job_done.get(job_id)
+        return bool(event is not None and event.is_set())
+
     def cancel_job(self, job_id: str) -> None:
         with self._state_lock:
             state = self._jobs.get(job_id)

@@ -225,6 +225,20 @@ class AlignmentSession(Protocol):
     is in this process or on a cluster. That is what the conformance suite pins down.
     """
 
+    # -- where the compute is ------------------------------------------------------
+    #
+    # The window is not supposed to branch on these -- if it needs to know where the
+    # engine is in order to work, the abstraction has already failed. They are for
+    # telling the *user*, who very much does need to know which machine is about to
+    # spend an hour, and whose filesystem a path refers to.
+
+    @property
+    def is_remote(self) -> bool: ...
+
+    def describe(self) -> str:
+        """Somewhere to show in the title bar: "this machine", or an address."""
+        ...
+
     # -- events and state ----------------------------------------------------------
 
     def summary(self, since_iteration: int = 0) -> SessionSummary:

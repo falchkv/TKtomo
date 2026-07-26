@@ -149,6 +149,39 @@ for result in engine.run(20):
 `align_joint`); `mode="sequential"` reconstructs from scratch each time (like
 `align_seq`).
 
+## Running the engine on another machine
+
+The data and the cores are often not where you want the window. Serve the engine where
+the data is, and point the GUI at it:
+
+```bash
+# On the machine with the data (no GUI needed -- installs without the `ui` extra):
+ptycho-align-server --address tcp://127.0.0.1:5610
+
+# On your laptop, through an SSH tunnel:
+ssh -N -L 5610:localhost:5610 node07 &
+ptycho-align --connect tcp://127.0.0.1:5610
+```
+
+The window is identical either way — it drives an `AlignmentSession`, and `LocalSession`
+and `RemoteSession` are interchangeable. `tests/test_session_conformance.py` runs every
+one of its tests against both, over a real socket, which is what keeps that true.
+
+Two things do change, and the title bar says so when you are connected:
+
+- **Paths resolve on the server.** The file you type, the dataset browser, "save
+  session" and every export refer to *its* filesystem, not yours. Nothing is uploaded or
+  downloaded; the 4.7 GB file never crosses the link.
+- **The resource panel shows the server's load**, because that is the machine about to
+  spend an hour.
+
+What crosses the wire is a summary (kilobytes) plus the single 2-D plane each viewer is
+displaying. Closing the window **disconnects rather than cancels** — a run keeps going,
+and reconnecting to the same server picks it up with its history intact.
+
+> There is no authentication or encryption. Bind to `127.0.0.1` and use an SSH tunnel;
+> do not expose the port on an untrusted network.
+
 ## Sign conventions (read this before changing the engine)
 
 Three conventions were pinned down by reading TomoPy's source, and each is a bug if

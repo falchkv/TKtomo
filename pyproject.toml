@@ -63,6 +63,9 @@ tktomo-alignment = "tktomo.ui.alignment_app:main"
 tktomo-feature-alignment = "tktomo.ui.feature_alignment_app:main"
 tktomo-blender-sim = "tktomo.blender_sim.cli:main"
 ptycho-align = "tktomo.ptycho_align.ui.main_window:main"
+# Serves an engine to a remote ptycho-align window. No GUI, so it installs and runs
+# without the `ui` extra -- which is the point: it goes on the machine with the data.
+ptycho-align-server = "tktomo.ptycho_align.session.server:main"
 
 [tool.setuptools.packages.find]
 include = ["tktomo*"]

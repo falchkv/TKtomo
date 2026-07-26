@@ -38,6 +38,8 @@ from tktomo.ptycho_align.session import (  # noqa: E402
     LocalSession,
     NoEngine,
     PlaneRef,
+    RemoteSession,
+    SessionServer,
 )
 from tktomo.ptycho_align.session.protocol import (  # noqa: E402
     EVENT_ITERATION,
@@ -48,15 +50,27 @@ from tktomo.ptycho_align.session.protocol import (  # noqa: E402
 TIMEOUT = 300.0
 
 
-@pytest.fixture(params=["local"])
+@pytest.fixture(params=["local", "remote"])
 def session(request):
-    """One session per implementation. Add "remote" here when the transport lands."""
+    """One session per implementation. Every test below runs against both.
+
+    The remote one goes over a real TCP socket on an ephemeral port, not a stub: the
+    encoding, the threading and the polling are exactly what a cluster connection would
+    use, because those are where local and remote can actually differ.
+    """
     if request.param == "local":
         made = LocalSession()
-    else:  # pragma: no cover - reserved for the remote implementation
-        raise NotImplementedError(request.param)
-    yield made
-    made.close()
+        yield made
+        made.close()
+        return
+
+    server = SessionServer(address="tcp://127.0.0.1:*").start()
+    made = RemoteSession(server.endpoint)
+    try:
+        yield made
+    finally:
+        made.close()
+        server.stop()
 
 
 @pytest.fixture

@@ -127,12 +127,17 @@ def _scrollable(widget: QWidget) -> QScrollArea:
 class PtychoAlignWindow(QMainWindow):
     def __init__(self, path: str | None = None, session=None) -> None:
         super().__init__()
-        self.setWindowTitle("ptycho-align -- reprojection alignment")
         self._fit_to_screen(1500, 950)
 
         # Defaults to an in-process session. Passing one in is how a cluster connection
         # arrives: nothing below this line knows or cares which it is.
         self.session = session if session is not None else LocalSession()
+        # The one place the window does look: a user driving a machine 400 km away needs
+        # to be told, not least because every path they type resolves over there.
+        title = "ptycho-align -- reprojection alignment"
+        if self.session.is_remote:
+            title += f"  [engine on {self.session.describe()}]"
+        self.setWindowTitle(title)
         self.bridge = SessionBridge(self.session, self)
         self._summary: SessionSummary = self.session.summary()
         # Every pixel the viewers draw comes through here, one displayed plane at a time.
@@ -1178,10 +1183,25 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description="Interactive reprojection alignment.")
     parser.add_argument("path", nargs="?", help="projection stack to open (HDF5/npy/npz)")
+    parser.add_argument(
+        "--connect",
+        metavar="ADDRESS",
+        help="drive an engine served by ptycho-align-server, e.g. tcp://node07:5610. "
+        "Paths are then resolved on that machine, not this one: PATH, the file "
+        "browser and the exports all refer to its filesystem.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
-    return run_app(lambda: PtychoAlignWindow(args.path))
+
+    session = None
+    if args.connect:
+        from tktomo.ptycho_align.session import RemoteSession  # noqa: PLC0415
+
+        session = RemoteSession(args.connect)
+        logger.info("Driving the engine on %s", args.connect)
+
+    return run_app(lambda: PtychoAlignWindow(args.path, session=session))
 
 
 if __name__ == "__main__":
