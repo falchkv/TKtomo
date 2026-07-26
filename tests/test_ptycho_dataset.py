@@ -237,3 +237,44 @@ def test_crop_rejects_an_empty_region():
 
     assert Crop(2, 6, 3, 9).shifted_by(10, 100).as_tuple() == (12, 16, 103, 109)
     assert Crop.full((5, 20, 30)).as_tuple() == (0, 20, 0, 30)
+
+
+def test_load_kwargs_survive_a_json_round_trip():
+    """The browser builds these kwargs; the file they describe may be on another machine.
+
+    `Crop` is not serialisable at all, and tuples come back as lists. `load_hdf5` happens
+    to tolerate a list for both today, but the dict is also stored in `metadata` and
+    compared against later, where a list-vs-tuple mismatch is a silent inequality.
+    """
+    import json
+
+    from tktomo.ptycho_align.core import Crop, coerce_load_kwargs, jsonable_load_kwargs
+
+    kwargs = {
+        "data_path": "/obj",
+        "angle_path": "/theta",
+        "axis_order": (1, 0, 2),
+        "angles_in_degrees": True,
+        "component": "phase",
+        "crop": Crop(2, 30, 5, 100),
+    }
+
+    restored = coerce_load_kwargs(json.loads(json.dumps(jsonable_load_kwargs(kwargs))))
+
+    assert restored == kwargs
+    assert isinstance(restored["crop"], Crop)
+    assert isinstance(restored["axis_order"], tuple)
+
+
+def test_load_kwargs_coercion_tolerates_absent_optional_keys():
+    from tktomo.ptycho_align.core import coerce_load_kwargs, jsonable_load_kwargs
+
+    kwargs = {"data_path": "/obj", "crop": None, "axis_order": None}
+    assert coerce_load_kwargs(jsonable_load_kwargs(kwargs)) == kwargs
+
+
+def test_load_kwargs_coercion_rejects_a_bad_axis_order():
+    from tktomo.ptycho_align.core import coerce_load_kwargs
+
+    with pytest.raises(ValueError, match="permutation"):
+        coerce_load_kwargs({"axis_order": [0, 1, 1]})

@@ -45,14 +45,24 @@ class Hdf5BrowserDialog(QDialog):
 
     ``dialog.selection()`` returns the keyword arguments for
     :func:`tktomo.ptycho_align.core.load_dataset`.
+
+    Pass ``entries`` when the file is not on this machine: listing it is the one part of
+    browsing that needs to touch the disk, so it is done wherever the disk is and the
+    result handed in. Omitting it reads the local file, as before.
     """
 
-    def __init__(self, path: str, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        path: str,
+        parent: QWidget | None = None,
+        *,
+        entries: list[Hdf5Entry] | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"Choose datasets - {path.rsplit('/', 1)[-1]}")
         self.path = path
 
-        self.entries = list_hdf5_datasets(path)
+        self.entries = list(entries) if entries is not None else list_hdf5_datasets(path)
         self._data: Hdf5Entry | None = None
         self._angles: Hdf5Entry | None = None
 
@@ -290,9 +300,12 @@ def _row(*widgets: QWidget) -> QWidget:
     return container
 
 
-def preview_text(path: str) -> str:
-    """One-line summary of an HDF5 file's arrays, for the log."""
-    entries = list_hdf5_datasets(path)
+def preview_text(entries: list[Hdf5Entry]) -> str:
+    """One-line summary of an HDF5 file's arrays, for the log.
+
+    Takes the listing rather than the path so it can describe a file on another machine
+    without a second trip to it.
+    """
     stacks = [e for e in entries if e.is_stack]
     return (
         f"{len(entries)} dataset(s), {len(stacks)} of them 3-D "

@@ -13,10 +13,14 @@ scipy/skimage are imported lazily so importing this module stays light.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 __all__ = [
+    "PreprocessOptions",
     "background_mask",
+    "bin_stack",
     "check_mass_positive",
     "crop",
     "invert",
@@ -26,6 +30,22 @@ __all__ = [
     "scale",
     "unwrap_phase",
 ]
+
+
+@dataclass
+class PreprocessOptions:
+    """Which preprocessing steps to apply, and with what parameters.
+
+    Lives here rather than beside the checkboxes that produce it because the pass runs
+    wherever the stack is -- which is not necessarily where the window is.
+    """
+
+    remove_ramp: bool = True
+    remove_offset: bool = True
+    unwrap: bool = False
+    invert: bool = False
+    border: int = 8
+    pad_percent: float = 15.0
 
 
 def background_mask(shape: tuple[int, int], border: int = 8) -> np.ndarray:
@@ -132,6 +152,25 @@ def pad(prj: np.ndarray, pad_u: int, pad_v: int) -> np.ndarray:
     if pad_u < 0 or pad_v < 0:
         raise ValueError("padding must be non-negative")
     return np.pad(prj, ((0, 0), (pad_v, pad_v), (pad_u, pad_u)), mode="constant")
+
+
+def bin_stack(stack: np.ndarray, factor: int) -> np.ndarray:
+    """Mean-pool the detector axes by ``factor`` (angles are left alone).
+
+    Binning is the single biggest lever on a large stack: the cost of an iteration goes
+    as ``width^2`` (see :func:`~tktomo.ptycho_align.core.estimates.iteration_cost_units`),
+    so bin 2 is worth roughly eightfold, not twofold. Shifts and the rotation centre are
+    in pixels and so have to be rescaled alongside it --
+    :meth:`~tktomo.ptycho_align.core.state.AlignmentState.rescale_shifts` is the
+    counterpart.
+    """
+    if factor <= 1:
+        return stack
+    n, height, width = stack.shape
+    height -= height % factor
+    width -= width % factor
+    trimmed = stack[:, :height, :width]
+    return trimmed.reshape(n, height // factor, factor, width // factor, factor).mean(axis=(2, 4))
 
 
 def invert(prj: np.ndarray) -> np.ndarray:

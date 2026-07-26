@@ -12,6 +12,7 @@ from tktomo.ptycho_align.ui.panels.data_panel import (
 from tktomo.ptycho_align.ui.panels.crop import ComponentCombo, CropBox, CropDialog
 from tktomo.ptycho_align.ui.panels.hdf5_browser import Hdf5BrowserDialog
 from tktomo.ptycho_align.ui.panels.projection_view import ProjectionView
+from tktomo.ptycho_align.ui.panels.resources import ResourceView
 from tktomo.ptycho_align.ui.panels.shift_view import ShiftView
 from tktomo.ptycho_align.ui.panels.sinogram_view import SinogramView
 from tktomo.ptycho_align.ui.panels.tomogram_view import TomogramView
@@ -28,6 +29,7 @@ __all__ = [
     "PreprocessOptions",
     "PreprocessPanel",
     "ProjectionView",
+    "ResourceView",
     "ShiftView",
     "SinogramView",
     "TomogramView",

@@ -7,6 +7,7 @@ step, run, stop, revert, save/reload, and the binned-preview shift rescaling.
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -21,12 +22,16 @@ from make_phantom import make_misaligned_dataset  # noqa: E402
 
 from tktomo.io import save_projections  # noqa: E402
 from tktomo.ptycho_align.core import io as session_io  # noqa: E402
-from tktomo.ptycho_align.core import load_dataset  # noqa: E402
-from tktomo.ptycho_align.ui.main_window import PtychoAlignWindow, bin_stack  # noqa: E402
+from PySide6.QtWidgets import QMessageBox  # noqa: E402
+
+from tktomo.ptycho_align.core import center_is_plausible, load_dataset  # noqa: E402
+from tktomo.ptycho_align.core.preprocess import bin_stack  # noqa: E402
+from tktomo.ptycho_align.ui.main_window import PtychoAlignWindow  # noqa: E402
 from tktomo.ptycho_align.ui.panels import Hdf5BrowserDialog  # noqa: E402
 from tktomo.ptycho_align.ui.panels.base import (  # noqa: E402
     MODE_ALIGNED,
     MODE_DIFFERENCE,
+    MODE_RAW,
     MODE_REPROJECTION,
 )
 
@@ -49,10 +54,25 @@ def window(qtbot, phantom_file):
     return win
 
 
+def _engine(window):
+    """The engine behind an in-process session.
+
+    White-box, and valid only for a ``LocalSession`` -- these are tests of what the
+    window does to local state. The behaviour that has to hold for a remote session too
+    is pinned in ``test_session_conformance.py`` instead.
+    """
+    return window.session.host.engine
+
+
+def _state(window):
+    return _engine(window).state
+
+
 def _run(window, n: int) -> None:
-    """Run n iterations on the worker thread and wait for it to finish."""
+    """Run n iterations on the session's compute thread and wait for it to finish."""
     window._start_run(n)
-    assert window._run.wait(120_000), "the alignment run did not finish"
+    assert window._run_handle is not None, "the run did not start"
+    window.session.wait(window._run_handle, timeout=120.0)
     window._run_finished()
 
 
@@ -65,51 +85,55 @@ def test_bin_stack_halves_the_detector_axes():
 
 
 def test_loading_populates_the_engine(window):
-    assert window.raw is not None
-    assert window.engine is not None
-    assert window.engine.iteration == 0
+    assert window.session.summary().has_engine
+    assert _engine(window) is not None
+    assert _engine(window).iteration == 0
 
 
 def test_preprocessing_pads_and_rebuilds_the_engine(window):
-    before = window.engine.state.original.shape
+    before = _state(window).original.shape
     options = window.preprocess_panel.options()
     options.pad_percent = 20.0
     window._apply_preprocessing(options)
 
-    after = window.engine.state.original.shape
+    after = _state(window).original.shape
     assert after[1] > before[1] and after[2] > before[2], "padding was not applied"
-    assert window.engine.iteration == 0
+    assert _engine(window).iteration == 0
 
 
 def test_com_prealignment_populates_shifts_and_centre(window):
     window._run_com("mean")
 
-    assert window.com is not None
-    assert np.any(window.engine.state.sx != 0.0)
-    assert window.engine.state.center > 0
+    assert window.session.summary().com is not None
+    assert np.any(_state(window).sx != 0.0)
+    assert _state(window).center > 0
     # The sinogram overlay and the fit plot both need the fitted curve.
-    assert window.com.fitted_u.shape == window.engine.state.angles.shape
+    assert window.session.summary().com.fitted_u.shape == _state(window).angles.shape
 
 
 def test_step_produces_a_volume_and_fills_every_view(window):
     window._run_com("mean")
     _run(window, 1)
 
-    assert window.engine.iteration == 1
-    assert window.engine.state.volume is not None
+    assert _engine(window).iteration == 1
+    assert _state(window).volume is not None
 
-    # The viewers are fed from cached stacks; all four modes must be populated.
-    assert window._stacks[MODE_ALIGNED] is not None
-    assert window._stacks[MODE_REPROJECTION] is not None
-    assert window._stacks[MODE_DIFFERENCE] is not None
-    assert window._stacks[MODE_DIFFERENCE].shape == window._stacks[MODE_ALIGNED].shape
+    # The viewers pull one plane per mode; all four must have something to give.
+    planes = window._planes
+    aligned = planes.plane(MODE_ALIGNED, 0, 0)
+    assert planes.plane(MODE_RAW, 0, 0) is not None
+    assert aligned is not None
+    assert planes.plane(MODE_REPROJECTION, 0, 0) is not None
+    assert planes.plane(MODE_DIFFERENCE, 0, 0).shape == aligned.shape
+    # A plane, not the stack behind it.
+    assert aligned.shape == _state(window).original.shape[1:]
 
 
 def test_running_iterations_reduces_the_residual(window):
     window._run_com("mean")
     _run(window, 4)
 
-    history = window.engine.history
+    history = _engine(window).history
     assert len(history) == 4
     assert history[-1].residual < history[0].residual
 
@@ -118,24 +142,24 @@ def test_stop_cancels_and_leaves_a_valid_state(window):
     window._run_com("mean")
     window._start_run(50)
     window._stop_run()  # cancel immediately
-    assert window._run.wait(120_000)
+    window.session.wait(window._run_handle, timeout=120.0)
     window._run_finished()
 
-    assert window.engine.iteration < 50
+    assert _engine(window).iteration < 50
     # Whatever it managed, the state must be complete and steppable.
     _run(window, 1)
-    assert window.engine.state.volume is not None
+    assert _state(window).volume is not None
 
 
 def test_revert_rolls_back_the_iteration(window):
     window._run_com("mean")
     _run(window, 3)
-    sx_at_1 = window.engine.history[0].sx.copy()
+    sx_at_1 = _engine(window).history[0].sx.copy()
 
     window._revert(1)
 
-    assert window.engine.iteration == 1
-    np.testing.assert_allclose(window.engine.state.sx, sx_at_1)
+    assert _engine(window).iteration == 1
+    np.testing.assert_allclose(_state(window).sx, sx_at_1)
 
 
 def test_session_roundtrip_restores_the_state(window, tmp_path):
@@ -143,29 +167,218 @@ def test_session_roundtrip_restores_the_state(window, tmp_path):
     _run(window, 2)
 
     path = tmp_path / "session.h5"
-    session_io.save_session(path, window.engine)
+    session_io.save_session(path, _engine(window))
     restored = session_io.load_session(path)
 
     assert restored.iteration == 2
-    np.testing.assert_allclose(restored.state.sx, window.engine.state.sx)
-    np.testing.assert_allclose(restored.state.sy, window.engine.state.sy)
-    assert restored.state.center == pytest.approx(window.engine.state.center)
-    assert restored.config.recon_algorithm == window.engine.config.recon_algorithm
+    np.testing.assert_allclose(restored.state.sx, _state(window).sx)
+    np.testing.assert_allclose(restored.state.sy, _state(window).sy)
+    assert restored.state.center == pytest.approx(_state(window).center)
+    assert restored.config.recon_algorithm == _engine(window).config.recon_algorithm
 
 
 def test_bin_factor_rescales_the_existing_shifts(window):
     window._run_com("mean")
-    sx_before = window.engine.state.sx.copy()
-    center_before = window.engine.state.center
+    sx_before = _state(window).sx.copy()
+    center_before = _state(window).center
 
     window.align_panel.bin_spin.setValue(2)
 
     # Shifts are in pixels of the (now half-size) grid, so they halve with it.
-    np.testing.assert_allclose(window.engine.state.sx, sx_before / 2, rtol=1e-6)
-    assert window.engine.state.center == pytest.approx(center_before / 2)
-    assert window.engine.state.original.shape[2] == pytest.approx(
-        window.preprocessed.data.shape[2] // 2, abs=1
+    np.testing.assert_allclose(_state(window).sx, sx_before / 2, rtol=1e-6)
+    assert _state(window).center == pytest.approx(center_before / 2)
+    assert _state(window).original.shape[2] == pytest.approx(
+        window.session.summary().raw_shape[2] // 2, abs=1
     )
+
+
+def test_bin_factor_rescales_the_stored_com_result(window):
+    window._run_com("mean")
+    com_before = window.session.summary().com
+
+    window.align_panel.bin_spin.setValue(2)
+
+    # The COM result outlives the rebuild and is still in pixels, so it must follow the
+    # grid. Left on the old scale it becomes the reference `_estimate_center` judges
+    # against, and a correct estimate on the binned grid gets rejected as implausible.
+    assert window.session.summary().com.center == pytest.approx(com_before.center / 2)
+    np.testing.assert_allclose(window.session.summary().com.com_u, com_before.com_u / 2, rtol=1e-6)
+    np.testing.assert_allclose(window.session.summary().com.fitted_u, com_before.fitted_u / 2, rtol=1e-6)
+    assert window.session.summary().com.center == pytest.approx(_state(window).center)
+
+    width = _state(window).original.shape[2]
+    ok, reason = center_is_plausible(_state(window).center, width, window.session.summary().com.center)
+    assert ok, reason
+
+
+class _StuckRun:
+    """A session that reports a run in flight for the first few polls.
+
+    Models the case that matters: a reconstruction that outlives any *fixed* timeout,
+    because a tomopy call already running cannot be interrupted. Cancelling records the
+    request but does not stop it.
+    """
+
+    def __init__(self, session, polls_needed: int = 3) -> None:
+        self._session = session
+        self._polls = 0
+        self._polls_needed = polls_needed
+        self.cancelled = False
+        self.running = True
+
+    def summary(self, since_iteration: int = 0):
+        self._polls += 1
+        if self._polls >= self._polls_needed:
+            self.running = False
+        return replace(self._session.summary(since_iteration), running=self.running)
+
+    def cancel_run(self) -> None:
+        self.cancelled = True
+
+    def __getattr__(self, name):
+        return getattr(self._session, name)
+
+
+def test_closing_mid_run_waits_however_long_the_compute_takes(window):
+    window.session = stuck = _StuckRun(window.session)
+    window._summary = replace(window._summary, running=True)
+
+    window.close()
+
+    # The old code called wait() once with a 30 s cap and tore the window down anyway
+    # when it expired -- destroying a live thread mid-reconstruction, which can segfault
+    # inside tomopy's shared-memory cleanup. A cancelled run must be waited out.
+    assert stuck.cancelled, "the run was not cancelled on close"
+    assert not stuck.running, "the window was destroyed while compute was still running"
+
+
+def test_bin_change_is_refused_while_a_run_is_in_flight(window, monkeypatch):
+    nagged = []
+    monkeypatch.setattr(
+        "tktomo.ptycho_align.ui.main_window.QMessageBox.information",
+        lambda *args, **kwargs: nagged.append(args),
+    )
+    window._run_com("mean")
+    engine_before = _engine(window)
+    # Exactly what a live run does to the host: exclusive verbs are refused outright.
+    window.session.host._run_active = True
+    try:
+        window.align_panel.bin_spin.setValue(2)
+
+        # Rebuilding here would swap the engine out from under the compute thread, which
+        # keeps reconstructing into an engine nothing reads: the iteration is silently
+        # discarded -- minutes of work, no result, no error.
+        assert _engine(window) is engine_before
+        assert window.session.summary().bin_factor == 1
+        assert window.align_panel.bin_factor() == 1, "the spin box was not put back"
+        assert nagged, "the user was not told why the bin change was refused"
+    finally:
+        # Unconditionally: leaving it set makes closeEvent wait for a run that will never
+        # finish, and a failed assertion would hang the suite rather than report itself.
+        window.session.host._run_active = False
+
+
+def test_run_footprint_is_cubic_in_width_so_binning_dominates_it(window):
+    full, _text = window._run_footprint(5)
+
+    window.align_panel.bin_spin.setValue(2)
+    binned, _text = window._run_footprint(5)
+
+    # The volumes are (rows, width, width), so halving the detector axes cuts them 8x.
+    # The cached stacks only shrink 4x, so the total lands between the two -- the point
+    # being that it is dominated by the cubic term, which is what makes binning the
+    # effective lever.
+    assert binned < full / 4
+
+
+def test_a_run_that_would_exhaust_memory_is_refused(window, monkeypatch):
+    footprint, _text = window._run_footprint(5)
+    monkeypatch.setattr(
+        "tktomo.ptycho_align.session.engine_host.available_ram_bytes", lambda: footprint // 2
+    )
+    warnings = []
+
+    def refuse(*args, **kwargs):
+        warnings.append(args)
+        return QMessageBox.No
+
+    monkeypatch.setattr(
+        "tktomo.ptycho_align.ui.main_window.QMessageBox.warning", staticmethod(refuse)
+    )
+
+    window._start_run(5)
+
+    # An OOM kill leaves no traceback and no log line -- the window just disappears -- so
+    # the run must not start without the user having been told.
+    assert warnings, "the user was not warned before a run that cannot fit in RAM"
+    assert window._run_handle is None, "the run started despite the warning being declined"
+
+
+def test_a_runaway_iteration_stops_the_run_immediately(window, qtbot, monkeypatch):
+    monkeypatch.setattr(
+        "tktomo.ptycho_align.ui.main_window.QMessageBox.warning",
+        staticmethod(lambda *args, **kwargs: QMessageBox.Ok),
+    )
+    window._run_com("mean")
+    # The engine should have taken the COM amplitude as its yardstick for a real shift.
+    assert _engine(window).com_amplitude == pytest.approx(window.session.summary().com.amplitude)
+
+    # Force every iteration to look like the noise-matching failure: a shift update far
+    # larger than the object's actual motion.
+    monkeypatch.setattr(
+        "tktomo.ptycho_align.core.engine.shift_update_is_runaway",
+        lambda error, width, amplitude=None, **kwargs: "forced runaway",
+    )
+
+    window._start_run(5)
+    # waitUntil pumps the event loop. Blocking on run.wait() instead would deadlock the
+    # very thing under test: the cancel rides a queued signal to the GUI thread, which a
+    # blocked main thread never delivers.
+    qtbot.waitUntil(lambda: not window.session.summary().running, timeout=120_000)
+    window._run_finished()
+
+    # It must stop at the first bad iteration, not run all five: the shifts are
+    # cumulative, so each further iteration warps the data by a larger bogus offset.
+    assert _engine(window).iteration == 1, "the run did not stop at the runaway iteration"
+    assert _engine(window).history[-1].runaway
+
+
+def test_iteration_cost_is_square_in_width_and_linear_in_inner_iterations():
+    from tktomo.ptycho_align.core.estimates import iteration_cost_units
+
+    base = iteration_cost_units(410, 33, 1137, "sirt", 2)
+    # Doubling the width is 4x the work -- this is why the pad hurts and binning helps.
+    assert iteration_cost_units(410, 33, 2274, "sirt", 2) == pytest.approx(4 * base)
+    assert iteration_cost_units(410, 33, 1137, "sirt", 4) == pytest.approx(2 * base)
+    # gridrec/fbp are direct: num_iter does not apply, so it must not inflate the cost.
+    direct = iteration_cost_units(410, 33, 1137, "gridrec", 2)
+    assert iteration_cost_units(410, 33, 1137, "gridrec", 8) == pytest.approx(direct)
+
+
+def test_a_timed_iteration_predicts_what_a_finer_grid_would_cost(window):
+    window._run_com("mean")
+    _run(window, 1)
+
+    measured = _engine(window).history[-1].wallclock_s
+    assert window._run_duration(1) == pytest.approx(measured, rel=0.5)
+
+    # The calibration is per-machine, not per-grid, so it survives a rebuild and can warn
+    # about a grid that has never been run -- which is the only moment the warning helps.
+    coarse = window._run_duration(1)
+    window.align_panel.bin_spin.setValue(2)
+    assert window._run_duration(1) < coarse
+
+
+def test_the_resource_view_samples_cpu_and_memory(qtbot):
+    from tktomo.ptycho_align.ui.panels import ResourceView
+
+    view = ResourceView()
+    qtbot.addWidget(view)
+    view.sample()
+    view.sample()  # CPU is a rate: it needs two readings to mean anything
+
+    assert view.peak_rss_gb() > 0
+    assert "GB" in view.info_label.text()
 
 
 def test_align_toggles_reach_the_engine(window):
@@ -173,7 +386,7 @@ def test_align_toggles_reach_the_engine(window):
     window._run_com("mean")
     _run(window, 1)
 
-    result = window.engine.history[-1]
+    result = _engine(window).history[-1]
     np.testing.assert_array_equal(result.dsx, np.zeros_like(result.dsx))
 
 
@@ -218,8 +431,8 @@ def test_reprojection_owns_its_memory(window):
     window._run_com("mean")
     _run(window, 1)
 
-    assert window.engine.last_simulated.flags.owndata
-    assert window.engine.state.volume.flags.owndata
+    assert _engine(window).last_simulated.flags.owndata
+    assert _state(window).volume.flags.owndata
 
 
 def test_window_fits_on_a_small_screen(qtbot):
@@ -247,7 +460,7 @@ def test_window_fits_on_a_small_screen(qtbot):
 def test_export_without_a_volume_reports_clearly(window, tmp_path):
     # Nothing has been reconstructed yet, so there is no volume to write.
     with pytest.raises(ValueError, match="no volume to export"):
-        session_io.export_volume(tmp_path / "v.h5", window.engine.state.volume)
+        session_io.export_volume(tmp_path / "v.h5", _state(window).volume)
 
 
 # -- HDF5 dataset browser ---------------------------------------------------------------
@@ -300,9 +513,9 @@ def test_browser_selection_loads_into_the_window(qtbot, odd_file):
     qtbot.addWidget(dialog)
     assert win.load_path(str(odd_file), **dialog.selection())
 
-    assert win.raw is not None
-    assert win.raw.data.shape == (20, 24 + 16, 24 + 16)  # margin-padded phantom
-    assert win.engine is not None
+    summary = win.session.summary()
+    assert summary.has_engine
+    assert summary.raw_shape == (20, 24 + 16, 24 + 16)  # margin-padded phantom
 
 
 def test_browser_blocks_ok_on_an_angle_length_mismatch(qtbot, odd_file):
@@ -398,13 +611,17 @@ def test_loading_a_crop_of_a_complex_stack(qtbot, complex_file, auto_accept):
         crop=Crop(8, 24, 10, 30),
     )
 
-    assert win.raw.data.shape == (16, 16, 20)
+    summary = win.session.summary()
+    assert summary.raw_shape == (16, 16, 20)
     # exp(1j*phase) round-trips through np.angle for |phase| < pi.
-    np.testing.assert_allclose(win.raw.data[0], phase[0][8:24, 10:30], atol=1e-5)
-    assert win.raw.metadata["crop"] == (8, 24, 10, 30)
+    np.testing.assert_allclose(
+        win.session.read_plane(MODE_RAW, 0, 0), phase[0][8:24, 10:30], atol=1e-5
+    )
+    assert summary.dataset.crop == (8, 24, 10, 30)
     assert win.data_panel.crop_button.isEnabled()
-    assert win._source["kwargs"]["data_path"] == "/obj"
-    assert win._source_is_complex()
+    source = win._source()
+    assert source["kwargs"]["data_path"] == "/obj"
+    assert win._source_is_complex(source)
 
 
 def test_crop_box_reports_the_size_and_clamps_to_the_stack(qtbot):

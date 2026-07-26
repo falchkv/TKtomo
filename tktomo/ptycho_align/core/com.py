@@ -52,6 +52,27 @@ class ComResult:
     fit_residual: float  # RMS of (fitted_u - com_u), in pixels
     amplitude: float  # sqrt(a^2 + b^2); ~0 means a suspiciously centred object
 
+    def scaled(self, factor: float) -> ComResult:
+        """The same result expressed on a grid ``factor`` times finer.
+
+        Every field is in pixels, so a change of binning rescales all of them. The
+        caller must do this whenever the pixel grid changes underneath a stored
+        result, or the COM's numbers silently start referring to a grid that no
+        longer exists: the plausibility check in :func:`center_is_plausible` would
+        reject a correct centre estimate for differing from a stale reference, and
+        the sinogram overlay would be drawn at the wrong scale.
+        """
+        return ComResult(
+            sx=self.sx * factor,
+            sy=self.sy * factor,
+            center=self.center * factor,
+            com_u=self.com_u * factor,
+            com_v=self.com_v * factor,
+            fitted_u=self.fitted_u * factor,
+            fit_residual=self.fit_residual * factor,
+            amplitude=self.amplitude * factor,
+        )
+
 
 def projection_centroids(prj: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Mass-weighted ``(com_v, com_u)`` centroids, one per projection.

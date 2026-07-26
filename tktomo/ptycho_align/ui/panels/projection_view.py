@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from tktomo.ptycho_align.session import PlaneRef
 from tktomo.ptycho_align.ui.panels.base import (
     MODE_ALIGNED,
     MODE_DIFFERENCE,
@@ -32,6 +33,7 @@ from tktomo.ptycho_align.ui.panels.base import (
     StackDisplay,
     side_by_side,
 )
+from tktomo.ptycho_align.ui.planes import PlaneSource
 
 
 class ProjectionView(QWidget):
@@ -42,7 +44,8 @@ class ProjectionView(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
 
-        self._stacks: dict[str, np.ndarray | None] = {}
+        self._source: PlaneSource | None = None
+        self._sized = False
         self._sx: np.ndarray | None = None
         self._sy: np.ndarray | None = None
 
@@ -95,39 +98,42 @@ class ProjectionView(QWidget):
 
     # -- data ------------------------------------------------------------------------
 
-    def set_stacks(
+    def set_source(
         self,
-        stacks: dict[str, np.ndarray | None],
+        source: PlaneSource,
         sx: np.ndarray | None = None,
         sy: np.ndarray | None = None,
     ) -> None:
-        """Hand over the (cached) stacks for each mode. Recomputing a reprojection on
-        every slider tick would be far too slow, so the main window computes them once
-        per iteration and passes them in."""
-        first = self._stacks == {}
-        self._stacks = stacks
+        """Point the view at a plane source and redraw.
+
+        The slider is sized from the stack's declared shape, not from an array: the
+        shape is known as soon as a dataset is open, well before the aligned stack has
+        been computed, and waiting for pixels to size a slider is what forced the whole
+        stack across the boundary in the first place.
+        """
+        first = self._source is None
+        self._source = source
         self._sx, self._sy = sx, sy
 
-        reference = stacks.get(MODE_RAW)
-        if reference is not None:
-            n = reference.shape[0] - 1
-            self.index_slider.setMaximum(max(n, 0))
-            self.index_spin.setMaximum(max(n, 0))
+        n_angles = source.extent(MODE_RAW, 0)
+        if n_angles:
+            self.index_slider.setMaximum(n_angles - 1)
+            self.index_spin.setMaximum(n_angles - 1)
 
-        self._refresh(autorange=first)
+        self._refresh(autorange=first or not self._sized)
 
     def current_index(self) -> int:
         return self.index_slider.value()
 
     def roi_bounds(self) -> tuple[int, int, int, int] | None:
         """The ROI as ``(v0, v1, u0, u1)``, or None when it is not in use."""
-        if not self.roi_check.isChecked():
+        if not self.roi_check.isChecked() or self._source is None:
             return None
-        reference = self._stacks.get(MODE_RAW)
-        if reference is None:
+        shape = self._source.shape(MODE_RAW)
+        if shape is None:
             return None
 
-        n_v, n_u = reference.shape[1:]
+        n_v, n_u = shape[1:]
         position, size = self.roi.pos(), self.roi.size()
         u0 = int(np.clip(round(position.x()), 0, n_u - 1))
         v0 = int(np.clip(round(position.y()), 0, n_v - 1))
@@ -152,22 +158,22 @@ class ProjectionView(QWidget):
             self.info_label.setText("Nothing to show yet -- load data and run an iteration.")
             return
 
+        self._sized = True
         self.display.set_image(image, autorange=autorange)
         self._update_info()
 
     def _compose(self, mode: str, index: int) -> np.ndarray | None:
-        def frame(name: str) -> np.ndarray | None:
-            stack = self._stacks.get(name)
-            if stack is None or index >= stack.shape[0]:
-                return None
-            return stack[index]
+        """Fetch just the plane on screen: one image, or three for side-by-side."""
+        if self._source is None:
+            return None
 
         if mode == MODE_SIDE_BY_SIDE:
-            parts = [frame(MODE_ALIGNED), frame(MODE_REPROJECTION), frame(MODE_DIFFERENCE)]
+            keys = (MODE_ALIGNED, MODE_REPROJECTION, MODE_DIFFERENCE)
+            parts = self._source.planes([PlaneRef(key, 0, index) for key in keys])
             if all(part is None for part in parts):
                 return None
             return side_by_side(*parts)
-        return frame(mode)
+        return self._source.plane(mode, 0, index)
 
     def _update_info(self) -> None:
         index = self.index_slider.value()

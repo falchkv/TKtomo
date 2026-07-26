@@ -7,7 +7,8 @@ current volume against a stored earlier one answers it directly.
 
 from __future__ import annotations
 
-import numpy as np
+from collections.abc import Sequence
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from tktomo.ptycho_align.ui.panels.base import StackDisplay
+from tktomo.ptycho_align.ui.planes import PlaneSource
 
 # Volume axes are (z, y, x): z indexes reconstructed slices, y/x are in-plane.
 _AXES = {"Axial (xy)": 0, "Coronal (xz)": 1, "Sagittal (yz)": 2}
@@ -30,8 +32,9 @@ class TomogramView(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
 
-        self._volume: np.ndarray | None = None
-        self._reference: np.ndarray | None = None  # the "compare to" volume
+        self._source: PlaneSource | None = None
+        self._shape: tuple[int, int, int] | None = None
+        self._reference: int | None = None  # the "compare to" iteration, not its volume
         self._pixel_size_nm: float | None = None
 
         self.display = StackDisplay()
@@ -73,26 +76,34 @@ class TomogramView(QWidget):
         layout.addWidget(self.display, 1)
         layout.addWidget(self.info_label)
 
-        self._history: dict[int, np.ndarray] = {}
+        self._history: list[int] = []
 
-    def set_volume(self, volume: np.ndarray | None, pixel_size_nm: float | None = None) -> None:
-        first = self._volume is None
-        self._volume = volume
+    def set_source(self, source: PlaneSource, pixel_size_nm: float | None = None) -> None:
+        first = self._shape is None
+        self._source = source
         self._pixel_size_nm = pixel_size_nm
-        if volume is None:
+        self._shape = source.volume_shape()
+        if self._shape is None:
             return
 
         self._update_slice_range()
         self._refresh(autorange=first)
 
-    def set_comparison_choices(self, history: dict[int, np.ndarray]) -> None:
-        """Offer only the iterations whose volume the memory policy actually kept."""
-        self._history = history
+    def set_comparison_choices(self, iterations: Sequence[int]) -> None:
+        """Offer the iterations whose volume the memory policy actually kept.
+
+        Iteration *numbers*, not volumes. Populating this used to mean fetching every
+        retained volume -- three times 511 MiB to put three entries in a combo box, none
+        of which is looked at unless the user ticks Compare. The difference is computed
+        where the volumes live, one plane at a time.
+        """
+        self._history = list(iterations)
         current = self.compare_combo.currentText()
+        labels = [str(i) for i in sorted(iterations)]
         self.compare_combo.blockSignals(True)
         self.compare_combo.clear()
-        self.compare_combo.addItems([str(i) for i in sorted(history)])
-        if current and current in [str(i) for i in history]:
+        self.compare_combo.addItems(labels)
+        if current and current in labels:
             self.compare_combo.setCurrentText(current)
         self.compare_combo.blockSignals(False)
         self._compare_changed()
@@ -102,16 +113,17 @@ class TomogramView(QWidget):
     def _axis(self) -> int:
         return _AXES[self.axis_combo.currentText()]
 
-    def _oriented(self, volume: np.ndarray) -> np.ndarray:
-        return np.moveaxis(volume, self._axis(), 0)
+    def _extent(self) -> int:
+        """How many slices the chosen plane has."""
+        return 0 if self._shape is None else int(self._shape[self._axis()])
 
     def _update_slice_range(self) -> None:
-        if self._volume is None:
+        last = self._extent() - 1
+        if last < 0:
             return
-        last = self._oriented(self._volume).shape[0] - 1
         was_centred = self.slice_slider.value() == 0
-        self.slice_slider.setMaximum(max(last, 0))
-        self.slice_spin.setMaximum(max(last, 0))
+        self.slice_slider.setMaximum(last)
+        self.slice_spin.setMaximum(last)
         if was_centred:
             self.slice_slider.setValue(last // 2)
 
@@ -126,25 +138,25 @@ class TomogramView(QWidget):
 
     def _compare_changed(self) -> None:
         text = self.compare_combo.currentText()
-        self._reference = self._history.get(int(text)) if text else None
+        self._reference = int(text) if text else None
         self._refresh(autorange=True)
 
     def _refresh(self, *, autorange: bool = False) -> None:
-        if self._volume is None:
+        if self._source is None or self._shape is None:
             return
 
-        comparing = (
-            self.compare_check.isChecked()
-            and self._reference is not None
-            and self._reference.shape == self._volume.shape
-        )
-        volume = self._volume - self._reference if comparing else self._volume
+        comparing = self.compare_check.isChecked() and self._reference is not None
         self.display.set_symmetric(comparing)
 
-        index = min(self.slice_slider.value(), self._oriented(volume).shape[0] - 1)
-        self.display.set_image(self._oriented(volume)[index], autorange=autorange)
+        index = min(self.slice_slider.value(), self._extent() - 1)
+        image = self._source.volume_plane(
+            self._axis(), index, against=self._reference if comparing else None
+        )
+        if image is None:
+            return
+        self.display.set_image(image, autorange=autorange)
 
-        pieces = [f"{self.axis_combo.currentText()} slice {index}", f"volume {self._volume.shape}"]
+        pieces = [f"{self.axis_combo.currentText()} slice {index}", f"volume {self._shape}"]
         if self._pixel_size_nm:
             pieces.append(f"voxel {self._pixel_size_nm:g} nm")
         if comparing:

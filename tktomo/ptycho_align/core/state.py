@@ -33,6 +33,7 @@ class IterationResult:
     volume: np.ndarray | None = None  # dropped for old iterations, see VolumePolicy
     config_changed: bool = False  # marks iterations where the user edited AlignConfig
     diverging: bool = False  # residual climbed well above the best seen so far
+    runaway: str | None = None  # why this iteration's shift update is implausibly large
 
     @property
     def has_volume(self) -> bool:

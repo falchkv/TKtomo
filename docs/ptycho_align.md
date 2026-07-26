@@ -228,9 +228,18 @@ comparing; without that, a perfectly correct alignment still "scores" ~0.2 px.
   floor on how fast an iteration can be at that size, and the reason to crop and bin.
 - The aligned stack, the reprojection and their difference are cached once per
   iteration, so scrubbing the angle slider does not recompute a reprojection.
+- The viewers fetch **one 2-D plane at a time** — the projection on screen, the
+  sinogram row on screen, the volume slice on screen — rather than being handed whole
+  stacks to index into. A difference image is subtracted where the arrays live, so one
+  plane crosses instead of two, and recently viewed planes are cached (bounded in bytes,
+  keyed so that a new iteration's pixels can never be served from the old cache). This
+  is what keeps the window responsive when the engine is not in the same process.
 - Volumes are large, so only the last few iterations' volumes are kept in memory (plus
   every *N*th). Shift arrays are kept for every iteration, so "revert to iteration N"
   always works; if that iteration's volume was dropped, the next step simply
-  reconstructs from scratch instead of warm-starting.
-- All heavy computation runs on a `QThread`. The GUI never blocks, and Stop finishes
-  the current iteration before returning — a cancelled run always leaves a valid state.
+  reconstructs from scratch instead of warm-starting. "Compare to iteration *N*" also
+  differences one slice at a time, so it costs a plane rather than two volumes.
+- All heavy computation runs on the session's single compute thread, never on the GUI
+  thread and never on two threads at once (TomoPy's shared-memory globals segfault if
+  `recon` and `project` overlap). The GUI never blocks, and Stop finishes the current
+  iteration before returning — a cancelled run always leaves a valid state.

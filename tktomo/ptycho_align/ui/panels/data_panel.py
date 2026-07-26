@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-import numpy as np
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -19,17 +16,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from tktomo.io import ProjectionData
+from tktomo.ptycho_align.core.preprocess import PreprocessOptions
+from tktomo.ptycho_align.session.types import DatasetSummary
 
-
-@dataclass
-class PreprocessOptions:
-    remove_ramp: bool = True
-    remove_offset: bool = True
-    unwrap: bool = False
-    invert: bool = False
-    border: int = 8
-    pad_percent: float = 15.0
+# Re-exported: the panel builds these from its checkboxes, but the type belongs with the
+# code that acts on it, which runs wherever the projections are.
+__all__ = ["ComPanel", "DataPanel", "PreprocessOptions", "PreprocessPanel"]
 
 
 class DataPanel(QWidget):
@@ -82,30 +74,33 @@ class DataPanel(QWidget):
         layout.addWidget(self.session_button)
         layout.addWidget(self.summary)
 
-    def show_dataset(self, data: ProjectionData) -> None:
-        array = data.data
-        angles = np.rad2deg(data.angles)
-        step = float(np.mean(np.diff(angles))) if len(angles) > 1 else 0.0
-        meta = data.metadata
+    def show_dataset(self, summary: DatasetSummary) -> None:
+        """Describe the loaded stack.
 
-        self.crop_button.setEnabled(meta.get("data_path") is not None)
+        Takes a summary rather than the stack itself: the min/max/mean here are three
+        full passes over the array, which is fine in-process and absurd once the array
+        lives on another machine. They are computed where the data is.
+        """
+        self.crop_button.setEnabled(summary.data_path is not None)
 
-        lines = [f"<b>{meta.get('name', 'dataset')}</b>"]
-        if meta.get("data_path"):
-            lines.append(f"<tt>{meta['data_path']}</tt>")
-        lines.append(f"shape {array.shape} (angles, v, u)")
-        if meta.get("crop") and meta.get("full_shape"):
-            v0, v1, u0, u1 = meta["crop"]
-            full = meta["full_shape"]
-            whole = (v0, v1, u0, u1) == (0, full[1], 0, full[2])
+        lines = [f"<b>{summary.name}</b>"]
+        if summary.data_path:
+            lines.append(f"<tt>{summary.data_path}</tt>")
+        lines.append(f"shape {summary.shape} (angles, v, u)")
+        if summary.crop and summary.full_shape:
+            v0, v1, u0, u1 = summary.crop
+            full = summary.full_shape
             lines.append(
                 f"crop rows {v0}:{v1}, cols {u0}:{u1}"
-                + (" (full frame)" if whole else f" of {full[1]} x {full[2]}")
+                + (" (full frame)" if summary.is_full_frame else f" of {full[1]} x {full[2]}")
             )
-        if meta.get("component"):
-            lines.append(f"component: <b>{meta['component']}</b>")
-        lines.append(f"angles {angles.min():.1f}..{angles.max():.1f} deg, step {step:.2f} deg")
-        lines.append(f"min {array.min():.4g}, max {array.max():.4g}, mean {array.mean():.4g}")
+        if summary.component:
+            lines.append(f"component: <b>{summary.component}</b>")
+        lines.append(
+            f"angles {summary.angle_min_deg:.1f}..{summary.angle_max_deg:.1f} deg, "
+            f"step {summary.angle_step_deg:.2f} deg"
+        )
+        lines.append(f"min {summary.vmin:.4g}, max {summary.vmax:.4g}, mean {summary.vmean:.4g}")
 
         self.summary.setText("<br>".join(lines))
 

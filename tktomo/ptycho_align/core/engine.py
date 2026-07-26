@@ -33,9 +33,10 @@ Three conventions, each of which is a bug if you get it wrong:
 from __future__ import annotations
 
 import logging
+import os
 import time
-from dataclasses import asdict, dataclass, field
-from typing import Any, Callable
+from dataclasses import asdict, dataclass, field, fields
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
@@ -44,14 +45,94 @@ from tktomo.ptycho_align.core.state import AlignmentState, IterationResult, Volu
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "DIRECT_ALGORITHMS",
     "AlignConfig",
     "AlignmentEngine",
+    "Cancelled",
     "algorithm_rejects_negatives",
     "apply_shifts",
+    "row_chunk_size",
+    "shift_update_is_runaway",
 ]
 
+
+class Cancelled(Exception):
+    """Raised inside :meth:`AlignmentEngine.step` when the caller asked it to stop.
+
+    An iteration abandoned part-way records nothing: ``step`` mutates the state only at
+    the very end, via ``state.record``, so a cancelled iteration leaves the shifts, the
+    volume and the history exactly as they were. Stopping is always safe.
+    """
+
+
+class _Progress:
+    """Carries a cancel flag and a progress callback through one iteration.
+
+    ``fraction`` is *within* the iteration, and the two phases split it: the
+    reconstruction is the first ``_RECON_SHARE`` of the bar, the reprojection the rest.
+    """
+
+    # The recon repeats num_iter times where the projection is a single pass; measured at
+    # roughly 36 s against 6 s, so the bar spends most of itself in the reconstruction.
+    _RECON_SHARE = 0.85
+
+    def __init__(
+        self,
+        cancel: Any | None = None,
+        report: Callable[[float, str], None] | None = None,
+    ) -> None:
+        self._cancel = cancel
+        self._report = report
+        self._offset = 0.0
+        self._span = 1.0
+
+    def phase(self, recon: bool) -> _Progress:
+        self._offset = 0.0 if recon else self._RECON_SHARE
+        self._span = self._RECON_SHARE if recon else 1.0 - self._RECON_SHARE
+        return self
+
+    def check(self, fraction: float, message: str) -> None:
+        """Honour a pending cancel, and report where we are. Raises :class:`Cancelled`."""
+        if self._cancel is not None and self._cancel.is_set():
+            raise Cancelled(message)
+        if self._report is not None:
+            self._report(self._offset + self._span * fraction, message)
+
+
+def row_chunk_size(rows: int, ncore: int | None, requested: int = 0) -> int:
+    """How many detector rows to reconstruct per interruptible chunk.
+
+    Parallel-beam reconstruction is **slice-independent**: each detector row's sinogram
+    reconstructs into its own volume slice, with no coupling between rows. So the row
+    axis can be cut into chunks and processed one at a time, giving a point between each
+    chunk where a cancel can actually be honoured -- which a single tomopy call, being an
+    uninterruptible C extension, never offers.
+
+    The chunk cannot be made arbitrarily small, and that is the whole subtlety: tomopy
+    parallelises *across slices*, so a chunk narrower than the core count leaves cores
+    idle. Measured on an 8-core machine (200 x 32 x 512, sirt, num_iter=2), reconstructing
+    the stack in chunks costs, relative to one call for all 32 rows:
+
+        32 rows/chunk  36.1 s   (one call, the old behaviour)
+         8 rows/chunk  37.6 s   +4%   <-- the core count
+         4 rows/chunk  53.1 s   +47%
+         1 row /chunk 149.6 s   +314%
+
+    So the default is the core count: the smallest chunk that still saturates the machine,
+    and it buys interruptibility for a few percent. Going below it trades wallclock for
+    cancellation granularity at a punitive rate. ``requested`` (``AlignConfig.row_chunk``)
+    overrides, for anyone who wants to make that trade deliberately.
+
+    This governs the reconstruction only. The reprojection is left as a single call --
+    ``tomopy.project`` has a fixed per-call cost that chunking cannot amortise. See
+    :meth:`AlignmentEngine._reproject`.
+    """
+    cores = ncore if ncore else (os.cpu_count() or 1)
+    chunk = requested if requested > 0 else cores
+    return max(1, min(rows, chunk))
+
 # Algorithms that take neither `num_iter` nor a warm-start `init_recon`.
-_DIRECT_ALGORITHMS = frozenset({"gridrec", "fbp"})
+DIRECT_ALGORITHMS = frozenset({"gridrec", "fbp"})
 
 # Emission algorithms: they model photon counts with a *multiplicative* update, so they
 # assume the data is non-negative. Phase projections routinely are not (~20% of voxels
@@ -75,6 +156,53 @@ def algorithm_rejects_negatives(algorithm: str, projections: np.ndarray) -> str 
         f"'{algorithm}' is an emission algorithm and assumes non-negative data, but "
         f"{fraction:.0%} of the projection values are negative. It will diverge. Use "
         f"'sirt', 'art' or 'gridrec', or enable 'Invert' and re-check the preprocessing."
+    )
+
+
+def shift_update_is_runaway(
+    error: float,
+    width: int,
+    com_amplitude: float | None = None,
+    *,
+    tolerance: float = 0.05,
+) -> str | None:
+    """Is this iteration's shift update too large to be a real misalignment?
+
+    Returns a reason string, or None if the update is plausible.
+
+    The residual-based divergence check cannot catch this. When the reconstruction is
+    too poor to reproject anything structured -- ``art`` with a couple of inner
+    iterations, say -- ``phase_cross_correlation`` registers noise against noise and
+    returns huge, essentially random shifts. Those are *accumulated* onto ``sx``/``sy``
+    and warped into the pristine data on the next iteration, so the run eats itself.
+    Meanwhile the residual can sit flat or even creep down, because a blurred volume
+    reprojects to something bland that differs from the data by no more than before.
+    Observed: a first iteration with a 101 px RMS update on a 1137 px detector whose
+    object only swings 16 px, with the residual *falling* 0.79 -> 0.74.
+
+    The COM sinusoid amplitude is the honest physical bound -- it is how far the object's
+    centroid actually moves across the scan -- so prefer it when the caller has one, and
+    fall back to a fraction of the detector width. The larger of the two is used, so a
+    genuinely badly-misaligned scan is not flagged on its first, legitimately large
+    correction.
+    """
+    if not np.isfinite(error):
+        return "the shift update is not a finite number"
+
+    limit = tolerance * width
+    basis = f"{tolerance:.0%} of the {width} px detector width"
+    if com_amplitude is not None and 4.0 * com_amplitude > limit:
+        limit = 4.0 * com_amplitude
+        basis = f"4x the {com_amplitude:.1f} px COM sinusoid amplitude"
+
+    if error <= limit:
+        return None
+    return (
+        f"the shift update this iteration has an RMS of {error:.1f} px, which exceeds "
+        f"{limit:.1f} px ({basis}). A correction that large is not a misalignment -- the "
+        f"registration is matching noise, because the reconstruction is too poor to "
+        f"reproject anything it can lock onto. The shifts are cumulative, so each further "
+        f"iteration warps the data by a larger bogus offset."
     )
 
 
@@ -121,9 +249,38 @@ class AlignConfig:
     median_filter_shifts: bool = False  # smooth shifts across angle
     median_filter_size: int = 3
     ncore: int | None = None
+    # Detector rows per interruptible chunk; 0 = auto (the core count). See
+    # `row_chunk_size` for why smaller is not better.
+    row_chunk: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "AlignConfig":
+        """Rebuild a config from :meth:`to_dict` output that has been through JSON.
+
+        Neither JSON nor msgpack has a tuple, so ``pad`` comes back as a list and has
+        to be put back on every round trip through a session file or a socket. Doing
+        it here rather than at each call site is what stops the session loader and the
+        wire protocol from disagreeing about it.
+        """
+        known = {f.name for f in fields(cls)}
+        unknown = sorted(set(raw) - known)
+        if unknown:
+            raise ValueError(
+                f"Unknown AlignConfig field(s): {', '.join(unknown)}. "
+                "The config was probably written by a newer version of tktomo."
+            )
+
+        values = dict(raw)
+        pad = values.get("pad")
+        if pad is not None:
+            pad = tuple(int(p) for p in pad)
+            if len(pad) != 2:
+                raise ValueError(f"pad must have two entries, got {pad!r}")
+            values["pad"] = pad
+        return cls(**values)
 
 
 @dataclass
@@ -140,6 +297,9 @@ class AlignmentEngine:
     sy0: np.ndarray | None = None
     center: float | None = None
     policy: VolumePolicy = field(default_factory=VolumePolicy)
+    # The COM sinusoid amplitude, when a pre-alignment has been run: a physical bound on
+    # how far the object actually moves, and so the yardstick for `shift_update_is_runaway`.
+    com_amplitude: float | None = None
 
     def __post_init__(self) -> None:
         original = np.asarray(self.dataset.data, dtype=np.float32)
@@ -231,21 +391,33 @@ class AlignmentEngine:
 
     # -- the loop -------------------------------------------------------------------
 
-    def step(self) -> IterationResult:
-        """Run exactly ONE outer iteration."""
+    def step(
+        self,
+        cancel: Any | None = None,
+        report: Callable[[float, str], None] | None = None,
+    ) -> IterationResult:
+        """Run exactly ONE outer iteration.
+
+        ``cancel`` is an event checked between row chunks: setting it raises
+        :class:`Cancelled` from inside the iteration, which records nothing and leaves
+        the state untouched. ``report(fraction, message)`` is called as the iteration
+        proceeds, so the caller can show progress *within* an iteration -- which for a
+        twenty-minute one is the difference between a live progress bar and a frozen one.
+        """
         from skimage.registration import phase_cross_correlation  # noqa: PLC0415
 
         cfg = self.config
         started = time.perf_counter()
+        ctx = _Progress(cancel, report)
 
         # 1. Aligned sinogram, always rebuilt from the pristine original.
         prj_aligned = apply_shifts(self.state.original.copy(), self.state.sy, self.state.sx)
 
         # 2. Reconstruct (warm-started in joint mode).
-        volume = self._reconstruct(prj_aligned)
+        volume = self._reconstruct(prj_aligned, ctx.phase(recon=True))
 
         # 3. Reproject at the measured angles.
-        sim = self._reproject(volume)
+        sim = self._reproject(volume, ctx.phase(recon=False))
         sim = _match_shape(sim, prj_aligned.shape)
 
         # 4. Taper the borders -- on copies used ONLY for registration. Blurring the
@@ -298,6 +470,10 @@ class AlignmentEngine:
             float(np.linalg.norm(prj_aligned - sim) / denominator) if denominator else float("nan")
         )
 
+        runaway = shift_update_is_runaway(
+            error, self.state.original.shape[2], self.com_amplitude
+        )
+
         result = IterationResult(
             iteration=self.state.iteration + 1,
             sx=sx,
@@ -311,7 +487,10 @@ class AlignmentEngine:
             wallclock_s=time.perf_counter() - started,
             config_changed=self._pending_config_change,
             diverging=self._is_diverging(residual),
+            runaway=runaway,
         )
+        if runaway:
+            logger.warning("Iteration %d: RUNAWAY SHIFTS. %s", result.iteration, runaway)
         if result.diverging:
             logger.warning(
                 "Iteration %d is DIVERGING: residual %.4g is far above the best so far "
@@ -354,10 +533,24 @@ class AlignmentEngine:
             if cancel_event is not None and cancel_event.is_set():
                 logger.info("run cancelled after %d iteration(s)", len(results))
                 break
-            result = self.step()
+            try:
+                # Passing the event down means a cancel lands *within* the iteration, at
+                # the next row chunk, rather than waiting for the whole thing to finish.
+                result = self.step(cancel=cancel_event)
+            except Cancelled:
+                logger.info("run cancelled mid-iteration after %d complete", len(results))
+                break
             results.append(result)
             if callback is not None:
                 callback(result)
+            if result.runaway:
+                # Stop here rather than leaving it to the caller. The shifts accumulate,
+                # so the next iteration would warp the pristine data by a still larger
+                # bogus offset -- there is nothing to be gained by continuing, and a
+                # caller that only inspects the results afterwards would find the data
+                # ruined by then.
+                logger.warning("Stopping the run: iteration %d ran away", result.iteration)
+                break
         return results
 
     # -- internals ------------------------------------------------------------------
@@ -380,27 +573,57 @@ class AlignmentEngine:
 
         return get_backend(self.config.backend)
 
-    def _reconstruct(self, prj_aligned: np.ndarray) -> np.ndarray:
+    def _chunks(self, rows: int) -> list[tuple[int, int]]:
+        chunk = row_chunk_size(rows, self.config.ncore, self.config.row_chunk)
+        return [(r0, min(r0 + chunk, rows)) for r0 in range(0, rows, chunk)]
+
+    def _reconstruct(self, prj_aligned: np.ndarray, ctx: _Progress) -> np.ndarray:
+        """Reconstruct the volume a band of detector rows at a time.
+
+        One tomopy call over the whole stack is uninterruptible for as long as it runs --
+        19 minutes, in one measured case -- so Stop could not take effect until the
+        iteration ended. Rows are independent (see :func:`row_chunk_size`), so doing them
+        in bands gives a cancellation point between each, and something honest to put in
+        the progress bar, at no cost to the result.
+        """
         cfg = self.config
         backend = self._backend()
-
-        kwargs: dict[str, Any] = {"algorithm": cfg.recon_algorithm, "center": self.state.center}
-        if cfg.ncore is not None:
-            kwargs["ncore"] = cfg.ncore
 
         reason = algorithm_rejects_negatives(cfg.recon_algorithm, prj_aligned)
         if reason and not self._warned_algorithm:
             logger.warning("%s", reason)
             self._warned_algorithm = True
 
-        direct = cfg.recon_algorithm in _DIRECT_ALGORITHMS
-        if not direct:
-            kwargs["num_iter"] = cfg.recon_inner_iters
-            if cfg.mode == "joint" and self.state.volume is not None:
-                kwargs["init_recon"] = self.state.volume
+        direct = cfg.recon_algorithm in DIRECT_ALGORITHMS
+        chunks = self._chunks(prj_aligned.shape[1])
+        slabs = []
+        for index, (r0, r1) in enumerate(chunks):
+            ctx.check(index / len(chunks), f"reconstructing rows {r0}-{r1}")
 
+            kwargs: dict[str, Any] = {
+                "algorithm": cfg.recon_algorithm,
+                "center": self.state.center,
+            }
+            if cfg.ncore is not None:
+                kwargs["ncore"] = cfg.ncore
+            if not direct:
+                kwargs["num_iter"] = cfg.recon_inner_iters
+                # The warm start is per-slab: state.volume is indexed by the same row
+                # axis, so slab r0:r1 warm-starts from exactly its own previous slices.
+                if cfg.mode == "joint" and self.state.volume is not None:
+                    kwargs["init_recon"] = self.state.volume[r0:r1]
+
+            slabs.append(
+                self._reconstruct_slab(backend, prj_aligned[:, r0:r1, :], kwargs, direct)
+            )
+
+        return _owned(np.concatenate(slabs, axis=0))
+
+    def _reconstruct_slab(
+        self, backend: Any, prj: np.ndarray, kwargs: dict[str, Any], direct: bool
+    ) -> np.ndarray:
         try:
-            return _owned(backend.reconstruct(prj_aligned, self.state.angles, **kwargs))
+            return backend.reconstruct(prj, self.state.angles, **kwargs)
         except (TypeError, ValueError) as exc:
             # e.g. gridrec rejects num_iter/init_recon. Degrade to a fresh
             # reconstruction rather than killing a long run.
@@ -409,25 +632,39 @@ class AlignmentEngine:
             logger.warning(
                 "%r rejected the iterative/warm-start arguments (%s); "
                 "falling back to a fresh reconstruction.",
-                cfg.recon_algorithm,
+                self.config.recon_algorithm,
                 exc,
             )
-            return _owned(
-                backend.reconstruct(
-                    prj_aligned,
-                    self.state.angles,
-                    algorithm=cfg.recon_algorithm,
-                    center=self.state.center,
-                )
+            return backend.reconstruct(
+                prj,
+                self.state.angles,
+                algorithm=self.config.recon_algorithm,
+                center=self.state.center,
             )
 
-    def _reproject(self, volume: np.ndarray) -> np.ndarray:
+    def _reproject(self, volume: np.ndarray, ctx: _Progress | None = None) -> np.ndarray:
+        """Forward-project the volume, in ONE call.
+
+        Deliberately not chunked, unlike the reconstruction. ``tomopy.project`` carries a
+        fixed per-call cost of about 3.4 s on this machine no matter how many slices it is
+        given, so splitting it is nearly all overhead -- measured at 200 x 32 x 512:
+
+            32 slices, one call   5.8 s
+             8 slices x 4 calls  16.0 s   (+176%)
+
+        And there is little to buy: the reprojection is a single pass where the recon
+        repeats ``num_iter`` times, so it is a small tail of the iteration (~14% measured).
+        Cancelling therefore lands within the recon, and the reprojection runs to
+        completion -- a bounded, short wait rather than an unbounded one.
+        """
+        ctx = _Progress() if ctx is None else ctx
+        ctx.check(0.0, "reprojecting")
+
         kwargs: dict[str, Any] = {"center": self.state.center}
         if self.config.ncore is not None:
             kwargs["ncore"] = self.config.ncore
-        simulated = self._backend().reproject(volume, self.state.angles, **kwargs)
 
-        return _owned(simulated)
+        return _owned(self._backend().reproject(volume, self.state.angles, **kwargs))
 
     def _condition_update(
         self, dsx: np.ndarray, dsy: np.ndarray

@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from tktomo.ptycho_align.session import PlaneRef
 from tktomo.ptycho_align.ui.panels.base import (
     MODE_ALIGNED,
     MODE_DIFFERENCE,
@@ -31,6 +32,7 @@ from tktomo.ptycho_align.ui.panels.base import (
     StackDisplay,
     side_by_side,
 )
+from tktomo.ptycho_align.ui.planes import PlaneSource
 
 
 class SinogramView(QWidget):
@@ -39,7 +41,8 @@ class SinogramView(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
 
-        self._stacks: dict[str, np.ndarray | None] = {}
+        self._source: PlaneSource | None = None
+        self._sized = False
         self._com_u: np.ndarray | None = None
         self._fitted_u: np.ndarray | None = None
         self._center: float | None = None
@@ -79,19 +82,18 @@ class SinogramView(QWidget):
         layout.addLayout(controls)
         layout.addWidget(self.display, 1)
 
-    def set_stacks(self, stacks: dict[str, np.ndarray | None]) -> None:
-        first = self._stacks == {}
-        self._stacks = stacks
+    def set_source(self, source: PlaneSource) -> None:
+        first = self._source is None
+        self._source = source
 
-        reference = stacks.get(MODE_RAW)
-        if reference is not None:
-            last_row = reference.shape[1] - 1
-            self.row_slider.setMaximum(max(last_row, 0))
-            self.row_spin.setMaximum(max(last_row, 0))
+        n_rows = source.extent(MODE_RAW, 1)
+        if n_rows:
+            self.row_slider.setMaximum(n_rows - 1)
+            self.row_spin.setMaximum(n_rows - 1)
             if first:
-                self.row_slider.setValue(last_row // 2)
+                self.row_slider.setValue((n_rows - 1) // 2)
 
-        self._refresh(autorange=first)
+        self._refresh(autorange=first or not self._sized)
 
     def set_com(
         self, com_u: np.ndarray | None, fitted_u: np.ndarray | None, center: float | None
@@ -112,26 +114,22 @@ class SinogramView(QWidget):
         image = self._compose(self.mode_combo.currentText(), self.row_slider.value())
         if image is None:
             return
+        self._sized = True
         self.display.set_image(image, autorange=autorange)
         self._refresh_overlays()
 
     def _compose(self, mode: str, row: int) -> np.ndarray | None:
-        def sinogram(name: str) -> np.ndarray | None:
-            stack = self._stacks.get(name)
-            if stack is None or row >= stack.shape[1]:
-                return None
-            return stack[:, row, :]  # (n_angles, u)
+        """One row's sinogram is axis 1 of the stack: ``stack[:, row, :]``, ``(angle, u)``."""
+        if self._source is None:
+            return None
 
         if mode == MODE_SIDE_BY_SIDE:
-            parts = [
-                sinogram(MODE_ALIGNED),
-                sinogram(MODE_REPROJECTION),
-                sinogram(MODE_DIFFERENCE),
-            ]
+            keys = (MODE_ALIGNED, MODE_REPROJECTION, MODE_DIFFERENCE)
+            parts = self._source.planes([PlaneRef(key, 1, row) for key in keys])
             if all(part is None for part in parts):
                 return None
             return side_by_side(*parts)
-        return sinogram(mode)
+        return self._source.plane(mode, 1, row)
 
     def _refresh_overlays(self) -> None:
         # The sinogram image is (angle, u): u is x, angle index is y.

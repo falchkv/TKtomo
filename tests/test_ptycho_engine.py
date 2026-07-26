@@ -279,3 +279,189 @@ def test_alignment_config_can_change_mid_run(phantom):
     assert result.config_changed  # the history plot marks this iteration
     np.testing.assert_array_equal(result.dsx, np.zeros_like(result.dsx))
     assert np.any(result.dsy != 0.0)
+
+
+def test_shift_update_is_runaway_uses_the_com_amplitude_as_its_yardstick():
+    from tktomo.ptycho_align.core import shift_update_is_runaway
+
+    # The failure this exists for: registration matching noise because the volume is too
+    # poor to reproject. Observed at 101 px RMS on a 1137 px detector whose object only
+    # swings 16 px -- while the residual *fell*, so the divergence check stayed silent.
+    assert shift_update_is_runaway(101.0, 1137, 16.25)
+    assert "101.0 px" in shift_update_is_runaway(101.0, 1137, 16.25)
+
+    # A normal correction is not flagged.
+    assert shift_update_is_runaway(3.0, 1137, 16.25) is None
+
+    # Without a COM the fallback is a fraction of the detector width (5% of 1137 = 57 px).
+    assert shift_update_is_runaway(101.0, 1137) is not None
+    assert shift_update_is_runaway(20.0, 1137) is None
+
+    # A genuinely large first correction on a badly misaligned scan is NOT flagged: the
+    # bound is the larger of the two yardsticks, so a big COM amplitude widens it.
+    assert shift_update_is_runaway(101.0, 1137, 40.0) is None
+
+    assert shift_update_is_runaway(float("nan"), 1137) is not None
+
+
+def test_row_chunking_does_not_change_the_reconstruction():
+    """Rows are independent in parallel-beam geometry -- chunking must be exact.
+
+    This is the assumption the whole interruptible-Stop design rests on: if a chunked
+    reconstruction differed from a whole one, we would have traded correctness for
+    responsiveness.
+    """
+    from tktomo.ptycho_align.core import AlignConfig, AlignmentEngine
+
+    data, _sx, _sy = make_misaligned_dataset(size=32, n_angles=24, max_shift=1.0, seed=5)[:3]
+
+    def volume_with(ncore_hint: int) -> np.ndarray:
+        engine = AlignmentEngine(
+            dataset=data,
+            config=AlignConfig(recon_algorithm="sirt", recon_inner_iters=2, ncore=ncore_hint),
+        )
+        return engine.step().volume
+
+    # ncore=1 makes one row per chunk; a large ncore puts every row in a single chunk.
+    fine = volume_with(1)
+    whole = volume_with(1024)
+    np.testing.assert_allclose(fine, whole, rtol=1e-5, atol=1e-6)
+
+
+def test_row_chunk_size_never_starves_the_cores():
+    from tktomo.ptycho_align.core import row_chunk_size
+
+    # A chunk narrower than the core count would leave cores idle: tomopy parallelises
+    # across slices, so over-fine chunking buys cancellation granularity with wallclock.
+    # Measured: 8 rows/chunk costs +4%, 4 costs +47%, 1 costs +314%.
+    assert row_chunk_size(100, 8) == 8
+    assert row_chunk_size(100, 1) == 1
+    # Never more rows than exist, and never zero.
+    assert row_chunk_size(3, 8) == 3
+    assert row_chunk_size(1, 8) == 1
+    # An explicit request overrides, for a deliberate speed/granularity trade.
+    assert row_chunk_size(100, 8, 16) == 16
+    assert row_chunk_size(100, 8, 0) == 8  # 0 means auto
+
+
+def test_the_reprojection_is_one_call_not_chunked(monkeypatch):
+    """tomopy.project costs ~3.4 s per call regardless of size, so chunking it is
+    almost pure overhead (32 slices: 5.8 s in one call, 16.0 s in four). It must stay a
+    single call even though the reconstruction beside it is chunked."""
+    from tktomo.ptycho_align.core import AlignConfig, AlignmentEngine
+
+    data = make_misaligned_dataset(size=32, n_angles=24, max_shift=1.0, seed=8)[0]
+    # ncore=1 forces the recon into one chunk per row -- the reprojection must not follow.
+    engine = AlignmentEngine(dataset=data, config=AlignConfig(ncore=1))
+
+    calls = []
+    backend = engine._backend()
+    original = backend.reproject
+
+    def counting_reproject(volume, angles, **kwargs):
+        calls.append(volume.shape[0])
+        return original(volume, angles, **kwargs)
+
+    monkeypatch.setattr(backend, "reproject", counting_reproject)
+    engine.step()
+
+    assert len(calls) == 1, f"the reprojection was split into {len(calls)} calls"
+    assert calls[0] == engine.state.original.shape[1]  # the whole volume at once
+
+
+def test_cancelling_mid_iteration_records_nothing():
+    from tktomo.ptycho_align.core import AlignConfig, AlignmentEngine, Cancelled
+
+    data = make_misaligned_dataset(size=32, n_angles=24, max_shift=1.0, seed=6)[0]
+    engine = AlignmentEngine(dataset=data, config=AlignConfig(ncore=1))
+
+    sx_before = engine.state.sx.copy()
+    cancel = threading.Event()
+    cancel.set()  # already cancelled: the very first chunk check must trip
+
+    with pytest.raises(Cancelled):
+        engine.step(cancel=cancel)
+
+    # An abandoned iteration must leave the state pristine -- stopping is always safe.
+    assert engine.iteration == 0
+    assert engine.state.volume is None
+    assert engine.history == []
+    np.testing.assert_array_equal(engine.state.sx, sx_before)
+
+
+def test_step_reports_progress_within_the_iteration():
+    from tktomo.ptycho_align.core import AlignConfig, AlignmentEngine
+
+    data = make_misaligned_dataset(size=32, n_angles=24, max_shift=1.0, seed=7)[0]
+    engine = AlignmentEngine(dataset=data, config=AlignConfig(ncore=4))
+
+    seen: list[tuple[float, str]] = []
+    engine.step(report=lambda fraction, message: seen.append((fraction, message)))
+
+    # A 20-minute iteration used to leave the progress bar frozen; it must now move, and
+    # reach the reprojection phase. (The reprojection itself is one call -- chunking it is
+    # nearly all overhead -- so it reports once rather than per chunk.)
+    assert len(seen) > 1
+    fractions = [f for f, _ in seen]
+    assert fractions == sorted(fractions)
+    assert all(0.0 <= f <= 1.0 for f in fractions)
+    assert any("reconstructing" in m for _, m in seen)
+    assert any("reprojecting" in m for _, m in seen)
+
+
+def test_align_config_survives_a_json_round_trip():
+    """Every field, not just the ones a default config exercises.
+
+    JSON has no tuple, so `pad` comes back as a list; rebuilding with `AlignConfig(**raw)`
+    would silently leave it one. The engine then unpacks `pad_u, pad_v = self.config.pad`
+    and pads the stack from a list, which happens to work -- until something compares two
+    configs and finds them unequal, or the value goes back out over a wire.
+    """
+    import json
+
+    from tktomo.ptycho_align.core import AlignConfig
+
+    config = AlignConfig(
+        recon_algorithm="mlem",
+        recon_inner_iters=5,
+        mode="sequential",
+        upsample_factor=50,
+        blur_edges=False,
+        pad=(12, 34),
+        refine_center=True,
+        align_vertical=False,
+        shift_damping=0.5,
+        max_shift_per_iter=2.5,
+        median_filter_shifts=True,
+        ncore=8,
+        row_chunk=4,
+    )
+
+    restored = AlignConfig.from_dict(json.loads(json.dumps(config.to_dict())))
+
+    assert restored == config
+    assert isinstance(restored.pad, tuple)
+
+
+def test_align_config_from_dict_keeps_none_fields_none():
+    from tktomo.ptycho_align.core import AlignConfig
+
+    config = AlignConfig(max_shift_per_iter=None, ncore=None)
+    restored = AlignConfig.from_dict(config.to_dict())
+    assert restored.max_shift_per_iter is None
+    assert restored.ncore is None
+
+
+def test_align_config_from_dict_rejects_unknown_fields():
+    """A config written by a newer tktomo must fail loudly, not silently drop settings."""
+    from tktomo.ptycho_align.core import AlignConfig
+
+    with pytest.raises(ValueError, match="regularisation_weight"):
+        AlignConfig.from_dict({**AlignConfig().to_dict(), "regularisation_weight": 0.1})
+
+
+def test_align_config_from_dict_rejects_a_malformed_pad():
+    from tktomo.ptycho_align.core import AlignConfig
+
+    with pytest.raises(ValueError, match="two entries"):
+        AlignConfig.from_dict({**AlignConfig().to_dict(), "pad": [1, 2, 3]})

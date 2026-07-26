@@ -146,6 +146,17 @@ class AlignPanel(QWidget):
         )
         self.bin_spin.valueChanged.connect(self.bin_factor_changed)
 
+        # A run holds several reconstructed volumes at once (see VolumePolicy), and at
+        # full resolution on a padded stack that is gigabytes. Getting OOM-killed looks
+        # like an unexplained crash, so show the bill before it is run up.
+        self.memory_label = QLabel("-")
+        self.memory_label.setWordWrap(True)
+
+        # Iterations of tens of minutes are normal here, so "Run 10" can mean a working
+        # day. Say so before it is pressed, not after.
+        self.time_label = QLabel("-")
+        self.time_label.setWordWrap(True)
+
         form = QFormLayout(self)
         form.addRow("Backend:", self.backend_combo)
         form.addRow("Algorithm:", self.algorithm_combo)
@@ -163,6 +174,8 @@ class AlignPanel(QWidget):
         form.addRow(self.refine_center_check)
         form.addRow("Cores:", self.ncore_spin)
         form.addRow("Bin factor:", self.bin_spin)
+        form.addRow("Memory:", self.memory_label)
+        form.addRow("Time:", self.time_label)
 
         self.algorithm_combo.currentTextChanged.connect(self._algorithm_changed)
         self._algorithm_changed(self.algorithm_combo.currentText())
@@ -217,6 +230,22 @@ class AlignPanel(QWidget):
 
     def bin_factor(self) -> int:
         return self.bin_spin.value()
+
+    def set_bin_factor(self, factor: int) -> None:
+        """Put the spin box back without re-emitting -- used to refuse a bin change."""
+        self.bin_spin.blockSignals(True)
+        self.bin_spin.setValue(factor)
+        self.bin_spin.blockSignals(False)
+
+    def show_memory_estimate(self, text: str, *, warn: bool) -> None:
+        """Report what a run would cost in RAM. ``warn`` reddens it."""
+        colour = "#d66" if warn else "#888"
+        self.memory_label.setText(f"<span style='color:{colour}'>{text}</span>")
+
+    def show_time_estimate(self, text: str, *, warn: bool) -> None:
+        """Report what a run would cost in wallclock. ``warn`` reddens it."""
+        colour = "#d66" if warn else "#888"
+        self.time_label.setText(f"<span style='color:{colour}'>{text}</span>")
 
 
 class ActionBar(QWidget):

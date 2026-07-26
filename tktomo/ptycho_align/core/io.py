@@ -8,6 +8,7 @@ session puts you back exactly where you were.
 
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 from typing import Any
@@ -19,12 +20,15 @@ from tktomo.ptycho_align.core.engine import AlignConfig, AlignmentEngine
 from tktomo.ptycho_align.core.state import IterationResult
 
 __all__ = [
+    "convergence_csv",
     "export_convergence_csv",
+    "export_projections",
     "export_shifts_csv",
     "export_tiff_stack",
     "export_volume",
     "load_session",
     "save_session",
+    "shifts_csv",
 ]
 
 _SESSION_VERSION = 1
@@ -84,7 +88,7 @@ def load_session(path: str | Path) -> AlignmentEngine:
                 f"Session format v{version} is not supported (expected v{_SESSION_VERSION})."
             )
 
-        config = AlignConfig(**_coerce_config(json.loads(handle.attrs["config"])))
+        config = AlignConfig.from_dict(json.loads(handle.attrs["config"]))
         metadata = json.loads(handle.attrs.get("metadata", "{}"))
 
         dataset = ProjectionData(
@@ -96,7 +100,7 @@ def load_session(path: str | Path) -> AlignmentEngine:
         # construction would pad the data a second time.
         engine = AlignmentEngine(
             dataset=dataset,
-            config=AlignConfig(**{**config.to_dict(), "pad": (0, 0)}),
+            config=AlignConfig.from_dict({**config.to_dict(), "pad": (0, 0)}),
             sx0=handle["sx"][()],
             sy0=handle["sy"][()],
             center=float(handle.attrs["center"]),
@@ -129,13 +133,6 @@ def load_session(path: str | Path) -> AlignmentEngine:
     return engine
 
 
-def _coerce_config(raw: dict[str, Any]) -> dict[str, Any]:
-    # JSON has no tuples; AlignConfig.pad must come back as one.
-    if "pad" in raw and raw["pad"] is not None:
-        raw["pad"] = tuple(raw["pad"])
-    return raw
-
-
 def _jsonable(metadata: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key, value in metadata.items():
@@ -151,30 +148,34 @@ def _jsonable(metadata: dict[str, Any]) -> dict[str, Any]:
 # -- exports -----------------------------------------------------------------------
 
 
+def _csv_text(table: np.ndarray, header: str) -> str:
+    buffer = io.StringIO()
+    np.savetxt(buffer, table, delimiter=",", header=header, comments="", fmt="%.8g")
+    return buffer.getvalue()
+
+
+def shifts_csv(angles: np.ndarray, sx: np.ndarray, sy: np.ndarray) -> str:
+    """The shifts table as text.
+
+    Separate from writing it so the same bytes can be handed to a client whose disk is
+    not the one the engine is running on -- a few kilobytes, and one definition of the
+    format rather than two that can drift apart.
+    """
+    return _csv_text(np.column_stack([angles, np.rad2deg(angles), sx, sy]), "angle_rad,angle_deg,sx,sy")
+
+
+def convergence_csv(history: list[IterationResult]) -> str:
+    """The per-iteration convergence table as text."""
+    table = np.array([[r.iteration, r.error, r.residual, r.center, r.wallclock_s] for r in history])
+    return _csv_text(table.reshape(-1, 5), "iteration,shift_rms,residual,center,wallclock_s")
+
+
 def export_shifts_csv(path: str | Path, angles: np.ndarray, sx: np.ndarray, sy: np.ndarray) -> None:
-    table = np.column_stack([angles, np.rad2deg(angles), sx, sy])
-    np.savetxt(
-        path,
-        table,
-        delimiter=",",
-        header="angle_rad,angle_deg,sx,sy",
-        comments="",
-        fmt="%.8g",
-    )
+    Path(path).write_text(shifts_csv(angles, sx, sy))
 
 
 def export_convergence_csv(path: str | Path, history: list[IterationResult]) -> None:
-    table = np.array(
-        [[r.iteration, r.error, r.residual, r.center, r.wallclock_s] for r in history]
-    )
-    np.savetxt(
-        path,
-        table.reshape(-1, 5),
-        delimiter=",",
-        header="iteration,shift_rms,residual,center,wallclock_s",
-        comments="",
-        fmt="%.8g",
-    )
+    Path(path).write_text(convergence_csv(history))
 
 
 def export_tiff_stack(path: str | Path, array: np.ndarray) -> None:

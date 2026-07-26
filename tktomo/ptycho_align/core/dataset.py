@@ -18,7 +18,7 @@ rather than a traceback.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -33,7 +33,9 @@ __all__ = [
     "DatasetProblem",
     "Hdf5Entry",
     "angles_to_radians",
+    "coerce_load_kwargs",
     "inspect_dataset",
+    "jsonable_load_kwargs",
     "list_hdf5_datasets",
     "load_dataset",
     "load_hdf5",
@@ -304,6 +306,43 @@ class Crop:
 
     def __repr__(self) -> str:
         return f"Crop(v={self.v0}:{self.v1}, u={self.u0}:{self.u1})"
+
+
+def jsonable_load_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """Render ``load_dataset`` kwargs so they survive JSON or msgpack.
+
+    The browser and crop dialogs build this dict, but the file it describes may live on
+    another machine, so the dict has to travel. :class:`Crop` is not serialisable -- it
+    goes over as its ``as_tuple()`` -- and tuples arrive as lists.
+    """
+    out = dict(kwargs)
+    crop = out.get("crop")
+    if isinstance(crop, Crop):
+        out["crop"] = list(crop.as_tuple())
+    elif crop is not None:
+        out["crop"] = [int(v) for v in crop]
+    if out.get("axis_order") is not None:
+        out["axis_order"] = [int(a) for a in out["axis_order"]]
+    return out
+
+
+def coerce_load_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """Undo :func:`jsonable_load_kwargs` -- the same fix ``AlignConfig.from_dict`` makes.
+
+    Neither JSON nor msgpack has a tuple, so ``axis_order`` and ``crop`` come back as
+    lists. ``load_hdf5`` happens to tolerate both today, but that is luck rather than
+    design, and the dict is also stored in ``metadata`` and compared against later.
+    """
+    out = dict(kwargs)
+    crop = out.get("crop")
+    if crop is not None and not isinstance(crop, Crop):
+        out["crop"] = Crop(*(int(v) for v in crop))
+    if out.get("axis_order") is not None:
+        axis_order = tuple(int(a) for a in out["axis_order"])
+        if sorted(axis_order) != [0, 1, 2]:
+            raise ValueError(f"axis_order must be a permutation of (0, 1, 2); got {axis_order}")
+        out["axis_order"] = axis_order
+    return out
 
 
 # How a complex projection becomes the real image the alignment works on. Phase is the

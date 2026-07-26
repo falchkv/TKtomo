@@ -1,20 +1,30 @@
 """The ptycho-align main window.
 
-A thin shell over :mod:`tktomo.ptycho_align.core`. It owns the engine, drives it on a
-worker thread, and keeps the four viewers fed.
+A thin shell over an :class:`~tktomo.ptycho_align.session.protocol.AlignmentSession`.
+The window owns no engine and runs no compute: it asks the session for work, draws what
+comes back, and never touches tomopy. Whether the session is driving an engine in this
+process or a server on a cluster node is a connection detail it deliberately cannot see.
 
-One performance rule runs through the whole file: the aligned stack, the reprojection
-and their difference are computed **once per iteration** and cached. Recomputing a
-reprojection on every slider tick would make scrubbing unusable, and the viewers do
-scrub.
+Two rules follow from that and run through the whole file.
+
+**Nothing here blocks on compute.** Heavy verbs return a job handle and report through
+events; where the window legitimately has to wait -- loading, preprocessing, COM -- it
+does so behind a modal progress dialog via
+:meth:`~tktomo.ptycho_align.ui.session_bridge.SessionBridge.run_job`, which is
+cancellable and keeps the window painting.
+
+**The session is the single source of truth.** The window keeps one cached
+:class:`~tktomo.ptycho_align.session.types.SessionSummary` and draws from it, rather than
+reaching into engine state. Pixels are fetched separately and only when displayed.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import time
 from pathlib import Path
 
-import numpy as np
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
@@ -32,57 +42,53 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from tktomo.io import ProjectionData
-from tktomo.ptycho_align.core import (
-    AlignConfig,
-    AlignmentEngine,
-    Crop,
-    DatasetProblem,
-    algorithm_rejects_negatives,
-    center_is_plausible,
-    com_prealign,
-    find_center,
-    inspect_dataset,
-    list_hdf5_datasets,
-    load_dataset,
+from tktomo.ptycho_align.core import AlignConfig, Crop, center_is_plausible
+from tktomo.ptycho_align.core.estimates import format_bytes as _gb
+from tktomo.ptycho_align.core.estimates import format_duration as _duration
+from tktomo.ptycho_align.core.preprocess import PreprocessOptions
+from tktomo.ptycho_align.session import (
+    STACK_ALIGNED,
+    STACK_REPROJECTION,
+    Busy,
+    LocalSession,
+    SessionSummary,
 )
-from tktomo.ptycho_align.core import io as session_io
-from tktomo.ptycho_align.core import preprocess as pp
-from tktomo.ptycho_align.core.state import IterationResult
+from tktomo.ptycho_align.session.protocol import JobFailed
+from tktomo.ptycho_align.ui.session_bridge import JobCancelled, SessionBridge
 from tktomo.ptycho_align.ui.panels import (
     ActionBar,
     AlignPanel,
     ComPanel,
     DataPanel,
     Hdf5BrowserDialog,
-    PreprocessOptions,
     PreprocessPanel,
     ProjectionView,
+    ResourceView,
     ShiftView,
     SinogramView,
     TomogramView,
 )
-from tktomo.ptycho_align.ui.panels.base import (
-    MODE_ALIGNED,
-    MODE_DIFFERENCE,
-    MODE_RAW,
-    MODE_REPROJECTION,
-)
+from tktomo.ptycho_align.ui.panels.base import MODE_RAW
 from tktomo.ptycho_align.ui.panels.crop import CropDialog
 from tktomo.ptycho_align.ui.panels.hdf5_browser import preview_text
-from tktomo.ptycho_align.ui.worker import AlignmentRun
+from tktomo.ptycho_align.ui.planes import PlaneSource
 
 logger = logging.getLogger("tktomo.ptycho_align")
 
 _HDF5_SUFFIXES = (".h5", ".hdf5", ".nxs", ".nx5", ".hdf")
 
+# Warn once a run's estimated peak is within this fraction of available RAM. Not 1.0:
+# the estimate counts our own arrays, not tomopy's transient shared-memory buffers, and
+# overshooting means the OOM killer takes the window down with no traceback at all.
+_MEMORY_HEADROOM = 0.8
+
+# Beyond this, a run is an "leave it overnight" proposition rather than something to sit
+# and watch, and the user should be told before pressing Run, not after.
+_SLOW_RUN_SECONDS = 30 * 60
+
 
 def _is_hdf5(path: str) -> bool:
     return Path(path).suffix.lower() in _HDF5_SUFFIXES
-
-
-class _Cancelled(Exception):
-    """The user cancelled the load. Not an error, so it gets no dialog."""
 
 
 class _LogDock(QObject, logging.Handler):
@@ -118,34 +124,34 @@ def _scrollable(widget: QWidget) -> QScrollArea:
     return area
 
 
-def bin_stack(stack: np.ndarray, factor: int) -> np.ndarray:
-    """Mean-pool the detector axes by ``factor`` (angles are left alone)."""
-    if factor <= 1:
-        return stack
-    n, height, width = stack.shape
-    height -= height % factor
-    width -= width % factor
-    trimmed = stack[:, :height, :width]
-    return trimmed.reshape(n, height // factor, factor, width // factor, factor).mean(
-        axis=(2, 4)
-    )
-
-
 class PtychoAlignWindow(QMainWindow):
-    def __init__(self, path: str | None = None) -> None:
+    def __init__(self, path: str | None = None, session=None) -> None:
         super().__init__()
         self.setWindowTitle("ptycho-align -- reprojection alignment")
         self._fit_to_screen(1500, 950)
 
-        self.raw: ProjectionData | None = None  # exactly as loaded
-        self.preprocessed: ProjectionData | None = None  # engine input, before binning
-        self.engine: AlignmentEngine | None = None
-        self.com = None
-        # How the current stack was read, so a different crop can go back to the file.
-        self._source: dict | None = None
-        self._run: AlignmentRun | None = None
-        self._bin_factor = 1
-        self._stacks: dict[str, np.ndarray | None] = {}
+        # Defaults to an in-process session. Passing one in is how a cluster connection
+        # arrives: nothing below this line knows or cares which it is.
+        self.session = session if session is not None else LocalSession()
+        self.bridge = SessionBridge(self.session, self)
+        self._summary: SessionSummary = self.session.summary()
+        # Every pixel the viewers draw comes through here, one displayed plane at a time.
+        self._planes = PlaneSource(self.session)
+        self._planes.update(self._summary)
+        # The handle of the run in flight, so close and the tests can wait on it.
+        self._run_handle = None
+        # Measured seconds per unit of work, per algorithm (see `iteration_cost_units`).
+        # Kept across engine rebuilds on purpose: it is a property of this machine and
+        # this algorithm, not of the current grid, so one timed iteration at bin 2 can
+        # predict what bin 1 would cost -- which is exactly when the user needs telling.
+        self._seconds_per_unit: dict[str, float] = {}
+        # (epoch, iteration) pairs already folded into the calibration, so re-reading the
+        # history does not count the same iteration twice. Keyed on the session's epoch
+        # rather than on engine identity: a rebuild restarts the numbering at 1, and with
+        # a session that survives the rebuild those would collide with the keys already
+        # recorded -- freezing the estimate at the old grid's cost exactly when the grid
+        # got more expensive.
+        self._calibrated: set[tuple[int, int]] = set()
 
         self.projection_view = ProjectionView()
         self.sinogram_view = SinogramView()
@@ -179,6 +185,7 @@ class PtychoAlignWindow(QMainWindow):
         self.preprocess_panel = PreprocessPanel()
         self.com_panel = ComPanel()
         self.align_panel = AlignPanel()
+        self.resource_view = ResourceView()
         self._add_left_docks()
 
         self.log_widget = QPlainTextEdit(readOnly=True)
@@ -228,6 +235,7 @@ class PtychoAlignWindow(QMainWindow):
             ("Prep", self.preprocess_panel),
             ("COM", self.com_panel),
             ("Align", self.align_panel),
+            ("Res", self.resource_view),
         ):
             dock = QDockWidget(title, self)
             # Each panel goes in a scroll area. Stacked, their natural minimum heights
@@ -266,8 +274,19 @@ class PtychoAlignWindow(QMainWindow):
 
         self.action_bar.step_requested.connect(lambda: self._start_run(1))
         self.action_bar.run_requested.connect(self._start_run)
+        # More iterations means more retained volumes, so the estimate moves with it.
+        self.action_bar.run_spin.valueChanged.connect(lambda _: self._show_estimates())
         self.action_bar.stop_requested.connect(self._stop_run)
         self.action_bar.revert_requested.connect(self._revert)
+
+        # The session narrates itself. These four carry the signatures the retired
+        # AlignmentWorker had, so the slots below are unchanged.
+        self.bridge.iteration_finished.connect(self._iteration_finished)
+        self.bridge.progress.connect(self._progress)
+        self.bridge.failed.connect(self._run_failed)
+        self.bridge.run_finished.connect(self._run_finished)
+        self.bridge.summary_changed.connect(self._summary_changed)
+        self.bridge.telemetry.connect(self.resource_view.show_sample)
 
     def _build_menus(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
@@ -315,45 +334,19 @@ class PtychoAlignWindow(QMainWindow):
     def _load_via_browser(self, path: str) -> bool:
         """Open the dataset browser on ``path``; return whether a dataset was loaded."""
         try:
-            dialog = Hdf5BrowserDialog(path, self)
+            # Listed once and shared: the dialog and the log line used to walk the file
+            # separately, and this is the call that becomes an RPC once the file is on a
+            # cluster.
+            entries = self.session.list_hdf5(path)
+            dialog = Hdf5BrowserDialog(path, self, entries=entries)
         except Exception as exc:
             self._error("Could not read the HDF5 file", str(exc))
             return False
 
-        logger.info("Browsing %s: %s", path, preview_text(path))
+        logger.info("Browsing %s: %s", path, preview_text(entries))
         if dialog.exec() != QDialog.Accepted:
             return False
         return self.load_path(path, **dialog.selection())
-
-    def _read_with_progress(self, path: str, load_kwargs: dict) -> ProjectionData:
-        """Load, showing a cancellable progress dialog for the big HDF5 reads.
-
-        Reading 410 cropped projections off a 5 GB file takes long enough that a frozen
-        window looks like a hang. ``load_hdf5`` calls back once per projection, which is
-        also where cancellation is honoured.
-        """
-        if "data_path" not in load_kwargs:
-            return load_dataset(path, **load_kwargs)
-
-        progress = QProgressDialog("Reading projections...", "Cancel", 0, 100, self)
-        progress.setWindowTitle("Loading")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(300)  # don't flash up for a small crop
-
-        def tick(done: int, total: int) -> bool:
-            progress.setMaximum(total)
-            progress.setValue(done)
-            QApplication.processEvents()
-            return not progress.wasCanceled()
-
-        try:
-            return load_dataset(path, progress=tick, **load_kwargs)
-        except DatasetProblem as exc:
-            if progress.wasCanceled():
-                raise _Cancelled from exc
-            raise
-        finally:
-            progress.close()
 
     def _adjust_crop(self) -> None:
         """Re-read the stack over a different detector region, or a different component.
@@ -362,19 +355,20 @@ class PtychoAlignWindow(QMainWindow):
         the discarded region was never in memory to begin with. That resets the
         alignment, hence the confirmation.
         """
-        if self.raw is None or not self._source:
+        source = self._source()
+        dataset = self._summary.dataset
+        if dataset is None or source is None or dataset.crop is None:
             self._error("No data", "Load a projection stack from an HDF5 file first.")
             return
         if self._busy():
             return
 
-        meta = self.raw.metadata
-        full_shape = tuple(meta["full_shape"])
+        current = Crop(*dataset.crop)
         dialog = CropDialog(
-            full_shape,
-            Crop(*meta["crop"]),
-            meta.get("component", "phase"),
-            complex_source=self._source_is_complex(),
+            tuple(dataset.full_shape),
+            current,
+            dataset.component or "phase",
+            complex_source=self._source_is_complex(source),
             roi=self._roi_as_file_crop(),
             parent=self,
         )
@@ -382,16 +376,14 @@ class PtychoAlignWindow(QMainWindow):
             return
 
         selection = dialog.selection()
-        if selection["crop"] == Crop(*meta["crop"]) and selection["component"] == meta.get(
-            "component"
-        ):
+        if selection["crop"] == current and selection["component"] == dataset.component:
             return  # nothing changed
 
-        if self.engine is not None and self.engine.iteration > 0:
+        if self._summary.iteration > 0:
             answer = QMessageBox.question(
                 self,
                 "Re-read the data?",
-                f"Re-reading discards the {self.engine.iteration} completed iteration(s) "
+                f"Re-reading discards the {self._summary.iteration} completed iteration(s) "
                 "and their shifts.\n\nContinue?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
@@ -399,12 +391,16 @@ class PtychoAlignWindow(QMainWindow):
             if answer != QMessageBox.Yes:
                 return
 
-        self.load_path(self._source["path"], **{**self._source["kwargs"], **selection})
+        self.load_path(source["path"], **{**source["kwargs"], **selection})
 
-    def _source_is_complex(self) -> bool:
+    def _source(self) -> dict | None:
+        """How the current stack was read, so a different crop can go back to the file."""
+        return self._summary.metadata.get("source")
+
+    def _source_is_complex(self, source: dict) -> bool:
         """Is the source dataset complex? (Only then is the component combo meaningful.)"""
-        entries = {e.path: e for e in list_hdf5_datasets(self._source["path"])}
-        entry = entries.get(self._source["kwargs"].get("data_path", ""))
+        entries = {e.path: e for e in self.session.list_hdf5(source["path"])}
+        entry = entries.get(source["kwargs"].get("data_path", ""))
         return bool(entry and entry.is_complex)
 
     def _roi_as_file_crop(self) -> Crop | None:
@@ -415,42 +411,43 @@ class PtychoAlignWindow(QMainWindow):
         the ROI's numbers no longer index the file.
         """
         roi = self.projection_view.roi_bounds()
-        if roi is None or self.raw is None or not self._source:
+        dataset = self._summary.dataset
+        if roi is None or dataset is None or dataset.crop is None or self._source() is None:
             return None
-        displayed = self._stacks.get(MODE_RAW)
-        if displayed is None or displayed.shape != self.raw.data.shape:
+        displayed = self._planes.shape(MODE_RAW)
+        raw_shape = self._summary.raw_shape
+        if displayed is None or raw_shape is None or tuple(displayed) != tuple(raw_shape):
             return None
-        v0, u0 = self.raw.metadata["crop"][0], self.raw.metadata["crop"][2]
-        return Crop(*roi).shifted_by(v0, u0)
+        return Crop(*roi).shifted_by(dataset.crop[0], dataset.crop[2])
 
     def load_path(self, path: str, **load_kwargs) -> bool:
-        """Load a dataset. Extra keywords go straight to :func:`load_dataset`.
+        """Load a dataset. Extra keywords go straight to the session's loader.
 
         With no keywords this probes the conventional layouts; when that finds nothing
         in an HDF5 file, the dataset browser opens rather than the user being told
         "no projection dataset found" and left there.
         """
         try:
-            data = self._read_with_progress(path, load_kwargs)
-        except KeyError as exc:
-            if not load_kwargs and _is_hdf5(path):
+            result = self.bridge.run_job(
+                self.session.open_dataset(path, load_kwargs),
+                title="Loading",
+                label="Reading projections...",
+                parent=self,
+            )
+        except JobCancelled:
+            self.action_bar.show_status("Loading cancelled.")
+            return False
+        except JobFailed as exc:
+            if exc.exc_type == "KeyError" and not load_kwargs and _is_hdf5(path):
                 logger.info("No conventional layout in %s; opening the browser", path)
                 return self._load_via_browser(path)
             self._error("Could not load the dataset", str(exc))
             return False
-        except _Cancelled:
-            self.action_bar.show_status("Loading cancelled.")
-            return False
-        except Exception as exc:
-            self._error("Could not load the dataset", str(exc))
+        except Busy:
+            self._refused()
             return False
 
-        # Only an explicitly-addressed HDF5 stack can be re-read with a different crop.
-        self._source = (
-            {"path": path, "kwargs": load_kwargs} if "data_path" in load_kwargs else None
-        )
-
-        problems = inspect_dataset(data)
+        problems = result.get("problems", ())
         if problems:
             # These are the failures that would otherwise surface as a traceback from
             # deep inside tomopy, so say them plainly and let the user decide.
@@ -464,149 +461,143 @@ class PtychoAlignWindow(QMainWindow):
             if answer != QMessageBox.Yes:
                 return False
 
-        self.raw = data
-        self.preprocessed = data
-        self.com = None
-        self.data_panel.show_dataset(data)
-        logger.info("Loaded %s %s from %s", path, data.data.shape, data.metadata.get("data_path"))
-
-        self._rebuild_engine()
+        self._after_engine_rebuilt()
         self.action_bar.show_status("Loaded. Apply preprocessing, then run COM pre-alignment.")
         return True
 
     # -- preprocessing -----------------------------------------------------------------
 
     def _apply_preprocessing(self, options: PreprocessOptions) -> None:
-        if self.raw is None:
+        if not self._summary.has_engine:
             self._error("No data", "Load a projection stack first.")
             return
-        if self._busy():
-            return
-
-        array = np.asarray(self.raw.data, dtype=np.float32)
-        roi = self.projection_view.roi_bounds()
-        mask = None
-        if roi is not None:
-            v0, v1, u0, u1 = roi
-            mask = np.zeros(array.shape[1:], dtype=bool)
-            mask[v0:v1, u0:u1] = True
 
         try:
-            if options.invert:
-                array = pp.invert(array)
-            if options.unwrap:
-                array = pp.unwrap_phase(array)
-            if options.remove_ramp:
-                array = pp.remove_phase_ramp(array, mask=mask, border=options.border)
-            if options.remove_offset:
-                array = pp.remove_phase_offset(array, mask=mask, border=options.border)
-        except Exception as exc:
+            report = self.bridge.run_job(
+                self.session.apply_preprocessing(options, self.projection_view.roi_bounds()),
+                title="Preprocessing",
+                label="Preprocessing projections...",
+                parent=self,
+            )
+        except JobCancelled:
+            return
+        except Busy:
+            self._refused()
+            return
+        except JobFailed as exc:
             self._error("Preprocessing failed", str(exc))
             return
 
-        ok, total = pp.check_mass_positive(array)
-        if not ok:
+        if not report.mass_is_positive:
             QMessageBox.warning(
                 self,
                 "Negative mass",
-                f"The projection integral is {total:.4g}, i.e. negative. The "
+                f"The projection integral is {report.mass_total:.4g}, i.e. negative. The "
                 "reconstruction and the centre-of-mass both assume positive mass -- "
                 "switch on 'Invert' and apply again.",
             )
 
-        if options.pad_percent > 0:
-            pad_v = int(round(array.shape[1] * options.pad_percent / 100.0))
-            pad_u = int(round(array.shape[2] * options.pad_percent / 100.0))
-            array = pp.pad(array, pad_u=pad_u, pad_v=pad_v)
-
-        self.preprocessed = ProjectionData(
-            data=array, angles=self.raw.angles, metadata=dict(self.raw.metadata)
-        )
-        self.com = None
-        logger.info("Preprocessed -> %s", array.shape)
-        self._rebuild_engine()
+        self._after_engine_rebuilt()
         self.action_bar.show_status("Preprocessing applied.")
 
     def _reset_preprocessing(self) -> None:
-        if self.raw is None:
+        if not self._summary.has_engine:
             return
-        self.preprocessed = self.raw
-        self.com = None
-        self._rebuild_engine()
+        try:
+            self.bridge.run_job(
+                self.session.reset_preprocessing(),
+                title="Preprocessing",
+                label="Restoring the raw stack...",
+                parent=self,
+            )
+        except (JobCancelled, Busy):
+            return
+        except JobFailed as exc:
+            self._error("Could not reset", str(exc))
+            return
+        self._after_engine_rebuilt()
         self.action_bar.show_status("Reset to raw.")
 
     # -- COM ---------------------------------------------------------------------------
 
-    def _busy(self) -> bool:
-        """True (with a nag) if a run is in flight.
+    def _refused(self) -> None:
+        """Explain why an exclusive action was refused."""
+        QMessageBox.information(
+            self,
+            "Alignment is running",
+            "Stop the current run first. TomoPy cannot safely run two "
+            "reconstructions at once.",
+        )
 
-        Anything that calls into tomopy must refuse to start while the worker thread is
-        already inside tomopy -- it is not thread-safe and the process segfaults.
+    def _busy(self) -> bool:
+        """True (with a nag) if the cached summary already says a run is in flight.
+
+        Only a courtesy check, so a dialog does not open just to be thrown away. The
+        authoritative answer is the session's :class:`Busy`, which every caller must
+        still handle -- the cache can be a moment out of date, and the refusal is what
+        actually keeps two reconstructions from running at once.
         """
-        if self._run is not None and self._run.running:
-            QMessageBox.information(
-                self,
-                "Alignment is running",
-                "Stop the current run first. TomoPy cannot safely run two "
-                "reconstructions at once.",
-            )
+        if self._summary.running:
+            self._refused()
             return True
         return False
 
     def _run_com(self, reference: str) -> None:
-        if self.engine is None:
+        """Ask for COM pre-alignment and show what came back.
+
+        The shifts, centre, history and volume that follow from the result are the
+        session's business, not the window's -- this used to reach into ``engine.state``
+        and rewrite six fields by hand.
+        """
+        if not self._summary.has_engine:
             self._error("No data", "Load a projection stack first.")
             return
         if self._busy():
             return
 
         try:
-            result = com_prealign(
-                self.engine.state.original, self.engine.state.angles, vertical_reference=reference
+            result = self.bridge.run_job(
+                self.session.run_com(reference),
+                title="COM pre-alignment",
+                label="Computing centroids...",
+                parent=self,
             )
-        except ValueError as exc:
+        except JobCancelled:
+            return
+        except Busy:
+            self._refused()
+            return
+        except JobFailed as exc:
             self._error("COM pre-alignment failed", str(exc))
             return
 
-        self.com = result
-        self.engine.state.sx = result.sx.copy()
-        self.engine.state.sy = result.sy.copy()
-        self.engine.state.center = result.center
-        self.engine.state.history.clear()
-        self.engine.state.volume = None
-        self.engine.invalidate_cache()
-
         self.com_panel.show_result(result.center, result.fit_residual, result.amplitude)
         self.shift_view.update_com(
-            self.engine.state.angles, result.com_u, result.fitted_u, result.fit_residual
+            self._summary.angles, result.com_u, result.fitted_u, result.fit_residual
         )
         self.sinogram_view.set_com(result.com_u, result.fitted_u, result.center)
-        logger.info(
-            "COM pre-alignment: centre %.3f px, fit residual %.3f px, amplitude %.2f px",
-            result.center,
-            result.fit_residual,
-            result.amplitude,
-        )
         self._refresh_views()
         self.action_bar.show_status(
             f"COM pre-alignment done (centre {result.center:.2f} px). Ready to step."
         )
 
     def _estimate_center(self, method: str) -> None:
-        if self.engine is None:
+        if not self._summary.has_engine:
             return
         if self._busy():
             return
-        QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            center = find_center(
-                self.engine.aligned_projections(), self.engine.state.angles, method=method
+            center = self.bridge.run_job(
+                self.session.estimate_center(method),
+                title="Centre estimation",
+                label=f"Finding the rotation centre ({method})...",
+                parent=self,
             )
-        except Exception as exc:
+        except (JobCancelled, Busy):
+            return
+        except JobFailed as exc:
             self._error("Centre estimation failed", str(exc))
             return
-        finally:
-            QApplication.restoreOverrideCursor()
 
         logger.info("Centre estimate (%s): %.3f px", method, center)
 
@@ -614,8 +605,9 @@ class PtychoAlignWindow(QMainWindow):
         # quietly ruins a long run. find_center_vo in particular is unreliable on padded
         # phase data. Check it against the COM fit before letting it anywhere near the
         # engine.
-        width = self.engine.state.original.shape[2]
-        reference = self.com.center if self.com else None
+        width = self._summary.original_shape[2]
+        com = self._summary.com
+        reference = com.center if com else None
         ok, reason = center_is_plausible(center, width, reference)
         if not ok:
             logger.warning("Rejected centre estimate (%s): %s", method, reason)
@@ -636,81 +628,165 @@ class PtychoAlignWindow(QMainWindow):
         self.com_panel.set_center(center)
 
     def _set_center(self, center: float) -> None:
-        if self.engine is None:
+        if not self._summary.has_engine:
             return
-        self.engine.state.center = center
-        self.engine.invalidate_cache()
+        self.session.set_center(center)
+        self._summary = self.session.summary()
+        com = self._summary.com
         self.sinogram_view.set_com(
-            self.com.com_u if self.com else None,
-            self.com.fitted_u if self.com else None,
-            center,
+            com.com_u if com else None, com.fitted_u if com else None, center
         )
-        logger.info("Centre set to %.3f px", center)
         self.action_bar.show_status(f"Centre set to {center:.3f} px.")
 
     # -- engine ------------------------------------------------------------------------
 
-    def _rebuild_engine(self, sx=None, sy=None, center=None) -> None:
-        if self.preprocessed is None:
-            return
-
-        binned = bin_stack(
-            np.asarray(self.preprocessed.data, dtype=np.float32), self._bin_factor
-        )
-        dataset = ProjectionData(
-            data=binned,
-            angles=self.preprocessed.angles,
-            metadata=dict(self.preprocessed.metadata),
-        )
-        # The engine's own pad is left at (0,0): padding is applied in the preprocess
-        # step so that what the viewers show is exactly what the engine aligns.
-        config = self.align_panel.config()
-        config.pad = (0, 0)
-
-        self.engine = AlignmentEngine(
-            dataset=dataset, config=config, sx0=sx, sy0=sy, center=center
-        )
+    def _after_engine_rebuilt(self) -> None:
+        """Re-read everything the window caches about a grid that has just changed."""
+        self._summary = self.session.summary()
+        dataset = self._summary.dataset
+        if dataset is not None:
+            self.data_panel.show_dataset(dataset)
         self.shift_view.clear()
+        self._show_estimates()
         self._refresh_views()
 
     def _bin_changed(self, factor: int) -> None:
-        if self.engine is None or factor == self._bin_factor:
-            self._bin_factor = factor
+        if not self._summary.has_engine or factor == self._summary.bin_factor:
             return
 
-        # Shifts are in pixels of the binned grid, so going 2x -> 1x doubles them.
-        scale = self._bin_factor / factor
-        sx = self.engine.state.sx * scale
-        sy = self.engine.state.sy * scale
-        center = self.engine.state.center * scale
+        # Rebinning rebuilds the engine, and a run in flight is working on the old grid.
+        # Rebuilding underneath it does not stop it: the iteration completes into an
+        # engine nothing reads any more and is silently discarded -- minutes of compute,
+        # no visible result, no error. The session refuses; put the spin box back.
+        try:
+            self.bridge.run_job(
+                self.session.set_bin_factor(factor),
+                title="Binning",
+                label=f"Rebinning to {factor}x...",
+                parent=self,
+            )
+        except Busy:
+            self._refused()
+            self.align_panel.set_bin_factor(self._summary.bin_factor)
+            return
+        except JobCancelled:
+            self.align_panel.set_bin_factor(self._summary.bin_factor)
+            return
+        except JobFailed as exc:
+            self._error("Could not change the bin factor", str(exc))
+            self.align_panel.set_bin_factor(self._summary.bin_factor)
+            return
 
-        self._bin_factor = factor
-        logger.info("Bin factor -> %dx; rescaled existing shifts by %.3g", factor, scale)
-        self._rebuild_engine(sx=sx, sy=sy, center=center)
+        self._after_engine_rebuilt()
+        # The COM result is in pixels too and outlives the rebuild -- it is the reference
+        # new centre estimates are judged against -- so the session rescales it and the
+        # panel re-reads it here.
+        com = self._summary.com
+        if com is not None:
+            self.com_panel.show_result(com.center, com.fit_residual, com.amplitude)
         self.action_bar.show_status(
             f"Binning {factor}x. Shifts rescaled; history cleared (the volume grid changed)."
         )
 
+    def _run_footprint(self, n_iterations: int) -> tuple[int, str]:
+        """Peak RAM a run of ``n_iterations`` would need, and a one-line explanation.
+
+        Priced by the session, because on a cluster the numbers that matter -- what is
+        available, and what the cgroup will actually allow -- belong to the machine doing
+        the work, not to the one drawing the window.
+        """
+        preflight = self.session.run_preflight(n_iterations)
+        return preflight.footprint_bytes, preflight.footprint_text
+
+    def _cost_units(self) -> float:
+        return self.session.cost_units()
+
+    def _calibrate(self) -> None:
+        """Learn seconds-per-unit from the iterations that have actually run.
+
+        Driven off the summary's history rather than the per-iteration signal: the signal
+        is queued to the GUI thread, so anything that blocks the main thread (a modal
+        dialog, a test waiting on a job) never delivers it, and the calibration would
+        silently never happen. The history is the authoritative record either way.
+        """
+        if not self._summary.has_engine:
+            return
+        units = self._cost_units()
+        if units <= 0:
+            return
+        algorithm = self._summary.config.get("recon_algorithm", "")
+        for result in self._summary.history:
+            key = (self._summary.epoch, result.iteration)
+            if key in self._calibrated or result.wallclock_s <= 0:
+                continue
+            self._calibrated.add(key)
+            measured = result.wallclock_s / units
+            previous = self._seconds_per_unit.get(algorithm)
+            # Average with what we knew: a single iteration can be an outlier (a cold
+            # cache, the machine busy elsewhere), and a wild estimate is worse than none.
+            self._seconds_per_unit[algorithm] = (
+                measured if previous is None else 0.5 * (previous + measured)
+            )
+
+    def _run_duration(self, n_iterations: int) -> float | None:
+        """Predicted wallclock for ``n_iterations``, or None if nothing is calibrated."""
+        rate = self._seconds_per_unit.get(self._summary.config.get("recon_algorithm", ""))
+        if rate is None:
+            return None
+        return rate * self._cost_units() * n_iterations
+
+    def _show_estimates(self) -> None:
+        """Refresh the "this is what Run will cost you" readouts."""
+        if not self._summary.has_engine:
+            return
+        n = self.action_bar.run_spin.value()
+
+        preflight = self.session.run_preflight(n)
+        total, text = preflight.footprint_bytes, preflight.footprint_text
+        available = preflight.ram_available
+        tight = available is not None and total > _MEMORY_HEADROOM * available
+        if available is not None:
+            text += f" {_gb(available)} available."
+        self.align_panel.show_memory_estimate(text, warn=tight)
+
+        seconds = self._run_duration(n)
+        if seconds is None:
+            self.align_panel.show_time_estimate(
+                "Unknown until one iteration has been timed.", warn=False
+            )
+            return
+        per_iteration = seconds / max(n, 1)
+        self.align_panel.show_time_estimate(
+            f"~{_duration(per_iteration)} per iteration, {_duration(seconds)} for {n} "
+            f"(measured on this machine; scales as angles x rows x width^2).",
+            warn=seconds > _SLOW_RUN_SECONDS,
+        )
+
     def _config_changed(self, config: AlignConfig) -> None:
-        if self.engine is None:
+        if not self._summary.has_engine:
             return
         config.pad = (0, 0)
-        self.engine.set_config(config)
+        self.session.set_config(config.to_dict())
+        self._summary = self.session.summary()
+        # Algorithm and inner iterations both move the cost, so the estimates follow them.
+        self._show_estimates()
 
     # -- running -----------------------------------------------------------------------
 
     def _start_run(self, n: int) -> None:
-        if self.engine is None:
+        if not self._summary.has_engine:
             self._error("No data", "Load a projection stack first.")
             return
-        if self._run is not None and self._run.running:
+        if self._summary.running:
             return
+
+        # One round trip prices the whole run: the negative-data scan is a full pass over
+        # the stack, and the memory numbers belong to the machine doing the work.
+        preflight = self.session.run_preflight(n)
 
         # mlem/osem on phase data (which is ~20% negative) diverges explosively rather
         # than failing, so say so before burning a run on it.
-        reason = algorithm_rejects_negatives(
-            self.engine.config.recon_algorithm, self.engine.state.original
-        )
+        reason = preflight.negative_reason
         if reason:
             answer = QMessageBox.warning(
                 self,
@@ -722,24 +798,79 @@ class PtychoAlignWindow(QMainWindow):
             if answer != QMessageBox.Yes:
                 return
 
+        # Running out of memory does not raise -- the kernel kills the process, and the
+        # window simply vanishes with no traceback and nothing in the log. Of every way
+        # this app can fail, that is the one the user has no chance of diagnosing, so
+        # spend a dialog on it.
+        total, explanation = preflight.footprint_bytes, preflight.footprint_text
+        available = preflight.ram_available
+        if available is not None and total > _MEMORY_HEADROOM * available:
+            logger.warning("Run needs %s but only %s is available", _gb(total), _gb(available))
+            answer = QMessageBox.warning(
+                self,
+                "This run may exhaust memory",
+                f"{explanation}<br><br>Only <b>{_gb(available)}</b> is available, so the "
+                "process is likely to be killed by the kernel -- the window will vanish "
+                "with no error message.<br><br>Raise the bin factor (2x cuts the volume "
+                "eightfold), reduce the padding, or run fewer iterations."
+                "<br><br>Run it anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+
+        # A slow run is not an error, but "Run 10" turning out to be a nine-hour job is
+        # worth one click to confirm. Only asked once the cost is actually known.
+        seconds = self._run_duration(n)
+        if seconds is not None and seconds > _SLOW_RUN_SECONDS:
+            answer = QMessageBox.question(
+                self,
+                "This will take a while",
+                f"{n} iteration(s) at this setting is about <b>{_duration(seconds)}</b> "
+                f"({_duration(seconds / max(n, 1))} each), based on what this machine has "
+                "measured so far.<br><br>Raising the bin factor is the strongest lever -- "
+                "the cost goes as the square of the detector width, so bin 2 is roughly "
+                "eight times cheaper.<br><br>Start the run?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if answer != QMessageBox.Yes:
+                return
+
+        try:
+            self._run_handle = self.session.start_run(n)
+        except Busy:
+            return
+        # Re-read rather than waiting for the pushed summary: Stop arriving before the
+        # first event would otherwise consult a cache that still says nothing is running.
+        self._summary = self.session.summary()
         self.action_bar.set_running(True)
-        self._run = AlignmentRun(self.engine, n)
-        self._run.worker.iteration_finished.connect(self._iteration_finished)
-        self._run.worker.progress.connect(self._progress)
-        self._run.worker.failed.connect(self._run_failed)
-        self._run.worker.run_finished.connect(self._run_finished)
-        self._run.start()
 
     def _stop_run(self) -> None:
-        if self._run is not None and self._run.running:
-            self._run.cancel()
-            self.action_bar.show_status("Stopping after the current iteration...")
+        # Unconditional: cancelling a run that has already finished is harmless, whereas
+        # gating on a cached summary loses the cancel in the window before the first
+        # event lands -- which is exactly when a user hits Stop by mistake.
+        self.session.cancel_run()
+        self.action_bar.show_status("Stopping at the next row chunk...")
+
+    def _summary_changed(self, summary: SessionSummary) -> None:
+        """The session pushes a fresh summary with every iteration and state change."""
+        self._summary = summary
 
     def _progress(self, fraction: float, message: str) -> None:
         self.action_bar.progress.setValue(int(fraction * 100))
         self.action_bar.show_status(message)
 
-    def _iteration_finished(self, result: IterationResult) -> None:
+    def _iteration_finished(self, result) -> None:
+        self._calibrate()
+        # The worker stops itself on a runaway (it cannot wait for us to call cancel --
+        # that is a race it would lose under load), so there is nothing to do here but
+        # say so. The dialog comes when the run finishes.
+        if result.runaway:
+            self.action_bar.show_status(
+                f"Stopped: runaway shifts at iteration {result.iteration}."
+            )
         if self.action_bar.live_check.isChecked():
             self._refresh_views()
 
@@ -749,19 +880,39 @@ class PtychoAlignWindow(QMainWindow):
 
     def _run_finished(self) -> None:
         self.action_bar.set_running(False)
+        # Re-read rather than trusting the pushed summary: the per-iteration signal is
+        # queued, so a blocked main thread may never have received the last one.
+        self._summary = self.session.summary()
+        self._calibrate()
+        self._show_estimates()
         self._refresh_views()
-        if self.engine is not None and self.engine.history:
-            last = self.engine.history[-1]
+        history = self._summary.history
+        if history:
+            last = history[-1]
             status = (
                 f"Iteration {last.iteration}  |  shift RMS {last.error:.4f} px  |  "
                 f"residual {last.residual:.4f}  |  {last.wallclock_s:.1f} s"
             )
-            if any(r.diverging for r in self.engine.history):
+            if last.runaway:
+                status = "RUNAWAY SHIFTS -- " + status
+            elif any(r.diverging for r in history):
                 status = "DIVERGING -- " + status
             self.action_bar.show_status(status)
             self.action_bar.revert_spin.setMaximum(last.iteration)
 
-            if last.diverging:
+            if last.runaway:
+                good = next((r.iteration for r in reversed(history) if not r.runaway), 0)
+                QMessageBox.warning(
+                    self,
+                    "Runaway shifts -- the run was stopped",
+                    f"{last.runaway}<br><br>The run has been stopped. The usual cause is a "
+                    "reconstruction too poor to reproject anything the registration can "
+                    "lock onto: try <b>sirt</b> rather than art, raise the inner "
+                    "iterations, and set <b>Max shift per iter</b> to clip outliers."
+                    f"<br><br>Revert to iteration {good} to discard the bad shifts -- they "
+                    "are cumulative, so they do not wash out on their own.",
+                )
+            elif last.diverging:
                 QMessageBox.warning(
                     self,
                     "The alignment is diverging",
@@ -774,129 +925,129 @@ class PtychoAlignWindow(QMainWindow):
                 )
 
     def _revert(self, iteration: int) -> None:
-        if self.engine is None:
+        if not self._summary.has_engine:
             return
         try:
-            self.engine.state.revert_to(iteration)
-        except ValueError as exc:
+            self.bridge.run_job(
+                self.session.revert(iteration),
+                title="Revert",
+                label=f"Reverting to iteration {iteration}...",
+                parent=self,
+                cancellable=False,
+            )
+        except Busy:
+            self._refused()
+            return
+        except JobCancelled:
+            return
+        except JobFailed as exc:
             self._error("Cannot revert", str(exc))
             return
-        self.engine.invalidate_cache()
-        logger.info("Reverted to iteration %d", iteration)
+        self._summary = self.session.summary()
         self._refresh_views()
         self.action_bar.show_status(f"Reverted to iteration {iteration}.")
 
     # -- views -------------------------------------------------------------------------
 
     def _refresh_views(self) -> None:
-        """Feed every viewer from the stacks the last iteration already produced.
+        """Point every viewer at the current pixels. Each pulls the one plane it draws.
 
-        This must NOT call tomopy. TomoPy is not thread-safe -- ``tomopy.util.mproc``
-        holds its shared arrays in module-level globals -- so running ``project()``
-        here on the GUI thread while the worker thread is inside ``recon()`` corrupts
-        those globals and segfaults the process. With "live update views" on, that is
-        exactly what would happen every iteration. The engine caches the aligned stack
-        and the reprojection it already computed, so use those.
+        This must NOT compute. Recomputing an aligned stack or a reprojection is a job
+        for the session's compute thread -- doing it here would both freeze the window
+        and, worse, call tomopy from a second thread, which segfaults the process. When
+        the cached stacks are missing and nothing is running, ask the session to
+        materialise them and come back.
         """
-        if self.engine is None:
+        summary = self._summary
+        if not summary.has_engine:
             return
 
-        state = self.engine.state
-        running = self._run is not None and self._run.running
-
-        aligned = self.engine.last_aligned
-        simulated = self.engine.last_simulated
-
-        if aligned is None:
-            if running:
-                return  # nothing cached yet and we must not compute; wait for the step
-            # shift_images is pure skimage/numpy, so it is safe off the worker thread.
-            aligned = self.engine.aligned_projections()
-
-        if simulated is None and state.volume is not None and not running:
+        available = {spec.key for spec in summary.stacks if spec.available}
+        if STACK_ALIGNED not in available and not summary.running:
             try:
-                simulated = self.engine.reproject()
-            except Exception as exc:  # a missing backend must not break the viewers
-                logger.warning("Could not reproject for display: %s", exc)
+                self.bridge.run_job(
+                    self.session.materialize([STACK_ALIGNED, STACK_REPROJECTION]),
+                    title="Preparing views",
+                    label="Applying shifts...",
+                    parent=self,
+                )
+                self._summary = summary = self.session.summary()
+            except (JobCancelled, Busy):
+                return
+            except JobFailed as exc:  # a missing backend must not break the viewers
+                logger.warning("Could not prepare the views: %s", exc)
 
-        self._stacks = {
-            MODE_RAW: state.original,
-            MODE_ALIGNED: aligned,
-            MODE_REPROJECTION: simulated,
-            MODE_DIFFERENCE: None if simulated is None else aligned - simulated,
-        }
+        # The epochs in the summary are what make the cached planes safe to keep: a plane
+        # from before this iteration is filed under the old pixel_epoch and can never be
+        # served in place of the current one.
+        self._planes.update(summary)
 
-        self.projection_view.set_stacks(self._stacks, sx=state.sx, sy=state.sy)
-        self.sinogram_view.set_stacks(self._stacks)
+        com = summary.com
+        self.projection_view.set_source(self._planes, sx=summary.sx, sy=summary.sy)
+        self.sinogram_view.set_source(self._planes)
         self.sinogram_view.set_com(
-            self.com.com_u if self.com else None,
-            self.com.fitted_u if self.com else None,
-            state.center,
+            com.com_u if com else None, com.fitted_u if com else None, summary.center
         )
-        self.tomogram_view.set_volume(
-            state.volume, pixel_size_nm=state.metadata.get("pixel_size_nm")
+        self.tomogram_view.set_source(
+            self._planes, pixel_size_nm=summary.metadata.get("pixel_size_nm")
         )
-        self.tomogram_view.set_comparison_choices(
-            {r.iteration: r.volume for r in state.history if r.has_volume}
-        )
-        self.shift_view.update_history(state.history, state.angles)
+        # Driven by the iteration numbers the policy kept, not by inspecting each result
+        # for a volume: over a wire the volume is always stripped, so a `has_volume`
+        # derived from its absence would report False for every iteration and the compare
+        # dropdown would quietly empty itself.
+        self.tomogram_view.set_comparison_choices(summary.volume_iterations)
+        self.shift_view.update_history(summary.history, summary.angles)
 
     # -- session and exports -------------------------------------------------------------
 
     def _save_session(self) -> None:
-        if self.engine is None:
+        if not self._summary.has_engine:
             self._error("Nothing to save", "Load a projection stack first.")
             return
         path, _ = QFileDialog.getSaveFileName(self, "Save session", "session.h5", "HDF5 (*.h5)")
         if not path:
             return
-        try:
-            session_io.save_session(path, self.engine)
-        except Exception as exc:
-            self._error("Could not save the session", str(exc))
-            return
-        logger.info("Session saved to %s", path)
-        self.action_bar.show_status(f"Session saved to {Path(path).name}.")
+        self._run_export(
+            self.session.save_session(path), path, title="Saving", label="Writing the session..."
+        )
 
     def _open_session(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Open session", "", "HDF5 (*.h5)")
         if not path:
             return
         try:
-            self.engine = session_io.load_session(path)
-        except Exception as exc:
+            self.bridge.run_job(
+                self.session.open_session(path),
+                title="Opening",
+                label="Restoring the session...",
+                parent=self,
+            )
+        except (JobCancelled, Busy):
+            return
+        except JobFailed as exc:
             self._error("Could not open the session", str(exc))
             return
 
-        self.preprocessed = ProjectionData(
-            data=self.engine.state.original,
-            angles=self.engine.state.angles,
-            metadata=dict(self.engine.state.metadata),
-        )
-        self.raw = self.preprocessed
-        self.com = None
-        self.data_panel.show_dataset(self.preprocessed)
-        self._refresh_views()
+        self._after_engine_rebuilt()
         self._run_finished()
-        logger.info("Session restored from %s (iteration %d)", path, self.engine.iteration)
 
     def _export_projections(self) -> None:
-        if self.engine is None:
+        if not self._summary.has_engine:
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "Export aligned projections", "aligned.h5", "HDF5 (*.h5);;TIFF (*.tif)"
         )
         if not path:
             return
-        data = ProjectionData(
-            data=self.engine.aligned_projections(),
-            angles=self.engine.state.angles,
-            metadata={"source": "ptycho-align"},
+        self._run_export(
+            self.session.export("projections", path),
+            path,
+            title="Exporting",
+            label="Applying shifts and writing...",
         )
-        self._export(lambda: session_io.export_projections(path, data), path)
 
     def _export_volume(self) -> None:
-        if self.engine is None or self.engine.state.volume is None:
+        if not self._summary.has_engine or self._summary.volume_shape is None:
             self._error("No volume", "Run at least one iteration first.")
             return
         path, _ = QFileDialog.getSaveFileName(
@@ -904,44 +1055,49 @@ class PtychoAlignWindow(QMainWindow):
         )
         if not path:
             return
-        self._export(
-            lambda: session_io.export_volume(
-                path, self.engine.state.volume, self.engine.state.angles
-            ),
-            path,
+        self._run_export(
+            self.session.export("volume", path), path, title="Exporting", label="Writing volume..."
         )
 
     def _export_shifts(self) -> None:
-        if self.engine is None:
+        if not self._summary.has_engine:
             return
         path, _ = QFileDialog.getSaveFileName(self, "Export shifts", "shifts.csv", "CSV (*.csv)")
-        if not path:
-            return
-        state = self.engine.state
-        self._export(
-            lambda: session_io.export_shifts_csv(path, state.angles, state.sx, state.sy), path
-        )
+        if path:
+            self._write_table("shifts", path)
 
     def _export_convergence(self) -> None:
-        if self.engine is None or not self.engine.history:
+        if not self._summary.has_engine or not self._summary.history:
             self._error("No history", "Run at least one iteration first.")
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "Export convergence", "convergence.csv", "CSV (*.csv)"
         )
-        if not path:
-            return
-        self._export(
-            lambda: session_io.export_convergence_csv(path, self.engine.history), path
-        )
+        if path:
+            self._write_table("convergence", path)
 
-    def _export(self, action, path: str) -> None:
+    def _write_table(self, kind: str, path: str) -> None:
+        """CSVs are kilobytes, so they come back as bytes and are written locally.
+
+        The other exports are hundreds of megabytes and are written by whoever is running
+        the engine -- shipping a volume across a tunnel to save it is not a plan.
+        """
         try:
-            action()
+            Path(path).write_bytes(self.session.fetch_table(kind))
         except Exception as exc:
             self._error("Export failed", str(exc))
             return
         logger.info("Exported %s", path)
+        self.action_bar.show_status(f"Exported {Path(path).name}.")
+
+    def _run_export(self, handle, path: str, *, title: str, label: str) -> None:
+        try:
+            self.bridge.run_job(handle, title=title, label=label, parent=self)
+        except JobCancelled:
+            return
+        except (JobFailed, Busy) as exc:
+            self._error("Export failed", str(exc))
+            return
         self.action_bar.show_status(f"Exported {Path(path).name}.")
 
     # -- misc --------------------------------------------------------------------------
@@ -961,10 +1117,56 @@ class PtychoAlignWindow(QMainWindow):
     def _error(self, title: str, message: str) -> None:
         QMessageBox.critical(self, title, message)
 
+    def _wait_for_run_to_exit(self) -> None:
+        """Block until the compute thread has exited, or the user chooses to quit anyway.
+
+        Cancelling only takes effect *between* iterations -- a tomopy call cannot be
+        interrupted once it is running -- so a cancelled run still has to finish the
+        reconstruction in flight. That is not seconds: an observed SIRT iteration on a
+        binned 410 x 33 x 1137 stack took 19 minutes.
+
+        Three things could happen at that point, and only two of them are acceptable.
+        Destroying the window on top of a live QThread (what the old fixed 30 s ``wait()``
+        did once it expired) is undefined behaviour -- "QThread: Destroyed while thread is
+        still running", a teardown racing tomopy's shared-memory cleanup, a segfault on
+        the way out. Waiting it out is safe but can strand the user for 20 minutes.
+
+        So offer the third: ``os._exit`` tears the whole process down at once. It is safe
+        for exactly the reason destroying the QThread is not -- nothing survives to race
+        anything, because there is no "after". Unsaved state is lost, so it is opt-in.
+        """
+        progress = QProgressDialog(
+            "Finishing the band of detector rows already in flight before closing.\n"
+            "A single tomopy call cannot be interrupted, so this takes as long as one\n"
+            "band -- normally seconds, but longer on a big unbinned stack.\n\n"
+            "'Quit now' ends the process immediately instead. Anything not exported\n"
+            "(the volume, the shifts, the session) is lost.",
+            "Quit now",
+            0,
+            0,
+            self,
+        )
+        progress.setWindowTitle("Closing")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        try:
+            while self.session.summary().running:
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    logger.warning("Quit requested while a reconstruction was in flight")
+                    os._exit(0)  # noqa: SLF001 - the point is to skip every teardown path
+                time.sleep(0.1)
+        finally:
+            progress.close()
+
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt's name
-        if self._run is not None and self._run.running:
-            self._run.cancel()
-            self._run.wait()
+        if self._summary.running or self.session.summary().running:
+            logger.info("Closing: cancelling the run and waiting for the compute thread")
+            self.session.cancel_run()
+            self._wait_for_run_to_exit()
+        self.bridge.close()
+        self.session.close()
         logger.removeHandler(self._log_handler)
         super().closeEvent(event)
 
