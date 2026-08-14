@@ -138,7 +138,7 @@ def test_tracker_pin_and_delete(tracker):
     truth = truth_for(tracker)
     label_from_truth(tracker, truth)
     tracker._fit_now()
-    tracker.feature_table.item(0, 7).setCheckState(Qt.CheckState.Checked)
+    tracker.feature_table.item(0, 8).setCheckState(Qt.CheckState.Checked)
     assert 0 in tracker._pins
     tracker._fit_now()
     assert not tracker._mask.features[0]
@@ -319,6 +319,100 @@ def test_fit_ignores_checkbox_history_when_free(qtbot):
     assert np.allclose(a.dx, b.dx, atol=1e-9)
     assert np.allclose(a.dy, b.dy, atol=1e-9)
     assert np.allclose(a.a, b.a, atol=1e-9)
+
+
+def test_worst_outlier_button(tracker):
+    truth = truth_for(tracker)
+    label_from_truth(tracker, truth)
+    # sabotage one label of feature 2 in view 24
+    u_t, v_t = truth.predict()
+    tracker._set_active(2)
+    tracker._set_view(24)
+    tracker._place(u_t[2, 24] + 15.0, v_t[2, 24])
+    tracker._fit_now()
+    tracker._set_active(0)
+    tracker._set_view(0)
+    tracker._goto_worst_outlier()
+    assert tracker._active == 2
+    assert tracker._view == 24
+
+
+def test_ghost_markers_and_sizes(tracker):
+    truth = truth_for(tracker)
+    label_from_truth(tracker, truth)
+    tracker._fit_now()
+    tracker._set_active(1)
+    tracker._set_view(0)
+    assert len(tracker.viewer._ghost_scatter.data) == 0
+    tracker.ghost_box.setChecked(True)          # triggers refresh
+    n_other = len(tracker._labels.views_of(1)) - 1
+    assert len(tracker.viewer._ghost_scatter.data) == n_other
+
+    # size edit: marker sizes and fit weights follow
+    tracker._feature_sizes[1] = 30.0
+    tracker._set_view(4)                        # a labeled view
+    label_sizes = set(tracker.viewer._label_scatter.data["size"].tolist())
+    assert 30.0 in label_sizes                  # active feature resized
+    assert 10.0 in label_sizes                  # others at the default
+    weights = tracker._feature_weights()
+    assert weights is not None
+    row = list(tracker._model.feature_ids).index(1)
+    other = list(tracker._model.feature_ids).index(0)
+    assert weights[row] == pytest.approx(1 / 30.0)
+    assert weights[other] == pytest.approx(1 / 10.0)
+
+
+def test_slice_probe_geometry_round_trip(tracker):
+    truth = truth_for(tracker)
+    label_from_truth(tracker, truth)
+    tracker._fit_now()
+    m = tracker._model
+    tracker._last_recon_info = {"extra_bin": 2, "row_loaded": 40,
+                                "width": 64}
+    # place the click exactly where feature 0's (a, b) would appear
+    scale = 2 * tracker._chain.binning
+    axis_row, axis_col = 64 // 2 - 1, (64 + 1) // 2
+    col = m.a[0] / scale + axis_col
+    row = axis_row - m.b[0] / scale
+    a, b, y = tracker._slice_to_probe(col, row)
+    assert a == pytest.approx(m.a[0])
+    assert b == pytest.approx(m.b[0])
+    # the drawn diamond then coincides horizontally with the feature's
+    # predicted marker in every view
+    tracker._probe = (a, b, y)
+    u_pred, _ = m.predict()
+    for view in (0, 20, 45):
+        tracker._set_view(view)
+        probe_x = tracker.viewer._probe_scatter.data[0][0]
+        assert probe_x == pytest.approx(u_pred[0, view], abs=1e-6)
+    tracker._clear_probe()
+    assert len(tracker.viewer._probe_scatter.data) == 0
+
+
+def test_slice_probe_convention():
+    """Guard tomopy's grid convention: the rotation axis reconstructs to
+    (row, col) = (N//2 - 1, (N+1)//2) whatever `center` is, with
+    col = axis + A and row = axis - B. If this fails after a tomopy
+    upgrade, fix `_slice_to_probe`, not the test."""
+    pytest.importorskip("tomopy")
+    from tktomo.recon import get_backend
+
+    theta = np.linspace(0, np.pi, 240, endpoint=False)
+    n = 129
+    center, a_true, b_true = 60.0, 22.0, -13.0
+    sino = np.zeros((240, 1, n), np.float32)
+    u = center + a_true * np.cos(theta) + b_true * np.sin(theta)
+    for k in range(240):
+        j0 = int(np.floor(u[k]))
+        f = u[k] - j0
+        sino[k, 0, j0] += 1 - f
+        sino[k, 0, j0 + 1] += f
+    vol = get_backend("tomopy").reconstruct(sino, theta, center=center,
+                                            algorithm="gridrec")
+    sl = np.clip(np.asarray(vol)[0], 0, None)
+    r, c = np.unravel_index(np.argmax(sl), sl.shape)
+    assert c - ((n + 1) // 2) == pytest.approx(a_true, abs=1.0)
+    assert (n // 2 - 1) - r == pytest.approx(b_true, abs=1.0)
 
 
 def test_recon_binning_rescales_geometry(tracker):

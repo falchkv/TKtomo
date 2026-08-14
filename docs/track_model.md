@@ -33,6 +33,24 @@ stored in raw coordinates through the stack's provenance chain, so they
 survive reloading the same data at another binning or crop, including
 feature-crop stacks from `tktomo-feature-isolation`.
 
+The active feature's predicted cross is drawn larger and in its feature
+color (others stay white). A toggle shows the active feature's labels
+from OTHER frames as faint half-size circles, useful for judging where
+the next click belongs. The "Worst outlier" button jumps to the label
+with the largest residual and makes its feature active.
+
+Each feature has an editable marker SIZE (image pixels) in the table.
+Match it to the physical feature: circles are drawn at that diameter in
+data coordinates, and the fit weights each feature's labels by 1/size,
+since a click on a large diffuse feature localizes it less than one on a
+small sharp feature. Uniform sizes mean unweighted.
+
+Clicking a point in the reconstructed slice marks it as a magenta
+diamond in the projection view, projected through the model so it
+follows the object point across frames (Escape clears it). The
+slice-to-object mapping is pinned against tomopy's grid convention by a
+dedicated test.
+
 ## Fixed and free parameters
 
 Every polynomial coefficient has a "fix" checkbox and an editable value;

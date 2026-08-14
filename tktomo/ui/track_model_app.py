@@ -170,6 +170,9 @@ class TrackModelWindow(QMainWindow):
         self._fit = None
         self._diagnostics: dict | None = None
         self._pins: set[int] = set()
+        self._feature_sizes: dict[int, float] = {}   # loaded px, default 10
+        self._probe: tuple[float, float, float] | None = None  # (a, b, y) raw
+        self._last_recon_info: dict | None = None
         self._active = 0
         self._view = 0
         self._updating_ui = False
@@ -189,6 +192,7 @@ class TrackModelWindow(QMainWindow):
         self.viewer.deleteRequested.connect(self._delete_near)
         self.viewer.stepRequested.connect(self._step)
         self.viewer.digitPressed.connect(self._set_active)
+        self.viewer.escapePressed.connect(self._clear_probe)
 
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.valueChanged.connect(self._set_view)
@@ -319,8 +323,54 @@ class TrackModelWindow(QMainWindow):
         layout.addWidget(self.recon_status)
         self.recon_display = StackDisplay()
         self.recon_display.auto_levels_box.setChecked(True)
+        self.recon_display.image_view.scene.sigMouseClicked.connect(
+            self._slice_clicked)
+        self.recon_display.setToolTip(
+            "Click a point in the slice to mark it as a magenta diamond "
+            "in the projection view, following the point across frames. "
+            "Escape (over the projection) clears it.")
         layout.addWidget(self.recon_display, 1)
         return holder
+
+    def _slice_clicked(self, event) -> None:
+        if event.button() != Qt.MouseButton.LeftButton or event.double():
+            return
+        if self._last_recon_info is None or self._data is None:
+            return
+        view_box = self.recon_display.image_view.getView()
+        if not view_box.sceneBoundingRect().contains(event.scenePos()):
+            return
+        point = view_box.mapSceneToView(event.scenePos())
+        self._probe = self._slice_to_probe(float(point.x()),
+                                           float(point.y()))
+        self._refresh_view()
+        event.accept()
+
+    def _slice_to_probe(self, col: float, row: float
+                        ) -> tuple[float, float, float]:
+        """Slice pixel -> object point (a, b, y) in raw px.
+
+        tomopy's gridrec re-centers the grid on the rotation axis whatever
+        `center` says; the axis lands at (row, col) = (N//2 - 1, (N+1)//2)
+        with u = center + A*cos + B*sin mapping to col = axis + A,
+        row = axis - B. Pinned empirically against tomopy in
+        test_slice_probe_convention, because this is exactly the kind of
+        convention that silently changes between library versions.
+        """
+        info = self._last_recon_info
+        n = int(info["width"])
+        axis_row = n // 2 - 1
+        axis_col = (n + 1) // 2
+        scale = info["extra_bin"] * self._chain.binning
+        a_raw = (col - axis_col) * scale
+        b_raw = -(row - axis_row) * scale
+        y_raw = float(self._chain.to_parent(0.0, info["row_loaded"])[1])
+        return (float(a_raw), float(b_raw), y_raw)
+
+    def _clear_probe(self) -> None:
+        if self._probe is not None:
+            self._probe = None
+            self._refresh_view()
 
     def _build_controls(self) -> QWidget:
         panel = QWidget()
@@ -340,9 +390,14 @@ class TrackModelWindow(QMainWindow):
 
         feat_box = QGroupBox("Features (digit keys switch, click places)")
         feat_layout = QVBoxLayout(feat_box)
-        self.feature_table = QTableWidget(0, 8)
+        self.feature_table = QTableWidget(0, 9)
         self.feature_table.setHorizontalHeaderLabels(
-            ["id", "n", "rms u", "rms v", "a", "b", "y", "pin"])
+            ["id", "n", "rms u", "rms v", "a", "b", "y", "size", "pin"])
+        self.feature_table.horizontalHeaderItem(7).setToolTip(
+            "Marker diameter in image pixels. Match it to the feature: "
+            "the fit weights each feature's labels by 1/size, because a "
+            "click on a large diffuse feature localizes it less than one "
+            "on a small sharp feature.")
         self.feature_table.verticalHeader().hide()
         self.feature_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows)
@@ -365,6 +420,10 @@ class TrackModelWindow(QMainWindow):
         feat_layout.addLayout(feat_row)
         self.active_label = QLabel("active feature: 0")
         feat_layout.addWidget(self.active_label)
+        self.ghost_box = QCheckBox("Show active feature's labels from "
+                                   "other frames (small circles)")
+        self.ghost_box.toggled.connect(lambda _c: self._refresh_view())
+        feat_layout.addWidget(self.ghost_box)
         layout.addWidget(feat_box)
 
         model_box = QGroupBox("Model (check = fixed at the shown value)")
@@ -463,9 +522,15 @@ class TrackModelWindow(QMainWindow):
         self.auto_fit.setChecked(True)
         diag_btn = QPushButton("Run diagnostics")
         diag_btn.clicked.connect(self._run_diagnostics)
+        outlier_btn = QPushButton("Worst outlier")
+        outlier_btn.setToolTip(
+            "Jump to the label with the largest residual and make its "
+            "feature active, ready to inspect or fix.")
+        outlier_btn.clicked.connect(self._goto_worst_outlier)
         fit_row.addWidget(fit_btn)
         fit_row.addWidget(self.auto_fit)
         fit_row.addWidget(diag_btn)
+        fit_row.addWidget(outlier_btn)
         layout.addLayout(fit_row)
 
         self.summary_label = QLabel("no fit yet")
@@ -647,6 +712,33 @@ class TrackModelWindow(QMainWindow):
 
     # ------------------------------------------------------------ fitting
 
+    def _feature_weights(self) -> np.ndarray | None:
+        """1/size per feature: a click's localization scales with the
+        feature's extent, so big markers count for less. Only relative
+        values matter to the solver."""
+        if self._model is None:
+            return None
+        sizes = np.array([self._feature_sizes.get(int(f), 10.0)
+                          for f in self._model.feature_ids], float)
+        if np.allclose(sizes, sizes[0] if sizes.size else 1.0):
+            return None                    # uniform sizes = unweighted
+        return 1.0 / np.clip(sizes, 1e-3, None)
+
+    def _goto_worst_outlier(self) -> None:
+        if self._fit is None or self._fit.residual_u.size == 0:
+            return
+        i, j = self._fit.obs
+        mag = np.hypot(self._fit.residual_u, self._fit.residual_v)
+        k = int(np.argmax(mag))
+        fid = int(self._fit.model.feature_ids[i[k]])
+        self._set_active(fid)
+        self._set_view(int(j[k]))
+        self.statusBar().showMessage(
+            f"worst outlier: feature {fid} in view {int(j[k])}, "
+            f"residual {mag[k]:.2f} px "
+            f"(u {self._fit.residual_u[k]:+.2f}, "
+            f"v {self._fit.residual_v[k]:+.2f})", 8000)
+
     def _request_fit(self) -> None:
         if self.auto_fit.isChecked():
             self._fit_timer.start()
@@ -662,7 +754,8 @@ class TrackModelWindow(QMainWindow):
         try:
             self._fit = solve_model(u, v, valid, self._model, self._mask,
                                     iters=self.iters.value(),
-                                    huber=self.huber.value())
+                                    huber=self.huber.value(),
+                                    feature_weight=self._feature_weights())
         except ValueError as exc:
             self.summary_label.setText(f"fit failed: {exc}")
             return
@@ -739,7 +832,8 @@ class TrackModelWindow(QMainWindow):
         u, v, valid, _ids = self._labels.to_arrays(
             self._data.angles.size, self._model.feature_ids)
         self._diagnostics = run_diagnostics(u, v, valid, self._model,
-                                            self._mask, self._fit)
+                                            self._mask, self._fit,
+                                            self._feature_weights())
         d = self._diagnostics
         chain = self._chain
         center_grid = chain.parent_to_grid(d["center_estimate_raw_px"],
@@ -786,11 +880,23 @@ class TrackModelWindow(QMainWindow):
             f"{np.rad2deg(self._data.angles[view]):7.2f}°")
         self.viewer.set_image(self._data.data[view])
 
+        sizes = {fid: self._feature_sizes.get(fid, 10.0)
+                 for fid in self._labels.feature_ids()}
         marks = []
         for fid, u_raw, v_raw in self._labels.in_view(view):
             u, v = self._chain.from_parent(u_raw, v_raw, view=view)
             marks.append((fid, float(u), float(v)))
-        self.viewer.show_labels(marks, active_id=self._active)
+        self.viewer.show_labels(marks, active_id=self._active, sizes=sizes)
+
+        ghosts = []
+        if self.ghost_box.isChecked():
+            for w in self._labels.views_of(self._active):
+                if w == view:
+                    continue
+                u_raw, v_raw = self._labels.get(self._active, w)
+                u, v = self._chain.from_parent(u_raw, v_raw, view=view)
+                ghosts.append((self._active, float(u), float(v)))
+        self.viewer.show_ghosts(ghosts, sizes=sizes)
 
         preds = []
         if self._fit is not None and self._model is not None \
@@ -801,7 +907,7 @@ class TrackModelWindow(QMainWindow):
                     continue
                 u, v = self._chain.from_parent(u_pred[row, view],
                                                v_pred[row, view], view=view)
-                preds.append((float(u), float(v)))
+                preds.append((int(fid), float(u), float(v)))
             row = list(self._model.feature_ids).index(self._active) \
                 if self._active in self._model.feature_ids else None
             if row is not None and self._chain.view_origin is None:
@@ -824,7 +930,24 @@ class TrackModelWindow(QMainWindow):
                 self.viewer.show_trajectory(u_all, v_all)
             else:
                 self.viewer.show_trajectory(None)
-        self.viewer.show_predictions(preds)
+        self.viewer.show_predictions(preds, active_id=self._active)
+
+        # the slice probe: an object point picked in the recon slice,
+        # projected into THIS view through the model
+        if self._probe is not None and self._model is not None:
+            a, b, y = self._probe
+            theta_v = float(self._data.angles[view])
+            ct, sn = np.cos(theta_v), np.sin(theta_v)
+            s = a * ct + b * sn
+            t = -a * sn + b * ct
+            c_of, alpha_of, beta_of = self._model.axis_curves()
+            u_raw = s + c_of[view] + self._model.dx[view]
+            v_raw = (y + alpha_of[view] * s + beta_of[view] * t
+                     + self._model.dy[view])
+            u, v = self._chain.from_parent(u_raw, v_raw, view=view)
+            self.viewer.show_probe((float(u), float(v)))
+        else:
+            self.viewer.show_probe(None)
 
     def _refresh_feature_table(self) -> None:
         if self._model is None or self._fit is None:
@@ -847,10 +970,11 @@ class TrackModelWindow(QMainWindow):
                           _fmt(rms_u[row]), _fmt(rms_v[row]),
                           f"{self._model.a[row]:.1f}",
                           f"{self._model.b[row]:.1f}",
-                          f"{self._model.y[row]:.1f}")
+                          f"{self._model.y[row]:.1f}",
+                          f"{self._feature_sizes.get(fid, 10.0):.1f}")
                 for col, value in enumerate(values, start=1):
                     item = QTableWidgetItem(str(value))
-                    if col in (4, 5, 6):
+                    if col in (4, 5, 6, 7):
                         item.setFlags(item.flags()
                                       | Qt.ItemFlag.ItemIsEditable)
                     else:
@@ -863,7 +987,7 @@ class TrackModelWindow(QMainWindow):
                              | Qt.ItemFlag.ItemIsSelectable)
                 pin.setCheckState(Qt.CheckState.Checked if fid in self._pins
                                   else Qt.CheckState.Unchecked)
-                table.setItem(row, 7, pin)
+                table.setItem(row, 8, pin)
         finally:
             self._updating_ui = False
 
@@ -880,11 +1004,21 @@ class TrackModelWindow(QMainWindow):
         if row >= self._model.feature_ids.size:
             return
         fid = int(self._model.feature_ids[row])
-        if col == 7:
-            item = self.feature_table.item(row, 7)
+        if col == 8:
+            item = self.feature_table.item(row, 8)
             pinned = item.checkState() == Qt.CheckState.Checked
             (self._pins.add if pinned else self._pins.discard)(fid)
             self._request_fit()
+            return
+        if col == 7:
+            item = self.feature_table.item(row, 7)
+            try:
+                size = float(item.text())
+            except (TypeError, ValueError):
+                return
+            self._feature_sizes[fid] = max(size, 0.5)
+            self._refresh_view()       # marker size updates immediately
+            self._request_fit()        # and so does the 1/size weighting
             return
         if col in (4, 5, 6):
             item = self.feature_table.item(row, col)
@@ -1188,6 +1322,9 @@ class TrackModelWindow(QMainWindow):
             row_in_slab = min(row_in_slab // extra_bin, slab.shape[1] - 1)
         self.recon_status.setText(
             f"reconstructing row {row} (bin {extra_bin})…")
+        self._last_recon_info = {"extra_bin": extra_bin,
+                                 "row_loaded": row,
+                                 "width": slab.shape[2]}
         self._recon_worker.submit(slab, data.angles, sy, sx, rot_deg,
                                   center, row_in_slab)
 
@@ -1240,6 +1377,9 @@ class TrackModelWindow(QMainWindow):
             "slice_row": self.slice_row.value(),
             "pins": sorted(self._pins),
             "view": self._view,
+            "feature_sizes": {str(k): float(size)
+                              for k, size in self._feature_sizes.items()},
+            "ghosts": self.ghost_box.isChecked(),
         }
 
     def _save_session(self) -> None:
@@ -1280,6 +1420,9 @@ class TrackModelWindow(QMainWindow):
         self._mask = state["mask"]
         ui = state["ui"]
         self._pins = set(ui.get("pins", []))
+        self._feature_sizes = {int(k): float(size) for k, size in
+                               ui.get("feature_sizes", {}).items()}
+        self.ghost_box.setChecked(bool(ui.get("ghosts", False)))
         self.advance_box.setValue(int(ui.get("advance", 5)))
         degrees = ui.get("degrees", [0, 0, 0])
         self.deg_c.setValue(int(degrees[0]))

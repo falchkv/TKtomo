@@ -253,12 +253,16 @@ def _huber_weights(r: np.ndarray, k: float) -> np.ndarray:
 
 
 def _masked_irls(rows, cols, vals, target, ncol, x0, free, *,
-                 iters, huber, damp):
+                 iters, huber, damp, base_w=None):
     """IRLS least squares with fixed columns moved to the right-hand side.
 
     rows/cols/vals describe the UNWEIGHTED sparse design matrix in COO form,
     with `rows` indexing observations (so per-observation weights broadcast
-    to entries as w[rows]). Returns (x, residual, weight).
+    to entries as w[rows]). `base_w` is a per-observation prior weight
+    (only RELATIVE values matter) multiplied into the Huber weights each
+    iteration; it carries the feature-size prior, where a click on a large
+    diffuse feature localizes it worse than one on a small sharp feature.
+    Returns (x, residual, weight).
     """
     import scipy.sparse as sp  # noqa: PLC0415
     from scipy.sparse.linalg import lsqr  # noqa: PLC0415
@@ -277,7 +281,8 @@ def _masked_irls(rows, cols, vals, target, ncol, x0, free, *,
     x_fixed[free_idx] = 0.0
     fixed_pred = a_full @ x_fixed
 
-    w = np.ones(n_obs)
+    w0 = np.ones(n_obs) if base_w is None else np.asarray(base_w, float)
+    w = w0.copy()
     for _ in range(max(1, iters)):
         a_w = sp.csr_matrix((vals * w[rows], (rows, cols)),
                             shape=(n_obs, ncol))
@@ -285,7 +290,7 @@ def _masked_irls(rows, cols, vals, target, ncol, x0, free, *,
                    damp=damp, atol=1e-12, btol=1e-12, iter_lim=5000)[0]
         x[free_idx] = sol
         r = target - a_full @ x
-        w = _huber_weights(r, huber)
+        w = w0 * _huber_weights(r, huber)
     return x, r, w
 
 
@@ -458,13 +463,16 @@ def residuals(u: np.ndarray, v: np.ndarray, valid: np.ndarray,
 def solve_model(u: np.ndarray, v: np.ndarray, valid: np.ndarray,
                 model: AxisModel, mask: FreeMask | None = None, *,
                 iters: int = 4, huber: float = 3.0,
-                damp: float = 1e-8) -> FitResult:
+                damp: float = 1e-8,
+                feature_weight: np.ndarray | None = None) -> FitResult:
     """Fit the free parameters to the labels; fixed ones stay put.
 
     u, v: (F, V) label coordinates in RAW px (NaN/garbage where not valid).
     valid: (F, V) bool. The input `model` is not modified; the result
     carries an updated copy with dx/dy on unlabeled views filled by
-    interpolation (flagged via `observed_views`).
+    interpolation (flagged via `observed_views`). `feature_weight` (F,)
+    is a relative per-feature prior weight, e.g. 1/size for hand labels
+    whose localization scales with the feature's size.
     """
     model = model.copy()
     if mask is None:
@@ -513,8 +521,11 @@ def solve_model(u: np.ndarray, v: np.ndarray, valid: np.ndarray,
         mask.c,
         np.full(n_ov, bool(mask.dx)),
     ])
+    base_w = (None if feature_weight is None
+              else np.asarray(feature_weight, float)[i])
     x1, res_u, w_u = _masked_irls(rows1, cols1, vals1, u[i, j], n1, x0, free1,
-                                  iters=iters, huber=huber, damp=damp)
+                                  iters=iters, huber=huber, damp=damp,
+                                  base_w=base_w)
     model.a = x1[:n_feat]
     model.b = x1[n_feat:2 * n_feat]
     model.c_coef = x1[2 * n_feat:2 * n_feat + kc + 1]
@@ -551,7 +562,8 @@ def solve_model(u: np.ndarray, v: np.ndarray, valid: np.ndarray,
         np.full(n_ov, bool(mask.dy)),
     ])
     x2, res_v, w_v = _masked_irls(rows2, cols2, vals2, v[i, j], n2, y0, free2,
-                                  iters=iters, huber=huber, damp=damp)
+                                  iters=iters, huber=huber, damp=damp,
+                                  base_w=base_w)
     model.y = x2[:n_feat]
     model.alpha_coef = x2[n_feat:n_feat + ka + 1]
     model.beta_coef = x2[n_feat + ka + 1:n_feat + ka + 1 + kb + 1]

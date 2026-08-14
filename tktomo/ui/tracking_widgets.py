@@ -66,6 +66,7 @@ class MarkableStackView(StackDisplay):
     stepRequested = Signal(int)               # arrow keys: +-1, +-10 (PgUp/Dn)
     digitPressed = Signal(int)                # 0..9
     hoverMoved = Signal(float, float)
+    escapePressed = Signal()                  # clears transient overlays
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent=parent)
@@ -96,18 +97,25 @@ class MarkableStackView(StackDisplay):
                                           self.highpass_sigma)
 
         view = self.image_view.getView()
-        self._label_scatter = pg.ScatterPlotItem(size=11, pxMode=True)
+        # labels are drawn in DATA pixels (pxMode=False) so their circles
+        # can be sized to the physical feature and zoom with the image
+        self._label_scatter = pg.ScatterPlotItem(pxMode=False)
+        self._ghost_scatter = pg.ScatterPlotItem(pxMode=False)
         self._pred_scatter = pg.ScatterPlotItem(
             size=11, symbol="x", pen=pg.mkPen((255, 255, 255, 200), width=1.5),
             brush=None, pxMode=True)
+        self._probe_scatter = pg.ScatterPlotItem(
+            size=16, symbol="d", pen=pg.mkPen((255, 0, 255), width=2),
+            brush=pg.mkBrush(255, 0, 255, 90), pxMode=True)
         self._trajectory = pg.PlotDataItem(
             pen=pg.mkPen((255, 255, 0, 160), width=1.5,
                          style=Qt.PenStyle.DashLine))
         self._crop_rect = pg.PlotDataItem(
             pen=pg.mkPen((0, 255, 255, 200), width=1.5))
         self._texts: list[pg.TextItem] = []
-        for item in (self._trajectory, self._crop_rect,
-                     self._pred_scatter, self._label_scatter):
+        for item in (self._trajectory, self._crop_rect, self._ghost_scatter,
+                     self._pred_scatter, self._label_scatter,
+                     self._probe_scatter):
             item.setZValue(10)
             view.addItem(item)
 
@@ -176,6 +184,8 @@ class MarkableStackView(StackDisplay):
             self.stepRequested.emit(-10)
         elif key == Qt.Key.Key_PageUp:
             self.stepRequested.emit(10)
+        elif key == Qt.Key.Key_Escape:
+            self.escapePressed.emit()
         elif text.isdigit():
             self.digitPressed.emit(int(text))
         else:
@@ -183,8 +193,13 @@ class MarkableStackView(StackDisplay):
 
     # -- overlays ---------------------------------------------------------
 
-    def show_labels(self, labels, active_id: int | None = None) -> None:
-        """labels: iterable of (feature_id, u, v) in the loaded frame."""
+    def show_labels(self, labels, active_id: int | None = None,
+                    sizes: dict | None = None) -> None:
+        """labels: iterable of (feature_id, u, v) in the loaded frame.
+
+        `sizes` maps feature_id -> circle diameter in DATA pixels, so the
+        marker can be matched to the physical feature it labels.
+        """
         view = self.image_view.getView()
         for text in self._texts:
             view.removeItem(text)
@@ -195,6 +210,7 @@ class MarkableStackView(StackDisplay):
             ring = 3 if (active_id is not None and fid == active_id) else 1.5
             spots.append({
                 "pos": (u, v),
+                "size": float((sizes or {}).get(fid, 10.0)),
                 "pen": pg.mkPen(color, width=ring),
                 "brush": pg.mkBrush(*color, 70),
             })
@@ -205,11 +221,46 @@ class MarkableStackView(StackDisplay):
             self._texts.append(text)
         self._label_scatter.setData(spots)
 
-    def show_predictions(self, points) -> None:
-        """points: iterable of (u, v) in the loaded frame; empty clears."""
-        pts = list(points)
-        self._pred_scatter.setData(
-            x=[p[0] for p in pts], y=[p[1] for p in pts])
+    def show_ghosts(self, points, sizes: dict | None = None) -> None:
+        """Faint markers of one feature's labels from OTHER frames:
+        (feature_id, u, v) tuples, drawn at half size."""
+        spots = []
+        for fid, u, v in points:
+            color = feature_color(fid)
+            spots.append({
+                "pos": (u, v),
+                "size": float((sizes or {}).get(fid, 10.0)) / 2.0,
+                "pen": pg.mkPen(*color, 110, width=1),
+                "brush": None,
+            })
+        self._ghost_scatter.setData(spots)
+
+    def show_predictions(self, points, active_id: int | None = None) -> None:
+        """Model-predicted positions: (feature_id, u, v) in the loaded
+        frame ((u, v) pairs also accepted). The ACTIVE feature's cross is
+        drawn in its feature color and larger; the rest stay white.
+        """
+        spots = []
+        for p in points:
+            fid, u, v = (None, *p) if len(p) == 2 else p
+            active = active_id is not None and fid == active_id
+            color = feature_color(fid) if active else (255, 255, 255, 200)
+            spots.append({
+                "pos": (u, v),
+                "symbol": "x",
+                "size": 16 if active else 11,
+                "pen": pg.mkPen(color, width=2.5 if active else 1.5),
+                "brush": None,
+            })
+        self._pred_scatter.setData(spots)
+
+    def show_probe(self, point=None) -> None:
+        """A magenta diamond marking an object point picked in the recon
+        slice, projected into the current frame. None clears it."""
+        if point is None:
+            self._probe_scatter.clear()
+        else:
+            self._probe_scatter.setData(x=[point[0]], y=[point[1]])
 
     def show_trajectory(self, u=None, v=None) -> None:
         if u is None or len(u) == 0:

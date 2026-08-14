@@ -310,6 +310,36 @@ def test_staggered_labels_warn_unconstrained_geometry():
     assert not any("W6" in w for w in fit2.warnings)
 
 
+def test_feature_weight_downweights_uncertain_feature():
+    """A large (unreliable) feature with a systematic click bias must pull
+    the center less when weighted by 1/size."""
+    truth = make_truth(degrees=(0, 0, 0))
+    u, v, valid = sample_labels(truth, noise=0.02)
+    u_biased = u.copy()
+    u_biased[0, :] += 4.0                       # feature 0 clicked off-center
+    start = AxisModel.blank(truth.theta, truth.feature_ids, truth.degrees)
+    mask = FreeMask.all_free(start)
+    mask.dx = False                             # center identifiable
+    start.dx = truth.dx.copy()
+    start.dy = truth.dy.copy()
+    mask.dy = False
+
+    # huber disabled (one iteration, huge k): the point here is the prior
+    # weighting, and a 4 px bias is otherwise already rejected as an
+    # outlier by the robust loop before the weights can show their effect
+    equal = solve_model(u_biased, v, valid, start, mask,
+                        iters=1, huber=1e6)
+    weight = np.ones(truth.feature_ids.size)
+    weight[0] = 0.05                            # 1/size for a huge feature
+    weighted = solve_model(u_biased, v, valid, start, mask,
+                           iters=1, huber=1e6, feature_weight=weight)
+    err_equal = abs(equal.model.center_at_mean_theta()
+                    - truth.center_at_mean_theta())
+    err_weighted = abs(weighted.model.center_at_mean_theta()
+                       - truth.center_at_mean_theta())
+    assert err_weighted < err_equal / 3
+
+
 def test_holdout_and_shift_split_run():
     truth = make_truth(n_feat=16)
     u, v, valid = sample_labels(truth, noise=0.05)

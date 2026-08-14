@@ -65,7 +65,8 @@ def _split_features(valid: np.ndarray, seed: int) -> tuple[np.ndarray, np.ndarra
 
 def holdout_error(u: np.ndarray, v: np.ndarray, valid: np.ndarray,
                   model: AxisModel, mask: FreeMask, *, seed: int = 0,
-                  iters: int = 4, huber: float = 3.0) -> dict:
+                  iters: int = 4, huber: float = 3.0,
+                  feature_weight: np.ndarray | None = None) -> dict:
     """Fit on half the features, predict the other half. The acceptance test.
 
     Also reports the half-split of the center, alpha and beta constants:
@@ -80,12 +81,17 @@ def holdout_error(u: np.ndarray, v: np.ndarray, valid: np.ndarray,
     if a_idx.size < 2 or b_idx.size < 2:
         return out
 
+    def sub_w(idx):
+        return None if feature_weight is None else feature_weight[idx]
+
     fit_a = solve_model(u[a_idx], v[a_idx], valid[a_idx],
                         model.subset(a_idx), mask.subset(a_idx),
-                        iters=iters, huber=huber)
+                        iters=iters, huber=huber,
+                        feature_weight=sub_w(a_idx))
     fit_b = solve_model(u[b_idx], v[b_idx], valid[b_idx],
                         model.subset(b_idx), mask.subset(b_idx),
-                        iters=iters, huber=huber)
+                        iters=iters, huber=huber,
+                        feature_weight=sub_w(b_idx))
     ma, mb = fit_a.model, fit_b.model
     out["center_split"] = abs(ma.center_at_mean_theta()
                               - mb.center_at_mean_theta()) / 2.0
@@ -118,7 +124,8 @@ def holdout_error(u: np.ndarray, v: np.ndarray, valid: np.ndarray,
 
 def shift_split(u: np.ndarray, v: np.ndarray, valid: np.ndarray,
                 model: AxisModel, mask: FreeMask, *, seed: int = 0,
-                order: int = 3, iters: int = 4, huber: float = 3.0) -> dict:
+                order: int = 3, iters: int = 4, huber: float = 3.0,
+                feature_weight: np.ndarray | None = None) -> dict:
     """Solve on disjoint feature halves; compare the shift curves.
 
     Reported raw and after removing an order-`order` polynomial in theta:
@@ -134,12 +141,17 @@ def shift_split(u: np.ndarray, v: np.ndarray, valid: np.ndarray,
     if a_idx.size < 2 or b_idx.size < 2:
         return out
 
+    def sub_w(idx):
+        return None if feature_weight is None else feature_weight[idx]
+
     fit_a = solve_model(u[a_idx], v[a_idx], valid[a_idx],
                         model.subset(a_idx), mask.subset(a_idx),
-                        iters=iters, huber=huber)
+                        iters=iters, huber=huber,
+                        feature_weight=sub_w(a_idx))
     fit_b = solve_model(u[b_idx], v[b_idx], valid[b_idx],
                         model.subset(b_idx), mask.subset(b_idx),
-                        iters=iters, huber=huber)
+                        iters=iters, huber=huber,
+                        feature_weight=sub_w(b_idx))
     both = fit_a.observed_views & fit_b.observed_views
     if both.sum() <= order + 1:
         return out
@@ -185,7 +197,8 @@ def regauge_condition(model: AxisModel, observed: np.ndarray) -> float:
 
 
 def run_diagnostics(u: np.ndarray, v: np.ndarray, valid: np.ndarray,
-                    model: AxisModel, mask: FreeMask, fit) -> dict:
+                    model: AxisModel, mask: FreeMask, fit,
+                    feature_weight: np.ndarray | None = None) -> dict:
     """The full on-demand panel: splits, holdout, spreads, significance.
 
     `fit` is the current FitResult (for residual-based numbers). Costs four
@@ -194,8 +207,10 @@ def run_diagnostics(u: np.ndarray, v: np.ndarray, valid: np.ndarray,
     i, j = fit.obs
     ct, sn = np.cos(model.theta), np.sin(model.theta)
     s = fit.model.a[i] * ct[j] + fit.model.b[i] * sn[j]
-    ho = holdout_error(u, v, valid, model, mask)
-    sp = shift_split(u, v, valid, model, mask)
+    ho = holdout_error(u, v, valid, model, mask,
+                       feature_weight=feature_weight)
+    sp = shift_split(u, v, valid, model, mask,
+                     feature_weight=feature_weight)
     spread_u = per_view_spread(fit.residual_u, j, model.theta.size)
     spread_v = per_view_spread(fit.residual_v, j, model.theta.size)
     cond = regauge_condition(fit.model, fit.observed_views)
