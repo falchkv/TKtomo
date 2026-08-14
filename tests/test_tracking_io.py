@@ -39,6 +39,9 @@ def test_label_store_basics():
     assert fid == 3
     assert dist == pytest.approx(1.0)
 
+    counts = store.counts_per_view(15)
+    assert counts[10] == 2 and counts[12] == 1 and counts.sum() == 3
+
     assert store.remove(3, 10)
     assert not store.remove(3, 10)
     assert store.clear_feature(1) == 2

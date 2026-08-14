@@ -82,6 +82,20 @@ from tktomo.ui.tracking_widgets import (
     load_stack_interactive,
 )
 
+# plot kinds selectable in the two residual panes; the first two are the
+# defaults, "labels per view" is the direct where-am-I-missing-data view
+PLOT_KINDS = [
+    "dx shifts",
+    "dy shifts",
+    "labels per view",
+    "residual u",
+    "residual v",
+    "per-view spread",
+    "axis center c",
+    "tilts alpha/beta",
+    "residual histogram",
+]
+
 
 class ReconWorker(QThread):
     """Runs tomopy gridrec off the GUI thread, one job at a time.
@@ -222,32 +236,55 @@ class TrackModelWindow(QMainWindow):
         return self.tabs
 
     def _build_plots_tab(self) -> QWidget:
+        """Two panes, each with a plot-kind dropdown. Defaults dx and dy.
+
+        Clicking in any angle-axis plot jumps to the nearest frame, which
+        turns the plots into navigation: see a gap or a bad point, click
+        it, and you are looking at that projection.
+        """
         holder = QWidget()
         layout = QVBoxLayout(holder)
-        self._plots = {}
-        specs = [
-            ("shifts", "dx / dy vs angle", "angle [deg]", "shift [raw px]"),
-            ("res_u", "u residuals", "angle [deg]", "res u [raw px]"),
-            ("res_v", "v residuals", "angle [deg]", "res v [raw px]"),
-            ("spread", "per-view residual spread (MAD)", "angle [deg]",
-             "MAD [raw px]"),
-            ("hist", "residual histogram", "residual [raw px]", "count"),
-            ("axis", "axis position c(angle)", "angle [deg]", "c [raw px]"),
-            ("tilt", "tilts alpha / beta (angle)", "angle [deg]",
-             "tilt [rad]"),
-        ]
-        for key, title, x_label, y_label in specs:
-            plot = pg.PlotWidget(title=title)
-            plot.setLabel("bottom", x_label)
-            plot.setLabel("left", y_label)
+        self._plot_selectors: list[QComboBox] = []
+        self._plot_widgets: list[pg.PlotWidget] = []
+        for default in ("dx shifts", "dy shifts"):
+            combo = QComboBox()
+            combo.addItems(PLOT_KINDS)
+            combo.setCurrentText(default)
+            combo.currentTextChanged.connect(
+                lambda _t: self._refresh_plots())
+            plot = pg.PlotWidget()
             plot.showGrid(x=True, y=True, alpha=0.3)
-            plot.setMinimumHeight(150)
-            self._plots[key] = plot
-            layout.addWidget(plot)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(holder)
-        return scroll
+            plot.scene().sigMouseClicked.connect(
+                lambda ev, c=combo: self._plot_clicked(ev, c))
+            layout.addWidget(combo)
+            layout.addWidget(plot, 1)
+            self._plot_selectors.append(combo)
+            self._plot_widgets.append(plot)
+        hint = QLabel("click in a plot to jump to the nearest frame; "
+                      "dots = labeled views (orange = only one label), "
+                      "red base ticks = views with NO labels")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        return holder
+
+    def _plot_clicked(self, event, combo) -> None:
+        if event.button() != Qt.MouseButton.LeftButton or event.double():
+            return
+        if combo.currentText() == "residual histogram":
+            return                      # x is residual px, not an angle
+        index = self._plot_selectors.index(combo)
+        plot = self._plot_widgets[index]
+        vb = plot.getPlotItem().vb
+        if not vb.sceneBoundingRect().contains(event.scenePos()):
+            return
+        self._jump_to_angle(float(vb.mapSceneToView(event.scenePos()).x()))
+        event.accept()
+
+    def _jump_to_angle(self, x_deg: float) -> None:
+        if self._data is None:
+            return
+        deg = np.rad2deg(self._data.angles)
+        self._set_view(int(np.argmin(np.abs(deg - x_deg))))
 
     def _build_recon_tab(self) -> QWidget:
         from tktomo.ptycho_align.ui.panels.base import (  # noqa: PLC0415
@@ -578,6 +615,7 @@ class TrackModelWindow(QMainWindow):
             self._set_view(self._view + advance)
         else:
             self._refresh_view()
+        self._refresh_plots()      # label coverage updates even without a fit
         self._request_fit()
 
     def _delete_near(self, u: float, v: float) -> None:
@@ -588,6 +626,7 @@ class TrackModelWindow(QMainWindow):
         if near is not None:
             self._labels.remove(near[0], self._view)
             self._refresh_view()
+            self._refresh_plots()
             self._request_fit()
 
     def _set_active(self, fid: int) -> None:
@@ -858,73 +897,125 @@ class TrackModelWindow(QMainWindow):
             self._evaluate()
 
     def _refresh_plots(self) -> None:
-        if self._fit is None:
+        if self._data is None:
             return
-        fit = self._fit
-        model = fit.model
-        deg = np.rad2deg(model.theta)
-        i, j = fit.obs
-        observed = fit.observed_views
-
-        plot = self._plots["shifts"]
-        plot.clear()
-        for values, color, name in ((model.dx, (255, 200, 0), "dx"),
-                                    (model.dy, (0, 200, 255), "dy")):
-            plot.plot(deg, values, pen=pg.mkPen(*color, 90, width=1,
-                                                style=Qt.PenStyle.DashLine))
-            plot.plot(deg[observed], values[observed], pen=None, symbol="o",
-                      symbolSize=4, symbolBrush=color, symbolPen=None,
-                      name=name)
-        plot.addLegend()
-
-        for key, res in (("res_u", fit.residual_u), ("res_v",
-                                                     fit.residual_v)):
-            plot = self._plots[key]
+        for combo, plot in zip(self._plot_selectors, self._plot_widgets):
             plot.clear()
+            self._render_plot(combo.currentText(), plot)
+
+    def _label_counts_per_view(self) -> np.ndarray:
+        return self._labels.counts_per_view(self._data.angles.size)
+
+    def _render_shift_plot(self, plot, values, observed, color,
+                           name: str) -> None:
+        """Dashed model curve, dots on labeled views, and the missing
+        frames made explicit: orange dots where ONE label carries the view
+        (its shift is that label, warning W4) and red base ticks where NO
+        label exists (the shift is pure interpolation)."""
+        deg = np.rad2deg(self._data.angles)
+        counts = self._label_counts_per_view()
+        plot.setLabel("left", f"{name} [raw px]")
+        plot.setLabel("bottom", "angle [deg]")
+        plot.plot(deg, values, pen=pg.mkPen(*color, 90, width=1,
+                                            style=Qt.PenStyle.DashLine))
+        solid = observed & (counts >= 2)
+        thin = observed & (counts == 1)
+        if solid.any():
+            plot.plot(deg[solid], values[solid], pen=None, symbol="o",
+                      symbolSize=5, symbolBrush=color, symbolPen=None)
+        if thin.any():
+            plot.plot(deg[thin], values[thin], pen=None, symbol="o",
+                      symbolSize=5, symbolBrush=(255, 140, 0),
+                      symbolPen=None)
+        missing = counts == 0
+        if missing.any() and values.size:
+            base = float(values.min()) - 0.08 * (float(np.ptp(values)) or 1.0)
+            plot.plot(deg[missing], np.full(int(missing.sum()), base),
+                      pen=None, symbol="t1", symbolSize=6,
+                      symbolBrush=(255, 60, 60), symbolPen=None)
+
+    def _render_plot(self, kind: str, plot) -> None:
+        deg = np.rad2deg(self._data.angles)
+        fit = self._fit
+
+        if kind == "labels per view":
+            counts = self._label_counts_per_view()
+            plot.setLabel("left", "labels in view")
+            plot.setLabel("bottom", "angle [deg]")
+            plot.plot(deg, counts, pen=pg.mkPen((200, 200, 200), width=1),
+                      symbol="o", symbolSize=4,
+                      symbolBrush=(200, 200, 200), symbolPen=None)
+            missing = counts == 0
+            if missing.any():
+                plot.plot(deg[missing], np.zeros(int(missing.sum())),
+                          pen=None, symbol="t1", symbolSize=7,
+                          symbolBrush=(255, 60, 60), symbolPen=None)
+            plot.addLine(y=2, pen=pg.mkPen((255, 140, 0, 120),
+                                           style=Qt.PenStyle.DashLine))
+            return
+
+        if fit is None:
+            return
+        model = fit.model
+        i, j = fit.obs
+
+        if kind == "dx shifts":
+            self._render_shift_plot(plot, model.dx, fit.observed_views,
+                                    (255, 200, 0), "dx")
+        elif kind == "dy shifts":
+            self._render_shift_plot(plot, model.dy, fit.observed_views,
+                                    (0, 200, 255), "dy")
+        elif kind in ("residual u", "residual v"):
+            res = fit.residual_u if kind == "residual u" else fit.residual_v
+            plot.setLabel("left", f"{kind} [raw px]")
+            plot.setLabel("bottom", "angle [deg]")
             brushes = [pg.mkBrush(*feature_color(int(model.feature_ids[fi])))
                        for fi in i]
-            plot.plot(deg[j], res, pen=None, symbol="o", symbolSize=4,
+            plot.plot(deg[j], res, pen=None, symbol="o", symbolSize=5,
                       symbolBrush=brushes, symbolPen=None)
             plot.addLine(y=0, pen=pg.mkPen((255, 255, 255, 60)))
-
-        from tktomo.tracking.diagnostics import per_view_spread  # noqa: PLC0415
-        plot = self._plots["spread"]
-        plot.clear()
-        for res, color in ((fit.residual_u, (255, 200, 0)),
-                           (fit.residual_v, (0, 200, 255))):
-            spread = per_view_spread(res, j, model.theta.size)
-            good = np.isfinite(spread)
-            plot.plot(deg[good], spread[good], pen=pg.mkPen(color, width=1.5))
-        plot.addLine(y=1.0, pen=pg.mkPen((255, 80, 80, 120),
-                                         style=Qt.PenStyle.DashLine))
-
-        plot = self._plots["hist"]
-        plot.clear()
-        for res, color in ((fit.residual_u, (255, 200, 0, 140)),
-                           (fit.residual_v, (0, 200, 255, 140))):
-            if res.size:
-                # a perfect fit has (near-)zero range; bins must stay
-                # representable against the residuals' magnitude
-                span = max(float(np.ptp(res)),
-                           1e-6 * max(1.0, float(np.abs(res).max())))
-                lo = float(res.min()) - 0.05 * span
-                hi = float(res.max()) + 0.05 * span
-                counts, edges = np.histogram(res, bins=60, range=(lo, hi))
-                plot.plot(edges, counts, stepMode="center",
-                          fillLevel=0, brush=pg.mkBrush(*color),
-                          pen=pg.mkPen(*color))
-
-        c_of, alpha_of, beta_of = model.axis_curves()
-        plot = self._plots["axis"]
-        plot.clear()
-        plot.plot(deg, c_of, pen=pg.mkPen((255, 255, 255), width=1.5))
-        plot = self._plots["tilt"]
-        plot.clear()
-        plot.plot(deg, alpha_of, pen=pg.mkPen((255, 200, 0), width=1.5),
-                  name="alpha")
-        plot.plot(deg, beta_of, pen=pg.mkPen((0, 200, 255), width=1.5),
-                  name="beta")
-        plot.addLegend()
+        elif kind == "per-view spread":
+            from tktomo.tracking.diagnostics import (  # noqa: PLC0415
+                per_view_spread,
+            )
+            plot.setLabel("left", "MAD [raw px], u yellow / v cyan")
+            plot.setLabel("bottom", "angle [deg]")
+            for res, color in ((fit.residual_u, (255, 200, 0)),
+                               (fit.residual_v, (0, 200, 255))):
+                spread = per_view_spread(res, j, model.theta.size)
+                good = np.isfinite(spread)
+                plot.plot(deg[good], spread[good],
+                          pen=pg.mkPen(color, width=1.5))
+            plot.addLine(y=1.0, pen=pg.mkPen((255, 80, 80, 120),
+                                             style=Qt.PenStyle.DashLine))
+        elif kind == "axis center c":
+            plot.setLabel("left", "c [raw px]")
+            plot.setLabel("bottom", "angle [deg]")
+            c_of, _, _ = model.axis_curves()
+            plot.plot(deg, c_of, pen=pg.mkPen((255, 255, 255), width=1.5))
+        elif kind == "tilts alpha/beta":
+            plot.setLabel("left", "tilt [rad], alpha yellow / beta cyan")
+            plot.setLabel("bottom", "angle [deg]")
+            _, alpha_of, beta_of = model.axis_curves()
+            plot.plot(deg, alpha_of, pen=pg.mkPen((255, 200, 0), width=1.5))
+            plot.plot(deg, beta_of, pen=pg.mkPen((0, 200, 255), width=1.5))
+        elif kind == "residual histogram":
+            plot.setLabel("left", "count, u yellow / v cyan")
+            plot.setLabel("bottom", "residual [raw px]")
+            for res, color in ((fit.residual_u, (255, 200, 0, 140)),
+                               (fit.residual_v, (0, 200, 255, 140))):
+                if res.size:
+                    # a perfect fit has (near-)zero range; bins must stay
+                    # representable against the residuals' magnitude
+                    span = max(float(np.ptp(res)),
+                               1e-6 * max(1.0, float(np.abs(res).max())))
+                    lo = float(res.min()) - 0.05 * span
+                    hi = float(res.max()) + 0.05 * span
+                    counts, edges = np.histogram(res, bins=60,
+                                                 range=(lo, hi))
+                    plot.plot(edges, counts, stepMode="center",
+                              fillLevel=0, brush=pg.mkBrush(*color),
+                              pen=pg.mkPen(*color))
 
     # ----------------------------------------------------------------- 3D
 

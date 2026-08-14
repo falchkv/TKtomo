@@ -56,6 +56,15 @@ class LabelStore:
     def views_of(self, feature_id: int) -> list[int]:
         return sorted(w for fid, w in self._points if fid == feature_id)
 
+    def counts_per_view(self, n_views: int) -> np.ndarray:
+        """(n_views,) int: how many labels each view carries. The zeros
+        are the frames still missing manual data."""
+        counts = np.zeros(int(n_views), int)
+        for _fid, view in self._points:
+            if 0 <= view < counts.size:
+                counts[view] += 1
+        return counts
+
     def in_view(self, view: int) -> list[tuple[int, float, float]]:
         """[(feature_id, u, v)] of every label in one view."""
         return [(fid, uv[0], uv[1])

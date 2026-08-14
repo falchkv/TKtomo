@@ -60,11 +60,22 @@ reports the disagreement (center, tilts, shift curves) plus held-out
 residuals. The half-split is the number to trust; the parametric sigma is
 shown but loses every argument with it.
 
-## Views without labels
+## Plots and views without labels
 
-`dx`/`dy` are measured only where labels exist; unlabeled views are filled
-by interpolation over angle, drawn dashed in the shift plot (measured views
-are dots). Long dashed stretches mean: label some views there.
+The middle panel holds two plot panes, each with a dropdown selecting
+what it shows (defaults: dx and dy shifts). Available: dx/dy shifts,
+labels per view, residual u/v colored by feature, per-view MAD spread,
+axis center c(theta), tilts alpha/beta, residual histogram. Clicking in
+any angle-axis plot jumps to the nearest frame, so a gap or a bad point
+is one click from being looked at and labeled.
+
+`dx`/`dy` are measured only where labels exist; unlabeled views are
+filled by interpolation over angle. In the shift plots, dots are labeled
+views (orange when only ONE label carries the view, so its shift is that
+label verbatim), the dashed curve is the interpolation, and red base
+ticks mark frames with NO labels at all. The "labels per view" plot
+shows the coverage directly, with the same red ticks and an orange
+guide line at two labels.
 
 ## Exports
 

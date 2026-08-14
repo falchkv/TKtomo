@@ -256,6 +256,40 @@ class _StubSignal:
         pass
 
 
+def test_plot_panes_defaults_kinds_and_missing_frames(tracker):
+    from tktomo.ui.track_model_app import PLOT_KINDS
+
+    assert [c.currentText() for c in tracker._plot_selectors] \
+        == ["dx shifts", "dy shifts"]
+    # "labels per view" renders from labels alone, before any fit exists
+    tracker._set_active(0)
+    tracker._set_view(4)
+    tracker._place(60.0, 40.0)
+    tracker._plot_selectors[0].setCurrentText("labels per view")
+    items = tracker._plot_widgets[0].getPlotItem().listDataItems()
+    assert items, "labels-per-view pane is empty without a fit"
+
+    truth = truth_for(tracker)
+    label_from_truth(tracker, truth)
+    tracker._fit_now()
+    # every kind renders without raising, and produces data items
+    for kind in PLOT_KINDS:
+        tracker._plot_selectors[1].setCurrentText(kind)
+        assert tracker._plot_widgets[1].getPlotItem().listDataItems(), kind
+
+
+def test_plot_click_jumps_to_nearest_frame(tracker):
+    truth = truth_for(tracker)
+    label_from_truth(tracker, truth)
+    tracker._fit_now()
+    deg = np.rad2deg(tracker._data.angles)
+    step = deg[1] - deg[0]
+    tracker._jump_to_angle(deg[37] + 0.4 * step)
+    assert tracker._view == 37
+    tracker._jump_to_angle(-1e6)          # clamps to the first frame
+    assert tracker._view == 0
+
+
 def test_fit_ignores_checkbox_history_when_free(qtbot):
     """With dx/dy FREE at fit time, the result must not depend on what the
     checkboxes were during labeling: free columns are solved fresh, stored
