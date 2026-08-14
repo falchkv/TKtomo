@@ -238,6 +238,64 @@ def test_tracker_3d_tab_degrades_or_builds(tracker):
     tracker._refresh_3d()         # must not raise, with or without OpenGL
 
 
+def test_trajectory_overlay_excludes_per_view_jitter(tracker):
+    """The overlay must stay a smooth sinusoid however jagged dx/dy are.
+
+    The per-view shifts are alignment errors of individual views; a curve
+    drawn inside ONE view's frame that mixes all of them zigzags while the
+    3D geometry is a clean circle (the original bug report). Only the
+    current view's own shift may enter, as the anchor.
+    """
+    truth = truth_for(tracker)
+    label_from_truth(tracker, truth)
+    tracker._fit_now()
+    m = tracker._model
+    m.dx[:] = np.where(np.arange(m.theta.size) % 2, 5.0, -5.0)
+    m.dy[:] = np.where(np.arange(m.theta.size) % 2, -3.0, 3.0)
+    tracker._set_active(0)
+    tracker._set_view(0)
+    x = np.asarray(tracker.viewer._trajectory.xData, float)
+    y = np.asarray(tracker.viewer._trajectory.yData, float)
+    assert x is not None and x.size == m.theta.size
+    # a +-5 px alternating dx would give second differences of ~20 px;
+    # the smooth sinusoid's are far below 1
+    assert np.abs(np.diff(x, 2)).max() < 1.0
+    assert np.abs(np.diff(y, 2)).max() < 1.0
+    # anchored: the curve passes through this view's predicted marker
+    u_pred, v_pred = m.predict()
+    assert x[0] == pytest.approx(u_pred[0, 0])
+    assert y[0] == pytest.approx(v_pred[0, 0])
+
+
+def test_colormap_combo_has_swatch_icons(tracker):
+    combo = tracker.viewer.colormap_combo
+    assert combo.count() > 0
+    assert not combo.itemIcon(0).isNull()
+    assert combo.iconSize().width() > 0
+
+
+def test_auto_levels_follow_each_frame(tracker):
+    viewer = tracker.viewer
+    assert viewer.auto_levels_box.isChecked()   # tracking default: on
+    viewer.set_image(np.linspace(0, 1, 10000, dtype=np.float32
+                                 ).reshape(100, 100))
+    lo1, hi1 = viewer.image_view.getHistogramWidget().item.getLevels()
+    viewer.set_image(np.linspace(50, 60, 10000, dtype=np.float32
+                                 ).reshape(100, 100))
+    lo2, hi2 = viewer.image_view.getHistogramWidget().item.getLevels()
+    assert lo2 > hi1                    # levels moved with the data range
+    assert 50.0 <= lo2 < hi2 <= 60.0
+    # robustness: one hot pixel must not blow the scale open
+    frame = np.full((100, 100), 5.0, np.float32)
+    frame[0, 0] = 1e6
+    viewer.set_image(frame)
+    _lo3, hi3 = viewer.image_view.getHistogramWidget().item.getLevels()
+    assert hi3 < 1e5
+    # ptycho-align's default stays untouched
+    from tktomo.ptycho_align.ui.panels.base import StackDisplay
+    assert not StackDisplay().auto_levels_box.isChecked()
+
+
 # ------------------------------------------------- end-to-end phantom
 
 def test_end_to_end_known_shifts_recovered(qtbot):

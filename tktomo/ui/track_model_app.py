@@ -258,6 +258,7 @@ class TrackModelWindow(QMainWindow):
         self.recon_status = QLabel("")
         layout.addWidget(self.recon_status)
         self.recon_display = StackDisplay()
+        self.recon_display.auto_levels_box.setChecked(True)
         layout.addWidget(self.recon_display, 1)
         return holder
 
@@ -685,8 +686,23 @@ class TrackModelWindow(QMainWindow):
             row = list(self._model.feature_ids).index(self._active) \
                 if self._active in self._model.feature_ids else None
             if row is not None and self._chain.view_origin is None:
-                u_all, v_all = (self._chain.from_parent(
-                    u_pred[row], v_pred[row]))
+                # The trajectory overlay shows the SMOOTH model track: the
+                # per-view dx/dy are alignment errors of OTHER views and
+                # have no place in a curve drawn inside THIS view's frame.
+                # With them included the track zigzags (worst where single-
+                # label views let dx fit one point exactly, warning W4)
+                # even though the 3D geometry is a clean circle. Anchored
+                # with the current view's own shift so the curve passes
+                # through this view's predicted marker.
+                m = self._model
+                ct, sn = np.cos(m.theta), np.sin(m.theta)
+                s_row = m.a[row] * ct + m.b[row] * sn
+                t_row = -m.a[row] * sn + m.b[row] * ct
+                c_of, alpha_of, beta_of = m.axis_curves()
+                u_tr = s_row + c_of + m.dx[view]
+                v_tr = (m.y[row] + alpha_of * s_row + beta_of * t_row
+                        + m.dy[view])
+                u_all, v_all = self._chain.from_parent(u_tr, v_tr)
                 self.viewer.show_trajectory(u_all, v_all)
             else:
                 self.viewer.show_trajectory(None)
@@ -967,7 +983,6 @@ class TrackModelWindow(QMainWindow):
     def _show_slice(self, image) -> None:
         self.recon_status.setText("")
         self.recon_display.set_image(np.asarray(image))
-        self.recon_display.reset_levels(np.asarray(image))
 
     # ------------------------------------------------------------ loading
 

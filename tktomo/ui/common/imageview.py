@@ -34,6 +34,8 @@ class SliceViewer(QWidget):
         self.colormap_combo = QComboBox()
         names = available_colormaps()
         self.colormap_combo.addItems(names)
+        from tktomo.ui.common.colormap_icons import add_colormap_icons  # noqa: PLC0415
+        add_colormap_icons(self.colormap_combo)
         if default_colormap in names:
             self.colormap_combo.setCurrentText(default_colormap)
         self.colormap_combo.currentTextChanged.connect(self._apply_colormap)

@@ -12,9 +12,17 @@ from collections.abc import Callable
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QVBoxLayout,
+    QWidget,
+)
 
 from tktomo.colormaps import available_colormaps, get_colormap
+from tktomo.ui.common.colormap_icons import add_colormap_icons
 
 # Modes shared by the projection and sinogram viewers.
 MODE_RAW = "Raw"
@@ -52,12 +60,19 @@ class StackDisplay(QWidget):
         self.colormap_combo = QComboBox()
         names = available_colormaps()
         self.colormap_combo.addItems(names)
+        add_colormap_icons(self.colormap_combo)
         self.colormap_combo.setCurrentText("viridis" if "viridis" in names else names[0])
         self.colormap_combo.currentTextChanged.connect(self._apply_colormap)
+
+        # Off by default: ptycho-align deliberately leaves the user's histogram
+        # alone between frames. The tracking apps switch it on.
+        self.auto_levels_box = QCheckBox("Auto levels")
+        self.auto_levels_box.toggled.connect(self._auto_levels_toggled)
 
         top = QHBoxLayout()
         top.addWidget(QLabel("Colormap:"))
         top.addWidget(self.colormap_combo)
+        top.addWidget(self.auto_levels_box)
         top.addStretch(1)
 
         layout = QVBoxLayout(self)
@@ -68,6 +83,7 @@ class StackDisplay(QWidget):
         layout.addWidget(self.image_view)
 
         self._symmetric = False
+        self._last_image: np.ndarray | None = None
         self._apply_colormap(self.colormap_combo.currentText())
 
     def set_symmetric(self, symmetric: bool) -> None:
@@ -93,14 +109,40 @@ class StackDisplay(QWidget):
             autoHistogramRange=False,
         )
 
+        self._last_image = image
         if self._symmetric:
             extent = float(np.nanmax(np.abs(image))) if image.size else 1.0
             extent = extent or 1.0
             self.image_view.setLevels(-extent, extent)
+        elif self.auto_levels_box.isChecked():
+            self._apply_auto_levels(image)
         elif self.image_view.getHistogramWidget().item.getLevels() == (0.0, 1.0):
             # First real image: give it sensible levels once, then leave the user's
             # histogram alone on subsequent frames.
             self.image_view.autoLevels()
+
+    def _apply_auto_levels(self, image: np.ndarray) -> None:
+        """Robust per-frame levels: clamp to the 1-99 percentile range.
+
+        Straight min/max hands the whole scale to one hot pixel; percentiles
+        keep the display closed around where the signal actually lives.
+        """
+        finite = image[np.isfinite(image)]
+        if finite.size == 0:
+            return
+        lo, hi = (float(x) for x in np.percentile(finite, (1.0, 99.0)))
+        if lo == hi:
+            # nearly-constant frame: widen around the bulk value instead of
+            # falling back to min/max, which would re-admit the very
+            # outliers the percentiles were there to exclude
+            pad = max(0.5, 1e-3 * abs(lo))
+            lo, hi = lo - pad, hi + pad
+        self.image_view.setLevels(lo, hi)
+        self.image_view.setHistogramRange(lo, hi)
+
+    def _auto_levels_toggled(self, checked: bool) -> None:
+        if checked and self._last_image is not None:
+            self._apply_auto_levels(self._last_image)
 
     def reset_levels(self, image: np.ndarray) -> None:
         if image.size:

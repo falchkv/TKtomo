@@ -68,6 +68,9 @@ class MarkableStackView(StackDisplay):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent=parent)
         self._mouse: tuple[float, float] | None = None
+        # tracking views step through hundreds of frames; per-frame robust
+        # levels beat a histogram frozen on whatever frame came first
+        self.auto_levels_box.setChecked(True)
 
         view = self.image_view.getView()
         self._label_scatter = pg.ScatterPlotItem(size=11, pxMode=True)
