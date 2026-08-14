@@ -51,6 +51,52 @@ follows the object point across frames (Escape clears it). The
 slice-to-object mapping is pinned against tomopy's grid convention by a
 dedicated test.
 
+## Auto-completing tracks
+
+Label a feature manually in a handful of views (at least 2), then
+"Auto-complete feature" (or "Auto-complete all" for every feature with
+2+ manual labels) fills the views around each manual label by template
+matching, on a background worker with progress and cancel. The design
+follows what tilt-series tools (IMOD Beadtrack) and trackers (TrackMate,
+KLT) converge on, tuned with numbers measured on this very dataset in
+the earlier slogger pipeline:
+
+- Your manual labels are the ANCHORS. The template is always cut at the
+  nearest manual label and never updated: chained templates drift
+  smoothly and plausibly (the dangerous kind of wrong), anchored ones
+  decorrelate honestly (correlation 0.65 one view away, 0.23 at ten), so
+  a track STOPS when the template stops resembling the image. More
+  manual labels = longer reach; every ~10 views is a good rhythm.
+- The search window sits on the sinusoid your manual labels imply. The
+  matcher is Hann-windowed phase correlation with iterative re-cut
+  (a single pass systematically underestimates motion by 13 percent)
+  and reports a plain correlation coefficient as quality.
+- Seeds on edge-like structure are refused up front (structure-tensor
+  coherence > 0.4): a patch on a filament can slide along it with a
+  confident correlation, and its position along the edge would be
+  fiction.
+- The forward-backward check tracks every accepted match back to its
+  seed and drops it if the round trip misses or correlates poorly.
+  Cheap, and it only ever removes labels.
+
+Auto labels are drawn as HOLLOW circles (same color and size), carry
+their match quality, and enter the fit at full weight: the Huber loop
+and the Worst-outlier button are the review path. A manual click always
+overwrites an auto label; the auto-tracker never touches a manual one;
+re-running replaces only auto labels; "Clear auto" undoes the machine's
+work in bulk. Not supported on per-view-cropped (feature-isolation)
+stacks, whose windows already follow the feature.
+
+A structural benefit: auto-completion populates many features across the
+SAME views, so multi-label views become the norm and the
+staggered-labeling trap (warning W6, free shifts absorbing single-label
+views) largely disappears.
+
+Defaults, all measured: min corr 0.30, search radius 8 px (+0.25 px per
+view from the seed), patch size 4x the feature's marker size (clipped
+16 to 96), high-pass sigma 12, coherence gate 0.4, three consecutive
+failures end a direction.
+
 ## Fixed and free parameters
 
 Every polynomial coefficient has a "fix" checkbox and an editable value;

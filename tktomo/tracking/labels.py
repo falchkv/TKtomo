@@ -3,43 +3,95 @@
 Labels live in RAW-grid coordinates (see `tktomo.tracking.coords`): the UI
 converts a click through its `CoordinateChain` at placement time, so a
 label survives reloading the same data at a different binning or crop.
+
+Every label carries a provenance kind: MANUAL (a human click) or AUTO
+(placed by the template matcher in `tktomo.tracking.autotrack`), plus a
+match quality for auto labels. The rules are asymmetric on purpose: a
+manual click OVERWRITES an auto label (the human wins), while the
+auto-tracker refuses to touch a manual label. Both kinds enter the model
+fit at full weight; provenance exists so the machine's work is visible,
+reviewable, and bulk-removable, never so it is silently trusted less.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
+KIND_MANUAL = 0
+KIND_AUTO = 1
+
 
 class LabelStore:
-    """{(feature_id, view): (u_raw, v_raw)} with per-(feature, view) uniqueness.
+    """{(feature_id, view): (u_raw, v_raw, kind, quality)}.
 
-    Placing a feature again in the same view moves the existing point: one
-    physical feature cannot be in two places in one projection.
+    Per-(feature, view) uniqueness is enforced on set: one physical
+    feature cannot be in two places in one projection.
     """
 
     def __init__(self) -> None:
-        self._points: dict[tuple[int, int], tuple[float, float]] = {}
+        self._points: dict[tuple[int, int],
+                           tuple[float, float, int, float]] = {}
 
     def __len__(self) -> int:
         return len(self._points)
 
-    def set(self, feature_id: int, view: int, u: float, v: float) -> None:
-        self._points[(int(feature_id), int(view))] = (float(u), float(v))
+    # -- writing ----------------------------------------------------------
 
-    def get(self, feature_id: int, view: int) -> tuple[float, float] | None:
-        return self._points.get((int(feature_id), int(view)))
+    def set(self, feature_id: int, view: int, u: float, v: float) -> None:
+        """Place/move a MANUAL label. Overwrites anything, auto included."""
+        self._points[(int(feature_id), int(view))] = (
+            float(u), float(v), KIND_MANUAL, float("nan"))
+
+    def set_auto(self, feature_id: int, view: int, u: float, v: float,
+                 quality: float) -> bool:
+        """Place an AUTO label. Refuses to overwrite a manual one."""
+        key = (int(feature_id), int(view))
+        existing = self._points.get(key)
+        if existing is not None and existing[2] == KIND_MANUAL:
+            return False
+        self._points[key] = (float(u), float(v), KIND_AUTO, float(quality))
+        return True
 
     def remove(self, feature_id: int, view: int) -> bool:
         return self._points.pop((int(feature_id), int(view)), None) is not None
+
+    def clear_feature(self, feature_id: int) -> int:
+        keys = [k for k in self._points if k[0] == feature_id]
+        for k in keys:
+            del self._points[k]
+        return len(keys)
+
+    def clear_auto(self, feature_id: int | None = None) -> int:
+        """Delete auto labels: one feature's, or every feature's (None)."""
+        keys = [k for k, val in self._points.items()
+                if val[2] == KIND_AUTO
+                and (feature_id is None or k[0] == feature_id)]
+        for k in keys:
+            del self._points[k]
+        return len(keys)
+
+    # -- reading ----------------------------------------------------------
+
+    def get(self, feature_id: int, view: int) -> tuple[float, float] | None:
+        val = self._points.get((int(feature_id), int(view)))
+        return None if val is None else (val[0], val[1])
+
+    def kind_of(self, feature_id: int, view: int) -> int | None:
+        val = self._points.get((int(feature_id), int(view)))
+        return None if val is None else val[2]
+
+    def quality_of(self, feature_id: int, view: int) -> float:
+        val = self._points.get((int(feature_id), int(view)))
+        return float("nan") if val is None else val[3]
 
     def nearest(self, view: int, u: float, v: float
                 ) -> tuple[int, float] | None:
         """(feature_id, distance) of the closest label in `view`, or None."""
         best = None
-        for (fid, w), (pu, pv) in self._points.items():
+        for (fid, w), val in self._points.items():
             if w != view:
                 continue
-            d = float(np.hypot(pu - u, pv - v))
+            d = float(np.hypot(val[0] - u, val[1] - v))
             if best is None or d < best[1]:
                 best = (fid, d)
         return best
@@ -53,8 +105,19 @@ class LabelStore:
             out[fid] = out.get(fid, 0) + 1
         return out
 
+    def manual_counts(self) -> dict[int, int]:
+        out: dict[int, int] = {}
+        for (fid, _), val in self._points.items():
+            if val[2] == KIND_MANUAL:
+                out[fid] = out.get(fid, 0) + 1
+        return out
+
     def views_of(self, feature_id: int) -> list[int]:
         return sorted(w for fid, w in self._points if fid == feature_id)
+
+    def manual_views_of(self, feature_id: int) -> list[int]:
+        return sorted(w for (fid, w), val in self._points.items()
+                      if fid == feature_id and val[2] == KIND_MANUAL)
 
     def counts_per_view(self, n_views: int) -> np.ndarray:
         """(n_views,) int: how many labels each view carries. The zeros
@@ -67,14 +130,16 @@ class LabelStore:
 
     def in_view(self, view: int) -> list[tuple[int, float, float]]:
         """[(feature_id, u, v)] of every label in one view."""
-        return [(fid, uv[0], uv[1])
-                for (fid, w), uv in sorted(self._points.items()) if w == view]
+        return [(fid, val[0], val[1])
+                for (fid, w), val in sorted(self._points.items())
+                if w == view]
 
-    def clear_feature(self, feature_id: int) -> int:
-        keys = [k for k in self._points if k[0] == feature_id]
-        for k in keys:
-            del self._points[k]
-        return len(keys)
+    def in_view_full(self, view: int
+                     ) -> list[tuple[int, float, float, int, float]]:
+        """[(feature_id, u, v, kind, quality)] of every label in one view."""
+        return [(fid, val[0], val[1], val[2], val[3])
+                for (fid, w), val in sorted(self._points.items())
+                if w == view]
 
     # -- solver interface -------------------------------------------------
 
@@ -82,8 +147,9 @@ class LabelStore:
                   ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """(u, v, valid, ids): (F, V) label arrays for `solve_model`.
 
-        Rows follow `feature_ids` when given (so pinned-feature indices stay
-        stable), otherwise the sorted ids present in the store.
+        Both manual and auto labels enter, at full weight. Rows follow
+        `feature_ids` when given (so pinned-feature indices stay stable),
+        otherwise the sorted ids present in the store.
         """
         ids = np.asarray(self.feature_ids() if feature_ids is None
                          else feature_ids, int)
@@ -91,27 +157,40 @@ class LabelStore:
         u = np.zeros((ids.size, n_views))
         v = np.zeros((ids.size, n_views))
         valid = np.zeros((ids.size, n_views), bool)
-        for (fid, w), (pu, pv) in self._points.items():
+        for (fid, w), val in self._points.items():
             if fid in row and 0 <= w < n_views:
-                u[row[fid], w] = pu
-                v[row[fid], w] = pv
+                u[row[fid], w] = val[0]
+                v[row[fid], w] = val[1]
                 valid[row[fid], w] = True
         return u, v, valid, ids
 
     # -- (de)serialization ------------------------------------------------
 
     def to_table(self) -> np.ndarray:
-        """(M, 4) float array [feature_id, view, u_raw, v_raw], sorted."""
-        rows = [(fid, w, uv[0], uv[1])
-                for (fid, w), uv in sorted(self._points.items())]
+        """(M, 6) float array [feature_id, view, u_raw, v_raw, kind,
+        quality], sorted."""
+        rows = [(fid, w, val[0], val[1], val[2], val[3])
+                for (fid, w), val in sorted(self._points.items())]
         return (np.asarray(rows, float) if rows
-                else np.zeros((0, 4)))
+                else np.zeros((0, 6)))
 
     @classmethod
     def from_table(cls, table: np.ndarray) -> "LabelStore":
+        """Accepts the current (M, 6) layout and the legacy (M, 4) one
+        (pre-provenance files: everything manual, quality NaN)."""
+        table = np.asarray(table, float)
         store = cls()
-        for fid, w, u, v in np.asarray(table, float).reshape(-1, 4):
-            store.set(int(fid), int(w), u, v)
+        if table.size == 0:
+            return store
+        if table.ndim != 2 or table.shape[1] not in (4, 6):
+            raise ValueError(
+                f"label table must be (M, 4) or (M, 6), got {table.shape}")
+        for row in table:
+            fid, view, u, v = int(row[0]), int(row[1]), row[2], row[3]
+            if table.shape[1] == 6 and int(row[4]) == KIND_AUTO:
+                store.set_auto(fid, view, u, v, row[5])
+            else:
+                store.set(fid, view, u, v)
         return store
 
 

@@ -195,7 +195,9 @@ class MarkableStackView(StackDisplay):
 
     def show_labels(self, labels, active_id: int | None = None,
                     sizes: dict | None = None) -> None:
-        """labels: iterable of (feature_id, u, v) in the loaded frame.
+        """labels: (feature_id, u, v) or (feature_id, u, v, kind) tuples
+        in the loaded frame; kind 1 (auto-placed) draws HOLLOW so the
+        machine's work is distinguishable from the user's at a glance.
 
         `sizes` maps feature_id -> circle diameter in DATA pixels, so the
         marker can be matched to the physical feature it labels.
@@ -205,20 +207,23 @@ class MarkableStackView(StackDisplay):
             view.removeItem(text)
         self._texts.clear()
         spots = []
-        for fid, u, v in labels:
+        for entry in labels:
+            fid, u, v = entry[0], entry[1], entry[2]
+            kind = entry[3] if len(entry) > 3 else 0
             color = feature_color(fid)
             ring = 3 if (active_id is not None and fid == active_id) else 1.5
             spots.append({
                 "pos": (u, v),
                 "size": float((sizes or {}).get(fid, 10.0)),
                 "pen": pg.mkPen(color, width=ring),
-                "brush": pg.mkBrush(*color, 70),
+                "brush": None if kind else pg.mkBrush(*color, 70),
             })
-            text = pg.TextItem(str(fid), color=color, anchor=(0.5, 1.3))
-            text.setPos(u, v)
-            text.setZValue(11)
-            view.addItem(text)
-            self._texts.append(text)
+            if not kind:      # auto labels stay untagged: less clutter
+                text = pg.TextItem(str(fid), color=color, anchor=(0.5, 1.3))
+                text.setPos(u, v)
+                text.setZValue(11)
+                view.addItem(text)
+                self._texts.append(text)
         self._label_scatter.setData(spots)
 
     def show_ghosts(self, points, sizes: dict | None = None) -> None:

@@ -34,7 +34,9 @@ from tktomo.tracking.coords import CoordinateChain
 from tktomo.tracking.labels import LabelStore
 from tktomo.tracking.model import AxisModel, FitResult, FreeMask
 
-MODEL_VERSION = 1
+# version 2: label_table gained provenance columns (kind, quality);
+# version-1 files are still readable (LabelStore.from_table accepts both)
+MODEL_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +79,9 @@ def write_model_h5(path: str | Path, fit: FitResult, mask: FreeMask,
             f.create_dataset(name, data=getattr(m, name))
         f.create_dataset("feature_id", data=m.feature_ids)
         f.create_dataset("observed_views", data=fit.observed_views)
-        f.create_dataset("label_table", data=labels.to_table())
+        table = f.create_dataset("label_table", data=labels.to_table())
+        table.attrs["columns"] = ("feature_id view u_raw v_raw kind "
+                                  "quality (kind: 0 manual, 1 auto)")
         f.create_dataset("obs_i", data=i)
         f.create_dataset("obs_j", data=j)
         f.create_dataset("residual_u", data=fit.residual_u)
@@ -105,8 +109,9 @@ def read_model_h5(path: str | Path) -> dict:
 
     with h5py.File(path, "r") as f:
         version = int(f.attrs.get("model_version", -1))
-        if version != MODEL_VERSION:
-            raise ValueError(f"model_version {version} is not {MODEL_VERSION}")
+        if version not in (1, MODEL_VERSION):
+            raise ValueError(
+                f"model_version {version} is not 1 or {MODEL_VERSION}")
         info = json.loads(f.attrs["model"])
         model = AxisModel(
             theta=f["theta_rad"][()],

@@ -211,7 +211,8 @@ def test_model_h5_round_trip(tmp_path):
     assert not out["mask"].features[2]
     assert out["mask"].features[0]
     assert len(out["labels"]) == len(labels)
-    assert out["labels"].to_table().tolist() == labels.to_table().tolist()
+    assert np.allclose(out["labels"].to_table(), labels.to_table(),
+                       equal_nan=True)
     assert out["provenance"]["chain"]["binning"] == 2
     assert out["diagnostics"]["center_split_px"] == pytest.approx(0.4)
     with h5py.File(path, "r") as f:

@@ -415,6 +415,117 @@ def test_slice_probe_convention():
     assert (n // 2 - 1) - r == pytest.approx(b_true, abs=1.0)
 
 
+def _blob_stack_window(qtbot, n_views=40, ny=72, nx=112):
+    """A tracker window whose stack contains one crisp blob on a known
+    sinusoid, crisp enough for the auto-tracker to follow."""
+    from tktomo.io import ProjectionData
+    from tktomo.tracking.coords import CoordinateChain
+
+    theta = np.linspace(0, np.pi, n_views)
+    truth_u = 25.0 * np.cos(theta) + 55.0
+    truth_v = np.full(n_views, 36.0)
+    rng = np.random.default_rng(0)
+    stack = np.empty((n_views, ny, nx), np.float32)
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    for j in range(n_views):
+        frame = 0.02 * rng.standard_normal((ny, nx))
+        frame += np.exp(-((yy - truth_v[j]) ** 2 + (xx - truth_u[j]) ** 2)
+                        / (2 * 2.5 ** 2))
+        stack[j] = frame
+    win = TrackModelWindow()
+    qtbot.addWidget(win)
+    win.auto_fit.setChecked(False)
+    win.advance_box.setValue(0)
+    win._show_data(ProjectionData(data=stack, angles=theta, metadata={}),
+                   CoordinateChain(), {"kind": "synthetic"})
+    return win, truth_u, truth_v
+
+
+def test_auto_complete_produces_hollow_reviewable_labels(qtbot):
+    win, truth_u, truth_v = _blob_stack_window(qtbot)
+    win._set_active(0)
+    for w in (5, 20, 35):
+        win._set_view(w)
+        win._place(truth_u[w], truth_v[w])
+    assert win._labels.manual_counts() == {0: 3}
+
+    win._auto_complete(False)
+    worker = win._autotrack_worker
+    assert worker is not None
+    with qtbot.waitSignal(worker.finished_tracks, timeout=120000):
+        pass
+    qtbot.wait(50)          # let the queued slot run
+
+    auto_views = [w for w in win._labels.views_of(0)
+                  if win._labels.kind_of(0, w) == 1]
+    assert len(auto_views) >= 20
+    # positions match the truth
+    errs = []
+    for w in auto_views:
+        u_raw, v_raw = win._labels.get(0, w)
+        errs.append(np.hypot(u_raw - truth_u[w], v_raw - truth_v[w]))
+    assert float(np.median(errs)) < 0.5
+    # manual labels untouched, qualities recorded
+    assert win._labels.kind_of(0, 20) == 0
+    assert win._labels.quality_of(0, auto_views[0]) > 0.3
+    assert "auto labels" in win.auto_status.text()
+
+    # clear-auto removes only the machine's work
+    n_before = len(win._labels)
+    win._clear_auto(False)
+    assert len(win._labels) == 3
+    assert n_before - 3 == len(auto_views)
+
+
+def test_auto_complete_requires_manual_seeds(qtbot):
+    win, truth_u, truth_v = _blob_stack_window(qtbot)
+    win._set_active(0)
+    win._set_view(5)
+    win._place(truth_u[5], truth_v[5])       # only ONE manual label
+    win._auto_complete(False)
+    assert win._autotrack_worker is None     # refused before submitting
+
+
+def test_auto_complete_refused_on_moving_crop(qtbot):
+    from tktomo.tracking.coords import CoordinateChain
+
+    win, truth_u, truth_v = _blob_stack_window(qtbot)
+    n = win._data.data.shape[0]
+    win._chain = CoordinateChain(binning=1,
+                                 view_origin=np.zeros((n, 2)))
+    win._set_active(0)
+    for w in (5, 20):
+        win._set_view(w)
+        win._place(truth_u[w], truth_v[w])
+    win._auto_complete(False)
+    assert win._autotrack_worker is None
+
+
+def test_auto_session_round_trip_preserves_kinds(qtbot, tmp_path,
+                                                 monkeypatch):
+    win, truth_u, truth_v = _blob_stack_window(qtbot)
+    win._set_active(0)
+    for w in (5, 20):
+        win._set_view(w)
+        win._place(truth_u[w], truth_v[w])
+    win._labels.set_auto(0, 12, 40.0, 36.0, 0.77)
+    win.auto_min_corr.setValue(0.45)
+
+    path = tmp_path / "session.h5"
+    monkeypatch.setattr(
+        "tktomo.ui.track_model_app.QFileDialog.getSaveFileName",
+        lambda *a, **k: (str(path), ""))
+    win._save_session()
+
+    from tktomo.tracking import sessionio
+    state = sessionio.load_session(path)
+    labels = state["labels"]
+    assert labels.kind_of(0, 12) == 1
+    assert labels.quality_of(0, 12) == 0.77
+    assert labels.kind_of(0, 5) == 0
+    assert state["ui"]["auto_min_corr"] == pytest.approx(0.45)
+
+
 def test_recon_binning_rescales_geometry(tracker):
     truth = truth_for(tracker)
     label_from_truth(tracker, truth)

@@ -17,7 +17,9 @@ import numpy as np
 from tktomo.tracking.labels import LabelStore
 from tktomo.tracking.model import AxisModel, FreeMask
 
-SESSION_VERSION = 1
+# version 2: label_table gained provenance columns (kind, quality);
+# version-1 files are still readable (LabelStore.from_table accepts both)
+SESSION_VERSION = 2
 
 
 def save_session(path: str | Path, *, labels: LabelStore,
@@ -57,9 +59,9 @@ def load_session(path: str | Path) -> dict:
 
     with h5py.File(path, "r") as f:
         version = int(f.attrs.get("session_version", -1))
-        if version != SESSION_VERSION:
+        if version not in (1, SESSION_VERSION):
             raise ValueError(
-                f"session_version {version} is not {SESSION_VERSION}")
+                f"session_version {version} is not 1 or {SESSION_VERSION}")
         out = {
             "labels": LabelStore.from_table(f["label_table"][()]),
             "source": json.loads(f.attrs["source"]),

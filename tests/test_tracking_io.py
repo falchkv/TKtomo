@@ -48,6 +48,56 @@ def test_label_store_basics():
     assert len(store) == 0
 
 
+def test_label_store_provenance():
+    store = LabelStore()
+    store.set(1, 5, 10.0, 20.0)                       # manual
+    assert store.set_auto(1, 6, 11.0, 21.0, 0.8)      # auto next view
+    assert not store.set_auto(1, 5, 99.0, 99.0, 0.9)  # refuses over manual
+    assert store.get(1, 5) == (10.0, 20.0)
+    assert store.kind_of(1, 5) == 0
+    assert store.kind_of(1, 6) == 1
+    assert store.quality_of(1, 6) == 0.8
+    assert np.isnan(store.quality_of(1, 5))
+
+    store.set(1, 6, 12.0, 22.0)                       # manual click wins
+    assert store.kind_of(1, 6) == 0
+
+    assert store.set_auto(1, 7, 13.0, 23.0, 0.5)
+    assert store.set_auto(2, 7, 14.0, 24.0, 0.6)
+    assert store.manual_views_of(1) == [5, 6]
+    assert store.manual_counts() == {1: 2}
+    full = store.in_view_full(7)
+    assert full[0][:4] == (1, 13.0, 23.0, 1)
+
+    # both kinds enter the fit arrays
+    _u, _v, valid, ids = store.to_arrays(10)
+    assert valid.sum() == 4
+
+    assert store.clear_auto(2) == 1
+    assert store.clear_auto() == 1                    # feature 1's view 7
+    assert store.manual_counts() == store.counts()
+
+
+def test_label_table_v2_and_legacy_v1_read():
+    store = LabelStore()
+    store.set(3, 1, 100.0, 50.0)
+    store.set_auto(3, 2, 101.0, 51.0, 0.72)
+    table = store.to_table()
+    assert table.shape == (2, 6)
+    restored = LabelStore.from_table(table)
+    assert restored.kind_of(3, 1) == 0
+    assert restored.kind_of(3, 2) == 1
+    assert restored.quality_of(3, 2) == 0.72
+
+    legacy = np.array([[5.0, 0.0, 10.0, 20.0], [5.0, 3.0, 30.0, 40.0]])
+    old = LabelStore.from_table(legacy)
+    assert len(old) == 2
+    assert old.kind_of(5, 0) == 0
+    assert np.isnan(old.quality_of(5, 3))
+    with pytest.raises(ValueError):
+        LabelStore.from_table(np.zeros((2, 5)))
+
+
 def test_label_store_arrays_and_table():
     store = LabelStore()
     store.set(5, 0, 10.0, 20.0)
@@ -65,7 +115,7 @@ def test_label_store_arrays_and_table():
 
     table = store.to_table()
     restored = LabelStore.from_table(table)
-    assert restored.to_table().tolist() == table.tolist()
+    assert np.allclose(restored.to_table(), table, equal_nan=True)
 
 
 def test_interpolate_track_sinusoid_recovery():

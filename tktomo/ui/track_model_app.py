@@ -156,6 +156,79 @@ class ReconWorker(QThread):
                 self.failed.emit(str(exc))
 
 
+class AutoTrackWorker(QThread):
+    """Runs seeded track completion off the GUI thread, one batch at a time.
+
+    Same single-flight contract as ReconWorker: `submit` overwrites the
+    pending job, `run()` loops until none is left, results leave only via
+    signals. The 540 MB stack is NOT copied (read-only numpy access from
+    this one thread); the highpassed copy is cached per (stack, sigma) so
+    repeated runs skip the ~7 s preprocessing.
+    """
+
+    progress = Signal(int, int, object)     # done, total, fid (None = highpass)
+    finished_tracks = Signal(object)        # [(fid, TrackResult)]
+    failed = Signal(str)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._job = None
+        self._cancelled = False
+        self._hp_cache: dict = {}
+
+    def submit(self, frames, theta, jobs, hp_sigma) -> None:
+        self._cancelled = False
+        self._job = (frames, np.asarray(theta, float), list(jobs),
+                     float(hp_sigma))
+        if not self.isRunning():
+            self.start()
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self):  # noqa: N802
+        while self._job is not None:
+            frames, theta, jobs, hp_sigma = self._job
+            self._job = None
+            try:
+                from tktomo.tracking.autotrack import (  # noqa: PLC0415
+                    complete_track,
+                    highpass2d,
+                )
+
+                key = (id(frames), hp_sigma)
+                if key not in self._hp_cache:
+                    self._hp_cache.clear()      # at most one stack cached
+                    n = len(frames)
+                    hp = []
+                    for k in range(n):
+                        if self._cancelled:
+                            break
+                        hp.append(highpass2d(frames[k], hp_sigma))
+                        if k % 10 == 0:
+                            self.progress.emit(k + 1, n, None)
+                    else:
+                        self._hp_cache[key] = hp
+                if self._cancelled or key not in self._hp_cache:
+                    self.finished_tracks.emit([])
+                    continue
+                hp = self._hp_cache[key]
+                out = []
+                for idx, (fid, seeds, params) in enumerate(jobs):
+                    self.progress.emit(idx, len(jobs), fid)
+                    result = complete_track(
+                        hp, theta, seeds, params,
+                        cancelled=lambda: self._cancelled)
+                    if result.cancelled:
+                        self.finished_tracks.emit([])
+                        break
+                    out.append((fid, result))
+                else:
+                    self.finished_tracks.emit(out)
+            except Exception as exc:  # noqa: BLE001 - report, don't crash
+                self.failed.emit(str(exc))
+
+
 class TrackModelWindow(QMainWindow):
     def __init__(self, path: str | None = None) -> None:
         super().__init__()
@@ -186,6 +259,7 @@ class TrackModelWindow(QMainWindow):
         self._recon_timer.setInterval(500)
         self._recon_timer.timeout.connect(self._request_recon)
         self._recon_worker: ReconWorker | None = None
+        self._autotrack_worker: AutoTrackWorker | None = None
 
         self.viewer = MarkableStackView()
         self.viewer.placeRequested.connect(self._place)
@@ -425,6 +499,67 @@ class TrackModelWindow(QMainWindow):
         self.ghost_box.toggled.connect(lambda _c: self._refresh_view())
         feat_layout.addWidget(self.ghost_box)
         layout.addWidget(feat_box)
+
+        auto_box = QGroupBox("Auto-track (manual labels are the anchors)")
+        auto_layout = QVBoxLayout(auto_box)
+        run_row = QHBoxLayout()
+        self.auto_feature_btn = QPushButton("Auto-complete feature")
+        self.auto_feature_btn.clicked.connect(
+            lambda: self._auto_complete(False))
+        self.auto_all_btn = QPushButton("Auto-complete all")
+        self.auto_all_btn.clicked.connect(lambda: self._auto_complete(True))
+        self.auto_all_btn.setToolTip(
+            "Every feature with at least 2 manual labels. Templates are "
+            "cut at your clicks and matched outward until the correlation "
+            "drops; tracks STOP honestly instead of wandering.")
+        run_row.addWidget(self.auto_feature_btn)
+        run_row.addWidget(self.auto_all_btn)
+        auto_layout.addLayout(run_row)
+        param_row = QHBoxLayout()
+        self.auto_min_corr = QDoubleSpinBox()
+        self.auto_min_corr.setRange(0.05, 0.95)
+        self.auto_min_corr.setSingleStep(0.05)
+        self.auto_min_corr.setValue(0.30)
+        self.auto_min_corr.setToolTip(
+            "Matches below this correlation end the track. The template "
+            "genuinely stops resembling the image ~10-20 views from a "
+            "seed (measured 0.65 at 1 view, 0.23 at 10), so more manual "
+            "labels = longer reach.")
+        self.auto_radius = QDoubleSpinBox()
+        self.auto_radius.setRange(2.0, 50.0)
+        self.auto_radius.setValue(8.0)
+        self.auto_radius.setSuffix(" px")
+        self.auto_radius.setToolTip(
+            "Search radius around the predicted position (grows slowly "
+            "with distance from the seed).")
+        self.auto_fb = QCheckBox("fwd-back")
+        self.auto_fb.setChecked(True)
+        self.auto_fb.setToolTip(
+            "Track every accepted match BACK to its seed and reject it "
+            "if the round trip misses or correlates poorly. Cheap, only "
+            "ever removes labels.")
+        param_row.addWidget(QLabel("min corr"))
+        param_row.addWidget(self.auto_min_corr)
+        param_row.addWidget(QLabel("search"))
+        param_row.addWidget(self.auto_radius)
+        param_row.addWidget(self.auto_fb)
+        auto_layout.addLayout(param_row)
+        clear_row = QHBoxLayout()
+        clear_feat = QPushButton("Clear auto: feature")
+        clear_feat.clicked.connect(lambda: self._clear_auto(False))
+        clear_all = QPushButton("Clear auto: all")
+        clear_all.clicked.connect(lambda: self._clear_auto(True))
+        self.auto_cancel_btn = QPushButton("Cancel")
+        self.auto_cancel_btn.setEnabled(False)
+        self.auto_cancel_btn.clicked.connect(self._cancel_autotrack)
+        clear_row.addWidget(clear_feat)
+        clear_row.addWidget(clear_all)
+        clear_row.addWidget(self.auto_cancel_btn)
+        auto_layout.addLayout(clear_row)
+        self.auto_status = QLabel("")
+        self.auto_status.setWordWrap(True)
+        auto_layout.addWidget(self.auto_status)
+        layout.addWidget(auto_box)
 
         model_box = QGroupBox("Model (check = fixed at the shown value)")
         self._model_form = QFormLayout(model_box)
@@ -739,6 +874,119 @@ class TrackModelWindow(QMainWindow):
             f"(u {self._fit.residual_u[k]:+.2f}, "
             f"v {self._fit.residual_v[k]:+.2f})", 8000)
 
+    # ---------------------------------------------------------- auto-track
+
+    def _auto_complete(self, all_features: bool) -> None:
+        from tktomo.tracking.autotrack import (  # noqa: PLC0415
+            AutoTrackParams,
+            patch_size,
+        )
+
+        if self._data is None:
+            return
+        if self._chain.view_origin is not None:
+            self.statusBar().showMessage(
+                "auto-complete does not support per-view-cropped stacks "
+                "(the crop already follows the feature)", 6000)
+            return
+        manual = self._labels.manual_counts()
+        fids = (sorted(f for f, n in manual.items() if n >= 2)
+                if all_features else
+                [self._active] if manual.get(self._active, 0) >= 2 else [])
+        if not fids:
+            self.statusBar().showMessage(
+                "auto-complete needs at least 2 MANUAL labels on the "
+                "feature (they are the template anchors)", 6000)
+            return
+
+        jobs = []
+        for fid in fids:
+            seeds = []
+            for w in self._labels.manual_views_of(fid):
+                u_raw, v_raw = self._labels.get(fid, w)
+                u, v = self._chain.from_parent(u_raw, v_raw)
+                seeds.append((w, float(u), float(v)))
+            params = AutoTrackParams(
+                patch=patch_size(self._feature_sizes.get(fid, 10.0)),
+                search_radius=float(self.auto_radius.value()),
+                min_corr=float(self.auto_min_corr.value()),
+                fb_check=self.auto_fb.isChecked())
+            jobs.append((fid, seeds, params))
+
+        if self._autotrack_worker is None:
+            self._autotrack_worker = AutoTrackWorker(self)
+            self._autotrack_worker.finished_tracks.connect(
+                self._autotrack_finished)
+            self._autotrack_worker.progress.connect(self._autotrack_progress)
+            self._autotrack_worker.failed.connect(
+                lambda msg: (self._autotrack_done_ui(),
+                             self.auto_status.setText(f"failed: {msg}")))
+        for btn in (self.auto_feature_btn, self.auto_all_btn):
+            btn.setEnabled(False)
+        self.auto_cancel_btn.setEnabled(True)
+        self.auto_status.setText("preparing…")
+        self._autotrack_worker.submit(self._data.data, self._data.angles,
+                                      jobs, hp_sigma=12.0)
+
+    def _autotrack_progress(self, done: int, total: int, fid) -> None:
+        if fid is None:
+            self.auto_status.setText(f"high-pass filtering {done}/{total}…")
+        else:
+            self.auto_status.setText(
+                f"tracking feature {fid} ({done + 1}/{total})…")
+
+    def _autotrack_done_ui(self) -> None:
+        for btn in (self.auto_feature_btn, self.auto_all_btn):
+            btn.setEnabled(True)
+        self.auto_cancel_btn.setEnabled(False)
+
+    def _autotrack_finished(self, results) -> None:
+        self._autotrack_done_ui()
+        if not results:
+            self.auto_status.setText("cancelled, nothing applied")
+            return
+        lines = []
+        for fid, res in results:
+            self._labels.clear_auto(fid)
+            added = 0
+            for al in res.labels:
+                u_raw, v_raw = self._chain.to_parent(al.u, al.v)
+                if self._labels.set_auto(fid, al.view, float(u_raw),
+                                         float(v_raw), al.quality):
+                    added += 1
+            qualities = [al.quality for al in res.labels]
+            line = (f"feature {fid}: +{added} auto labels"
+                    + (f", median corr "
+                       f"{float(np.median(qualities)):.2f}"
+                       if qualities else ""))
+            refusals = [w for w in res.warnings if "refused" in w
+                        or "not trackable" in w]
+            if refusals:
+                line += f" ({len(refusals)} seed(s) refused)"
+            lines.append(line)
+            for w in res.warnings:
+                lines.append(f"  {w}")
+        self.auto_status.setText("\n".join(lines))
+        self._refresh_view()
+        self._refresh_plots()
+        self._request_fit()
+
+    def _cancel_autotrack(self) -> None:
+        if self._autotrack_worker is not None:
+            self._autotrack_worker.cancel()
+
+    def _clear_auto(self, all_features: bool) -> None:
+        n = self._labels.clear_auto(None if all_features else self._active)
+        self.auto_status.setText(
+            f"removed {n} auto label(s)"
+            + ("" if all_features else f" of feature {self._active}"))
+        if n:
+            self._refresh_view()
+            self._refresh_plots()
+            self._request_fit()
+
+    # ------------------------------------------------------------- fitting
+
     def _request_fit(self) -> None:
         if self.auto_fit.isChecked():
             self._fit_timer.start()
@@ -883,9 +1131,9 @@ class TrackModelWindow(QMainWindow):
         sizes = {fid: self._feature_sizes.get(fid, 10.0)
                  for fid in self._labels.feature_ids()}
         marks = []
-        for fid, u_raw, v_raw in self._labels.in_view(view):
+        for fid, u_raw, v_raw, kind, _q in self._labels.in_view_full(view):
             u, v = self._chain.from_parent(u_raw, v_raw, view=view)
-            marks.append((fid, float(u), float(v)))
+            marks.append((fid, float(u), float(v), kind))
         self.viewer.show_labels(marks, active_id=self._active, sizes=sizes)
 
         ghosts = []
@@ -1380,6 +1628,9 @@ class TrackModelWindow(QMainWindow):
             "feature_sizes": {str(k): float(size)
                               for k, size in self._feature_sizes.items()},
             "ghosts": self.ghost_box.isChecked(),
+            "auto_min_corr": self.auto_min_corr.value(),
+            "auto_search_radius": self.auto_radius.value(),
+            "auto_fb_check": self.auto_fb.isChecked(),
         }
 
     def _save_session(self) -> None:
@@ -1423,6 +1674,9 @@ class TrackModelWindow(QMainWindow):
         self._feature_sizes = {int(k): float(size) for k, size in
                                ui.get("feature_sizes", {}).items()}
         self.ghost_box.setChecked(bool(ui.get("ghosts", False)))
+        self.auto_min_corr.setValue(float(ui.get("auto_min_corr", 0.30)))
+        self.auto_radius.setValue(float(ui.get("auto_search_radius", 8.0)))
+        self.auto_fb.setChecked(bool(ui.get("auto_fb_check", True)))
         self.advance_box.setValue(int(ui.get("advance", 5)))
         degrees = ui.get("degrees", [0, 0, 0])
         self.deg_c.setValue(int(degrees[0]))
