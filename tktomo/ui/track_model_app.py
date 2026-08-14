@@ -35,6 +35,7 @@ import pyqtgraph as pg
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -259,11 +260,21 @@ class TrackModelWindow(QMainWindow):
         self.live_recon.setChecked(False)
         self.slice_row = QSpinBox()
         self.slice_row.valueChanged.connect(self._recon_maybe)
+        self.recon_bin = QComboBox()
+        self.recon_bin.addItems(["1", "2", "4", "8"])
+        self.recon_bin.setToolTip(
+            "Extra binning applied to the slab before reconstruction. "
+            "Cost falls roughly as bin^3 (fewer pixels AND fewer rows per "
+            "pixel), so 2 is much more than twice as fast; use it for "
+            "live evaluation and go back to 1 for the final look.")
+        self.recon_bin.currentTextChanged.connect(self._recon_maybe)
         recon_btn = QPushButton("Reconstruct now")
         recon_btn.clicked.connect(self._request_recon)
         controls.addWidget(self.live_recon)
         controls.addWidget(QLabel("detector row:"))
         controls.addWidget(self.slice_row)
+        controls.addWidget(QLabel("bin:"))
+        controls.addWidget(self.recon_bin)
         controls.addWidget(recon_btn)
         controls.addStretch(1)
         layout.addLayout(controls)
@@ -910,6 +921,7 @@ class TrackModelWindow(QMainWindow):
         self.view3d.setCameraPosition(distance=600)
         self._gl_grid = gl.GLGridItem()
         self._gl_grid.scale(20, 20, 1)
+        self._gl_centered = False
         self.view3d.addItem(self._gl_grid)
         self._gl_axis = gl.GLLinePlotItem(width=2, antialias=True)
         self.view3d.addItem(self._gl_axis)
@@ -928,6 +940,23 @@ class TrackModelWindow(QMainWindow):
         gl = self._gl
         model = self._fit.model
         i, j = self._fit.obs
+
+        # The horizontal grid plane sits at the stack's CENTER ROW (in raw
+        # coordinates, like everything in the scene), so height reads
+        # relative to the middle of the field of view instead of raw zero,
+        # which for a cropped stack is nowhere near the data.
+        if self._data is not None:
+            center_row = (self._data.data.shape[1] - 1) / 2.0
+            view = self._view if self._chain.view_origin is not None else None
+            _, v_center = self._chain.to_parent(0.0, center_row, view=view)
+            z_grid = -float(v_center)
+            self._gl_grid.resetTransform()
+            self._gl_grid.scale(20, 20, 1)
+            self._gl_grid.translate(0, 0, z_grid)
+            if not self._gl_centered:
+                self._gl_centered = True
+                self.view3d.opts["center"] = pg.Vector(0, 0, z_grid)
+                self.view3d.update()
         counts = self._labels.counts()
         keep = np.array([counts.get(int(f), 0) > 0
                          for f in model.feature_ids], bool)
@@ -1022,9 +1051,25 @@ class TrackModelWindow(QMainWindow):
         hi = min(n_rows, row + margin + 1)
         slab = data.data[:, lo:hi, :]
         center = float(self._chain.from_parent(c_ref, 0.0)[0])
-        self.recon_status.setText(f"reconstructing row {row}…")
+        row_in_slab = row - lo
+        extra_bin = int(self.recon_bin.currentText())
+        if extra_bin > 1:
+            # bin BEFORE warping: isotropic mean-pooling preserves the
+            # rotation angle, and shifts/center rescale by the pixel-center
+            # rule. The slice lands within half a binned pixel of the
+            # requested row, which is what a speed preview is for.
+            from tktomo.ptycho_align.core.preprocess import (  # noqa: PLC0415
+                bin_stack,
+            )
+            slab = bin_stack(np.asarray(slab, np.float32), extra_bin)
+            sy = sy / extra_bin
+            sx = sx / extra_bin
+            center = (center - (extra_bin - 1) / 2.0) / extra_bin
+            row_in_slab = min(row_in_slab // extra_bin, slab.shape[1] - 1)
+        self.recon_status.setText(
+            f"reconstructing row {row} (bin {extra_bin})…")
         self._recon_worker.submit(slab, data.angles, sy, sx, rot_deg,
-                                  center, row - lo)
+                                  center, row_in_slab)
 
     def _show_slice(self, image) -> None:
         self.recon_status.setText("")

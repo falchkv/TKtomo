@@ -229,6 +229,8 @@ def test_recon_slice_responds_to_alpha(tracker, monkeypatch):
 
         def submit(self, slab, theta, sy, sx, rot_deg, center, row_in_slab):
             jobs.append({"slab_rows": slab.shape[1],
+                         "slab_width": slab.shape[2],
+                         "sx": np.array(sx), "center": center,
                          "rot": np.array(rot_deg),
                          "row_in_slab": row_in_slab})
 
@@ -252,6 +254,54 @@ def test_recon_slice_responds_to_alpha(tracker, monkeypatch):
 class _StubSignal:
     def connect(self, *_a):
         pass
+
+
+def test_recon_binning_rescales_geometry(tracker):
+    truth = truth_for(tracker)
+    label_from_truth(tracker, truth)
+    tracker._fit_now()
+
+    jobs = []
+
+    class StubWorker:
+        finished_slice = _StubSignal()
+        failed = _StubSignal()
+
+        def submit(self, slab, theta, sy, sx, rot_deg, center, row_in_slab):
+            jobs.append({"width": slab.shape[2], "sx": np.array(sx),
+                         "sy": np.array(sy), "center": center,
+                         "row_in_slab": row_in_slab,
+                         "rot": np.array(rot_deg)})
+
+    tracker._recon_worker = StubWorker()
+    tracker.recon_bin.setCurrentText("1")
+    tracker._request_recon()
+    tracker.recon_bin.setCurrentText("2")
+    tracker._request_recon()
+
+    full, binned = jobs
+    assert binned["width"] == full["width"] // 2
+    assert np.allclose(binned["sx"], full["sx"] / 2)
+    assert np.allclose(binned["sy"], full["sy"] / 2)
+    # pixel-center rule: c_b = (c - (b-1)/2) / b
+    assert binned["center"] == pytest.approx((full["center"] - 0.5) / 2)
+    assert np.allclose(binned["rot"], full["rot"])   # angles are invariant
+    assert binned["row_in_slab"] <= full["row_in_slab"] // 2 + 1
+
+
+def test_3d_grid_sits_at_center_row(tracker):
+    truth = truth_for(tracker)
+    label_from_truth(tracker, truth)
+    tracker._fit_now()
+    tracker._build_3d_once()
+    if tracker._gl is None:
+        pytest.skip("no OpenGL in this environment")
+    tracker._refresh_3d()
+    from PySide6.QtGui import QVector3D
+    z = tracker._gl_grid.transform().map(QVector3D(0, 0, 0)).z()
+    # identity chain: grid at the stack's center row, scene z negated
+    center_row = (tracker._data.data.shape[1] - 1) / 2.0
+    assert z == pytest.approx(-center_row)
 
 
 def test_tracker_recon_single_flight(tracker, qtbot):
