@@ -256,6 +256,37 @@ class _StubSignal:
         pass
 
 
+def test_fit_ignores_checkbox_history_when_free(qtbot):
+    """With dx/dy FREE at fit time, the result must not depend on what the
+    checkboxes were during labeling: free columns are solved fresh, stored
+    values only matter for fixed parameters."""
+    results = []
+    for tick_during_labeling in (True, False):
+        win = TrackModelWindow()
+        qtbot.addWidget(win)
+        win.auto_fit.setChecked(False)
+        win.advance_box.setValue(0)
+        win.free_dx.setChecked(tick_during_labeling)
+        win.free_dy.setChecked(tick_during_labeling)
+        truth = truth_for(win)
+        u_t, v_t = truth.predict()
+        for f in range(4):
+            win._set_active(f)
+            for view in range(0, 60, 4):
+                win._set_view(view)
+                win._place(u_t[f, view], v_t[f, view])
+                win._fit_now()          # fits happen along the way
+        win.free_dx.setChecked(True)    # both free for the FINAL fit
+        win.free_dy.setChecked(True)
+        win._fit_now()
+        results.append(win._fit.model)
+    a, b = results
+    assert np.allclose(a.c_coef, b.c_coef, atol=1e-9)
+    assert np.allclose(a.dx, b.dx, atol=1e-9)
+    assert np.allclose(a.dy, b.dy, atol=1e-9)
+    assert np.allclose(a.a, b.a, atol=1e-9)
+
+
 def test_recon_binning_rescales_geometry(tracker):
     truth = truth_for(tracker)
     label_from_truth(tracker, truth)

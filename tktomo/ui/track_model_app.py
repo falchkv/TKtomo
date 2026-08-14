@@ -392,6 +392,17 @@ class TrackModelWindow(QMainWindow):
         shift_holder = QWidget()
         shift_holder.setLayout(shift_row)
         self._model_form.addRow("Per-view shifts:", shift_holder)
+        # Frozen shifts are invisible state that changes what a fit means;
+        # this line keeps them visible so "why does my fit depend on
+        # earlier clicking" has an on-screen answer.
+        self.shift_state_label = QLabel("dx: zero   dy: zero")
+        self.shift_state_label.setToolTip(
+            "Current content of the per-view shifts. 'free' is refitted "
+            "from the labels every fit (history cannot matter); 'FROZEN' "
+            "is held at the shown rms, which is whatever the last free "
+            "fit left, so the fit DOES depend on that history until you "
+            "press Zero.")
+        self._model_form.addRow("", self.shift_state_label)
         self.huber = QDoubleSpinBox()
         self.huber.setRange(0.5, 20.0)
         self.huber.setValue(3.0)
@@ -645,6 +656,7 @@ class TrackModelWindow(QMainWindow):
 
     def _after_evaluate(self) -> None:
         fit = self._fit
+        self._update_shift_state_label()
         self._refresh_feature_table()
         self._refresh_plots()
         self._refresh_view()
@@ -663,6 +675,23 @@ class TrackModelWindow(QMainWindow):
                                        if warn_lines else "no warnings")
         if self.live_recon.isChecked():
             self._recon_timer.start()
+
+    def _update_shift_state_label(self) -> None:
+        if self._model is None:
+            return
+        parts = []
+        for name, values, free in (
+                ("dx", self._model.dx, self.free_dx.isChecked()),
+                ("dy", self._model.dy, self.free_dy.isChecked())):
+            rms = float(np.sqrt(np.mean(values ** 2)))
+            if free:
+                state = f"free, fitted rms {rms:.2f} px"
+            elif rms == 0.0:
+                state = "fixed at zero"
+            else:
+                state = f"FROZEN at rms {rms:.2f} px"
+            parts.append(f"{name}: {state}")
+        self.shift_state_label.setText("   ".join(parts))
 
     def _run_diagnostics(self) -> None:
         if self._fit is None or self._data is None:
