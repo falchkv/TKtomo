@@ -25,8 +25,10 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QLabel,
@@ -68,9 +70,30 @@ class MarkableStackView(StackDisplay):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent=parent)
         self._mouse: tuple[float, float] | None = None
+        self._raw_image: np.ndarray | None = None
         # tracking views step through hundreds of frames; per-frame robust
         # levels beat a histogram frozen on whatever frame came first
         self.auto_levels_box.setChecked(True)
+
+        # Display-only high-pass: small features ride on a smooth phase
+        # background orders of magnitude larger, and subtracting a Gaussian
+        # blur is what makes them visible at all. Labels and coordinates
+        # are untouched; only the pixels shown change.
+        self.highpass_box = QCheckBox("High-pass")
+        self.highpass_sigma = QDoubleSpinBox()
+        self.highpass_sigma.setRange(0.5, 200.0)
+        self.highpass_sigma.setValue(8.0)
+        self.highpass_sigma.setSingleStep(1.0)
+        self.highpass_sigma.setSuffix(" px")
+        self.highpass_sigma.setToolTip(
+            "sigma of the subtracted Gaussian blur; features larger than "
+            "a few sigma fade out")
+        self.highpass_box.toggled.connect(self._redisplay)
+        self.highpass_sigma.valueChanged.connect(self._redisplay)
+        stretch_at = self.controls_layout.count() - 1
+        self.controls_layout.insertWidget(stretch_at, self.highpass_box)
+        self.controls_layout.insertWidget(stretch_at + 1,
+                                          self.highpass_sigma)
 
         view = self.image_view.getView()
         self._label_scatter = pg.ScatterPlotItem(size=11, pxMode=True)
@@ -93,6 +116,21 @@ class MarkableStackView(StackDisplay):
         self.image_view.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.image_view.scene.sigMouseMoved.connect(self._on_mouse_moved)
         self.image_view.scene.sigMouseClicked.connect(self._on_mouse_clicked)
+
+    # -- display filtering ------------------------------------------------
+
+    def set_image(self, image, *, autorange: bool = False) -> None:
+        image = np.asarray(image, np.float32)
+        self._raw_image = image
+        if self.highpass_box.isChecked():
+            from scipy.ndimage import gaussian_filter  # noqa: PLC0415
+            image = image - gaussian_filter(
+                image, float(self.highpass_sigma.value()))
+        super().set_image(image, autorange=autorange)
+
+    def _redisplay(self) -> None:
+        if self._raw_image is not None:
+            self.set_image(self._raw_image)
 
     # -- pointer plumbing -------------------------------------------------
 

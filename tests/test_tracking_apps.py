@@ -267,6 +267,32 @@ def test_trajectory_overlay_excludes_per_view_jitter(tracker):
     assert y[0] == pytest.approx(v_pred[0, 0])
 
 
+def test_highpass_display_filter(tracker):
+    """High-pass is display-only: a small bump on a huge ramp becomes the
+    dominant feature on screen, and the stored pixels stay untouched."""
+    viewer = tracker.viewer
+    ramp = np.linspace(0, 1000, 128 * 128, dtype=np.float32
+                       ).reshape(128, 128)
+    ramp[60:64, 60:64] += 5.0                 # small feature, 0.5% of range
+    viewer.set_image(ramp)
+    shown_raw = viewer.image_view.getImageItem().image
+    assert shown_raw.max() > 900              # unfiltered: ramp dominates
+
+    viewer.highpass_sigma.setValue(6.0)
+    viewer.highpass_box.setChecked(True)      # triggers redisplay
+    shown = viewer.image_view.getImageItem().image
+    assert abs(float(np.median(shown))) < 1.0      # background removed
+    # away from the boundary halo (a high-pass classic) the bump dominates
+    interior = shown[20:-20, 20:-20]
+    peak = np.unravel_index(np.argmax(interior), interior.shape)
+    assert 38 <= peak[0] <= 46 and 38 <= peak[1] <= 46   # 60..64 - 20 + 2
+    assert viewer._raw_image.max() == pytest.approx(ramp.max())
+
+    viewer.highpass_box.setChecked(False)
+    shown_back = viewer.image_view.getImageItem().image
+    assert shown_back.max() > 900             # round trip restores the raw
+
+
 def test_colormap_combo_has_swatch_icons(tracker):
     combo = tracker.viewer.colormap_combo
     assert combo.count() > 0

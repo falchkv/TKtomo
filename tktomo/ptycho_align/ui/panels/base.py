@@ -69,7 +69,9 @@ class StackDisplay(QWidget):
         self.auto_levels_box = QCheckBox("Auto levels")
         self.auto_levels_box.toggled.connect(self._auto_levels_toggled)
 
-        top = QHBoxLayout()
+        # kept as an attribute so subclasses can add their own controls in
+        # front of the stretch (e.g. the tracking views' high-pass filter)
+        self.controls_layout = top = QHBoxLayout()
         top.addWidget(QLabel("Colormap:"))
         top.addWidget(self.colormap_combo)
         top.addWidget(self.auto_levels_box)
