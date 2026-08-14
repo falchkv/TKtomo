@@ -49,11 +49,18 @@ python -m tktomo.ui.tomogram_app
 python -m tktomo.ui.projection_app
 python -m tktomo.ui.alignment_app
 python -m tktomo.ui.feature_alignment_app   # align a pair of images by manual marks
+python -m tktomo.ui.feature_isolation_app   # hand-track one feature, export a moving crop
+python -m tktomo.ui.track_model_app         # fit a tomography model from manual labels
 ptycho-align [projections.h5]               # interactive reprojection alignment
 ```
 
 The feature-alignment method (labelled marks → least squares, unlabelled marks →
 RANSAC) is described in [`docs/feature_alignment.md`](docs/feature_alignment.md).
+The manual feature-tracking pair (`tktomo-feature-isolation`,
+`tktomo-track-model`: label features, fit rotation axis + tilt drift +
+per-view shifts, export shifts/ASTRA geometry/aligned stack) is documented in
+[`docs/feature_isolation.md`](docs/feature_isolation.md) and
+[`docs/track_model.md`](docs/track_model.md).
 
 ### `ptycho-align` — interactive reprojection alignment
 

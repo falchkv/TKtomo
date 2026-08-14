@@ -33,6 +33,9 @@ ui = [
     "colorcet>=3.0",
     "cmocean>=3.0",
     "cmasher>=1.6",
+    # for the track-model app's 3D view (pyqtgraph.opengl); the app degrades
+    # to a hint label without it, so it is a soft requirement at runtime
+    "PyOpenGL>=3.1",
 ]
 # Tomographic reconstruction / reprojection + alignment backends.
 # tomopy is best installed via conda-forge; listed here for completeness.
@@ -61,6 +64,8 @@ tktomo-tomogram = "tktomo.ui.tomogram_app:main"
 tktomo-projection = "tktomo.ui.projection_app:main"
 tktomo-alignment = "tktomo.ui.alignment_app:main"
 tktomo-feature-alignment = "tktomo.ui.feature_alignment_app:main"
+tktomo-feature-isolation = "tktomo.ui.feature_isolation_app:main"
+tktomo-track-model = "tktomo.ui.track_model_app:main"
 tktomo-blender-sim = "tktomo.blender_sim.cli:main"
 ptycho-align = "tktomo.ptycho_align.ui.main_window:main"
 # Serves an engine to a remote ptycho-align window. No GUI, so it installs and runs
