@@ -100,28 +100,40 @@ class ReconWorker(QThread):
         super().__init__(parent)
         self._job = None
 
-    def submit(self, slab, theta, sy, sx, center):
+    def submit(self, slab, theta, sy, sx, rot_deg, center, row_in_slab):
         self._job = (np.array(slab, np.float32), np.asarray(theta, float),
                      np.asarray(sy, float), np.asarray(sx, float),
-                     float(center))
+                     np.asarray(rot_deg, float), float(center),
+                     int(row_in_slab))
         if not self.isRunning():
             self.start()
 
     def run(self):  # noqa: N802
         while self._job is not None:
-            slab, theta, sy, sx, center = self._job
+            slab, theta, sy, sx, rot_deg, center, row_in_slab = self._job
             self._job = None
             try:
-                from scipy.ndimage import shift as nd_shift  # noqa: PLC0415
-
+                from tktomo.align.transform import (  # noqa: PLC0415
+                    Transform,
+                    apply_transform,
+                )
                 from tktomo.recon import get_backend  # noqa: PLC0415
 
+                # Full per-view 2D correction, same semantics as the
+                # aligned-stack export: shift AND derotation by the
+                # in-plane tilt alpha(theta), so the slice responds to the
+                # tilt parameters. (The rotation is about the slab center;
+                # versus the full-image center that is one constant
+                # vertical offset, identical for every view.) beta needs
+                # 3D geometry and stays out, as everywhere in 2D.
                 for k in range(slab.shape[0]):
-                    if sy[k] or sx[k]:
-                        slab[k] = nd_shift(slab[k], (sy[k], sx[k]), order=1,
-                                           mode="nearest")
-                mid = slab.shape[1] // 2
-                sino = slab[:, mid:mid + 1, :]
+                    t = Transform(dx=sx[k], dy=sy[k], rotation=rot_deg[k])
+                    if not t.is_identity():
+                        slab[k] = apply_transform(slab[k], t, order=1)
+                # the requested detector row's position inside the slab;
+                # NOT the slab middle, which drifts when the slab is
+                # clipped at the top or bottom of the stack
+                sino = slab[:, row_in_slab:row_in_slab + 1, :]
                 volume = get_backend("tomopy").reconstruct(
                     sino, theta, center=center, algorithm="gridrec")
                 self.finished_slice.emit(np.asarray(volume)[0])
@@ -994,18 +1006,25 @@ class TrackModelWindow(QMainWindow):
         n_rows = data.data.shape[1]
         self.slice_row.setMaximum(n_rows - 1)
         row = int(self.slice_row.value())
-        margin = 4
-        lo = max(0, row - margin)
-        hi = min(n_rows, row + margin + 1)
-        slab = data.data[:, lo:hi, :]
         model = self._model
-        c_of, _, _ = model.axis_curves()
+        c_of, alpha_of, _ = model.axis_curves()
         c_ref = model.center_at_mean_theta()
         sx = -self._chain.shift_from_parent(model.dx + (c_of - c_ref))
         sy = -self._chain.shift_from_parent(model.dy)
+        rot_deg = -np.rad2deg(alpha_of)
+        # the slab must be tall enough that shifting AND derotating still
+        # leaves the middle row valid: rotation moves rows by up to
+        # |alpha| * width/2 at the image edges
+        width = data.data.shape[2]
+        margin = 4 + int(np.ceil(np.abs(alpha_of).max() * width / 2.0
+                                 + np.abs(sy).max()))
+        lo = max(0, row - margin)
+        hi = min(n_rows, row + margin + 1)
+        slab = data.data[:, lo:hi, :]
         center = float(self._chain.from_parent(c_ref, 0.0)[0])
         self.recon_status.setText(f"reconstructing row {row}…")
-        self._recon_worker.submit(slab, data.angles, sy, sx, center)
+        self._recon_worker.submit(slab, data.angles, sy, sx, rot_deg,
+                                  center, row - lo)
 
     def _show_slice(self, image) -> None:
         self.recon_status.setText("")

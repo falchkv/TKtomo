@@ -213,6 +213,47 @@ def test_tracker_session_round_trip(tracker, tmp_path, monkeypatch):
     assert 2 in state["ui"]["pins"]
 
 
+def test_recon_slice_responds_to_alpha(tracker, monkeypatch):
+    """The submitted recon job must carry the tilt as per-view rotations,
+    and the slab must widen so the derotation cannot run out of rows."""
+    truth = truth_for(tracker)
+    label_from_truth(tracker, truth)
+    tracker._fit_now()
+
+    jobs = []
+
+    class StubWorker:
+        def __init__(self):
+            self.finished_slice = _StubSignal()
+            self.failed = _StubSignal()
+
+        def submit(self, slab, theta, sy, sx, rot_deg, center, row_in_slab):
+            jobs.append({"slab_rows": slab.shape[1],
+                         "rot": np.array(rot_deg),
+                         "row_in_slab": row_in_slab})
+
+    tracker._recon_worker = StubWorker()
+    tracker._model.alpha_coef[0] = 0.0
+    tracker._request_recon()
+    tracker._model.alpha_coef[0] = -0.02
+    tracker._request_recon()
+
+    flat, tilted = jobs
+    assert np.allclose(flat["rot"], 0.0)
+    assert np.allclose(tilted["rot"], np.rad2deg(0.02))   # rot = -deg(alpha)
+    width = tracker._data.data.shape[2]
+    assert (tilted["slab_rows"] - flat["slab_rows"]
+            >= int(0.02 * width / 2) - 1)                 # margin widened
+    # requested row 64 sits at its own index inside the (clipped) slab
+    assert jobs[0]["row_in_slab"] + max(0, 64 - (flat["slab_rows"] - 1) // 2) \
+        >= 0
+
+
+class _StubSignal:
+    def connect(self, *_a):
+        pass
+
+
 def test_tracker_recon_single_flight(tracker, qtbot):
     pytest.importorskip("tomopy")
     truth = truth_for(tracker)

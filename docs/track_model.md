@@ -85,8 +85,11 @@ are dots). Long dashed stretches mean: label some views there.
 
 ## Recon slice
 
-The Recon tab reconstructs one detector row with tomopy gridrec on
-shift-corrected projections at the fitted center. Off by default; the
+The Recon tab reconstructs one detector row with tomopy gridrec at the
+fitted center, after applying each view's full 2D correction: the dx/dy
+shifts, the c(theta) drift, and derotation by the in-plane tilt
+alpha(theta), so the slice responds to the tilt parameters. Only beta
+stays out (it needs 3D geometry, in 2D nothing can honor it). Off by default; the
 "Live" checkbox recomputes it (debounced) after every change. All
 reconstruction runs on a single worker thread with single-flight
 scheduling: tomopy segfaults when called from two threads at once, so a
