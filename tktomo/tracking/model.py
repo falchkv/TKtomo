@@ -233,8 +233,19 @@ class FitResult:
 # ---------------------------------------------------------------------------
 
 def _huber_weights(r: np.ndarray, k: float) -> np.ndarray:
-    """Huber weights on a MAD-scaled residual. Constant scale, no runaway."""
+    """Huber weights on a robustly-scaled residual. Constant scale, no runaway.
+
+    The scale is the MAD floored by percentile-90/2. The floor matters for
+    MANUAL labels: views holding a single label are fitted exactly by their
+    free dx/dy, so with staggered labeling a majority of residuals are
+    exactly zero, the MAD collapses, and every remaining genuine label
+    would be vetoed as an "outlier". The p90 floor keeps the scale at the
+    real spread in that regime while barely moving it for well-behaved
+    residuals (p90/2 ~ 0.8 sigma for a normal distribution), so a few
+    true mis-clicks are still downweighted hard.
+    """
     s = 1.4826 * np.median(np.abs(r - np.median(r)))
+    s = max(s, float(np.percentile(np.abs(r), 90.0)) / 2.0)
     if not np.isfinite(s) or s <= 0:
         return np.ones_like(r)
     a = np.abs(r) / (k * s)
@@ -407,6 +418,20 @@ def _structural_warnings(model: AxisModel, mask: FreeMask,
         out.append(
             f"W4: {thin} view(s) carry exactly one label. Their dx/dy fit "
             f"that label exactly and mean nothing on their own.")
+    # A free per-view shift eats the observation of any view it alone
+    # explains. When MOST observations sit in single-label views, the
+    # geometry (a, b, c, tilts) is left nearly unconstrained and the
+    # fitted track can sit far from every marker while the residual is
+    # still tiny. This is the staggered-labeling trap.
+    n_obs_total = int(labels_per_view.sum())
+    n_obs_single = int(labels_per_view[labels_per_view == 1].sum())
+    if (mask.dx or mask.dy) and n_obs_total \
+            and n_obs_single / n_obs_total > 0.5:
+        out.append(
+            f"W6: {n_obs_single} of {n_obs_total} labels are the ONLY "
+            f"label in their view, so free dx/dy absorb them and the "
+            f"track geometry is mostly unconstrained. Label several "
+            f"features in the SAME views (or fix dx/dy) to pin it down.")
     return out
 
 

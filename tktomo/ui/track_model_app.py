@@ -329,10 +329,38 @@ class TrackModelWindow(QMainWindow):
         self.free_dx.setChecked(True)
         self.free_dy = QCheckBox("dy free")
         self.free_dy.setChecked(True)
+        self.free_dx.setToolTip(
+            "dx: one HORIZONTAL displacement of the whole projection per "
+            "view, the per-view alignment error the model corrects.\n"
+            "Checked: the fit adjusts dx for every labeled view "
+            "(unlabeled views are interpolated).\n"
+            "Unchecked: dx is frozen at its current values (whatever the "
+            "last fit or Zero dx left), and the axis polynomial plus "
+            "feature positions must explain the labels alone.\n"
+            "Beware: a free dx exactly absorbs any view that carries only "
+            "one label, so label several features in the SAME views or "
+            "the track geometry is unconstrained (warning W6).")
+        self.free_dy.setToolTip(
+            "dy: one VERTICAL displacement of the whole projection per "
+            "view.\nChecked: fitted per labeled view (interpolated where "
+            "unlabeled).\nUnchecked: frozen at the current values; height "
+            "y and tilts must explain the labels alone.\n"
+            "Single-label views are absorbed exactly by a free dy, same "
+            "caveat as dx.")
         zero_dx = QPushButton("Zero dx")
         zero_dx.clicked.connect(lambda: self._zero_shift("dx"))
         zero_dy = QPushButton("Zero dy")
         zero_dy.clicked.connect(lambda: self._zero_shift("dy"))
+        zero_dx.setToolTip(
+            "Set every per-view horizontal shift to zero, i.e. assert the "
+            "projections are already horizontally aligned. Residuals "
+            "update immediately; combine with an UNCHECKED 'dx free' to "
+            "keep it that way through the next fit, otherwise the fit "
+            "writes new values.")
+        zero_dy.setToolTip(
+            "Set every per-view vertical shift to zero (projections "
+            "assumed vertically aligned). Combine with an unchecked "
+            "'dy free' to keep zeros through the next fit.")
         shift_row = QHBoxLayout()
         for w in (self.free_dx, zero_dx, self.free_dy, zero_dy):
             shift_row.addWidget(w)
@@ -686,22 +714,21 @@ class TrackModelWindow(QMainWindow):
             row = list(self._model.feature_ids).index(self._active) \
                 if self._active in self._model.feature_ids else None
             if row is not None and self._chain.view_origin is None:
-                # The trajectory overlay shows the SMOOTH model track: the
-                # per-view dx/dy are alignment errors of OTHER views and
-                # have no place in a curve drawn inside THIS view's frame.
-                # With them included the track zigzags (worst where single-
-                # label views let dx fit one point exactly, warning W4)
-                # even though the 3D geometry is a clean circle. Anchored
-                # with the current view's own shift so the curve passes
-                # through this view's predicted marker.
+                # The trajectory overlay is the model track WITHOUT any
+                # per-view shift: the feature's path in the ideal aligned
+                # frame. The per-view dx/dy are alignment errors of
+                # individual views; including them made the curve zigzag,
+                # and anchoring with the current view's shift made the
+                # whole curve jump with that one view's noise. Drawn this
+                # way the curve is stable, and the gap between a marker
+                # and the curve IS that view's misalignment.
                 m = self._model
                 ct, sn = np.cos(m.theta), np.sin(m.theta)
                 s_row = m.a[row] * ct + m.b[row] * sn
                 t_row = -m.a[row] * sn + m.b[row] * ct
                 c_of, alpha_of, beta_of = m.axis_curves()
-                u_tr = s_row + c_of + m.dx[view]
-                v_tr = (m.y[row] + alpha_of * s_row + beta_of * t_row
-                        + m.dy[view])
+                u_tr = s_row + c_of
+                v_tr = m.y[row] + alpha_of * s_row + beta_of * t_row
                 u_all, v_all = self._chain.from_parent(u_tr, v_tr)
                 self.viewer.show_trajectory(u_all, v_all)
             else:

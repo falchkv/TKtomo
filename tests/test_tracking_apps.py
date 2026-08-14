@@ -261,10 +261,14 @@ def test_trajectory_overlay_excludes_per_view_jitter(tracker):
     # the smooth sinusoid's are far below 1
     assert np.abs(np.diff(x, 2)).max() < 1.0
     assert np.abs(np.diff(y, 2)).max() < 1.0
-    # anchored: the curve passes through this view's predicted marker
-    u_pred, v_pred = m.predict()
-    assert x[0] == pytest.approx(u_pred[0, 0])
-    assert y[0] == pytest.approx(v_pred[0, 0])
+    # the curve is the shift-FREE model track (ideal aligned frame): no
+    # per-view dx/dy enter it at all, not even the current view's
+    ct, sn = np.cos(m.theta), np.sin(m.theta)
+    assert x[0] == pytest.approx(m.a[0] * ct[0] + m.b[0] * sn[0]
+                                 + m.c_coef[0])
+    assert y[0] == pytest.approx(m.y[0]
+                                 + m.alpha_coef[0] * (m.a[0] * ct[0]
+                                                      + m.b[0] * sn[0]))
 
 
 def test_highpass_display_filter(tracker):

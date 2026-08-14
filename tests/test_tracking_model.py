@@ -268,6 +268,48 @@ def test_per_view_spread_and_warnings():
     assert any("W1" in w for w in fit2.warnings)
 
 
+def test_huber_scale_survives_zero_inflated_residuals():
+    """Exact zeros from single-label views must not veto the real labels.
+
+    A free dx fits every single-label view exactly, so with staggered
+    manual labeling most residuals are exactly zero, the MAD collapses,
+    and un-floored Huber weights discard every remaining genuine label.
+    """
+    from tktomo.tracking.model import _huber_weights
+
+    zero_inflated = np.concatenate([np.zeros(60), np.full(40, 5.0)])
+    w = _huber_weights(zero_inflated, 3.0)
+    assert w[60:].min() > 0.5
+
+    # ordinary robustness is untouched: few large outliers still go
+    rng = np.random.default_rng(0)
+    normal = np.concatenate([0.1 * rng.standard_normal(95),
+                             np.full(5, 30.0)])
+    w2 = _huber_weights(normal, 3.0)
+    assert np.median(w2[:95]) > 0.9
+    assert w2[95:].max() < 0.2
+
+
+def test_staggered_labels_warn_unconstrained_geometry():
+    truth = make_truth(n_feat=2, degrees=(0, 0, 0))
+    u, v, valid = sample_labels(truth, noise=0.0)
+    # staggered: feature 0 only in even views, feature 1 only in odd ones
+    valid[:] = False
+    valid[0, 0::2] = True
+    valid[1, 1::2] = True
+    fit = solve_model(u, v, valid,
+                      AxisModel.blank(truth.theta, truth.feature_ids,
+                                      truth.degrees))
+    assert any("W6" in w for w in fit.warnings)
+
+    # co-labeled views: the same features, now constrained, no W6
+    valid[:, ::3] = True
+    fit2 = solve_model(u, v, valid,
+                       AxisModel.blank(truth.theta, truth.feature_ids,
+                                       truth.degrees))
+    assert not any("W6" in w for w in fit2.warnings)
+
+
 def test_holdout_and_shift_split_run():
     truth = make_truth(n_feat=16)
     u, v, valid = sample_labels(truth, noise=0.05)
