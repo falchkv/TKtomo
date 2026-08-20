@@ -785,3 +785,30 @@ Ranked by how much they change what the contribution should claim or ship.
    at 40 M non-zeros. A shared ASTRA-backed `ReconBackend` would let one run cover
    every method at full detector size, which is the only way the ⅓-*full-resolution*-
    voxel target (24.84 nm, 5× below anything measured here) ever gets tested.
+
+---
+
+## Real-data validation, definitive figure (2026-08-20)
+
+The gradient-domain aligner was applied end-to-end to the internal 907-projection
+dataset (vacuum/ramp-enforced prealigned stack + gradient-loss shifts, GRAD_SIGMA=3,
+CGLS-15 volume) and scored with the same mask-corrected even/odd 3D FSC protocol as
+the phase-domain baseline. Both reconstructions, identical protocol:
+
+| | phase-domain loss (v4) | **gradient-domain loss (v5)** |
+|---|---|---|
+| 3D FSC, half-bit, isotropic | 158.3 nm | **140.8 nm** (-11%) |
+| in-plane / axial | 162.3 / 168.1 nm | **139.7 / 141.8 nm** |
+| anisotropy | 3.6% | **1.5%** |
+| 0.143 criterion, isotropic | 152.0 nm | **135.8 nm** |
+| full-frame FRC row 744 | 251.5 nm | 216 nm |
+| interior FRC row 744 | 188.4 nm | 151.3 nm |
+| MAD shift outliers | 16 | **9** |
+
+Mask correction by phase randomisation changed the v5 numbers by 0.0 nm; FBP and
+CGLS half-volume pairs agree to within one shell. The outlier count halving is the
+mechanism made visible: frames the phase-domain estimator misfit badly enough to
+trip the MAD guard are fit well by the gradient loss — better conditioning, exactly
+the roadmap's argument. This is the non-planar-background evidence the synthetic
+benchmark could not supply (its planar ramps are removed exactly by step [0]), and
+it is the number to quote for the gradient-default discussion.
