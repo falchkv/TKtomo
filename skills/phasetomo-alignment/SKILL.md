@@ -361,3 +361,51 @@ measurement.
 path; the repository ships a fully synthetic fallback phantom so its own tests run for
 anyone. No `.h5` / `.npy` / `.tiff` of measured data, and no absolute site paths in
 library code or in this skill — parameters only.
+
+---
+
+## Production playbook additions (2026-08, real-beamtime campaign)
+
+Generic form of lessons measured in production; numbers are from one campaign
+but every rule transfers.
+
+### Gauge and vacuum
+- Anchor the per-projection phase gauge (offset + ramp) at the SOURCE, inside
+  the ptycho reconstruction loop (robust fit on edge-strip air each prior
+  break + once on the final object). Validated at zero data-error cost; it
+  removes the need for a downstream vacuum-enforcement stage.
+- A robust plane fit can be locally excellent and globally wrong: MAD
+  clipping can overfit a leveraged air subset and stamp offset+tilt planes
+  onto frames whose air is perfectly clean. Log the APPLIED correction and
+  test it against angular neighbours (C = after − before); never trust the
+  fit residual alone.
+- Stamped phases bias the shift fits. After any per-frame phase repair,
+  re-run the shift refinement — expect px-scale corrections concentrated on
+  the repaired frames; the re-fit is where the resolution comes back.
+
+### Guards and gates
+- Shift-cleaning MAD guards fight genuine large corrections: guard-reverted
+  frames appear as isolated jumps in shift-vs-θ (sinogram terraces). Make
+  thresholds tunable and always print which frames were reverted.
+- Replacing a projection with a re-reconstruction: register it to the
+  OUTGOING frame (same data → unambiguous correlation), never to a neighbour
+  median. Gate the swap on a per-row clause (no row may regress) in addition
+  to the mean.
+
+### Re-reconstruction seeding
+- Probe seeds must match the beam state (nearest in TIME/pass); object seeds
+  match the ANGLE. Cross-pass probe seeds produce self-consistent, wrong
+  reconstructions with normal data error.
+
+### Interleaved multi-pass acquisitions
+- θ-sorting turns slow per-pass drift into high-frequency stripes; diagnose
+  via same-pass vs cross-pass adjacent-pair RMS. Per-frame scalar corrections
+  do not help.
+- Level drift moves iso-phase contours (Δedge ≈ Δlevel / edge slope) and
+  fakes edge misalignment. Attribute before constraining edges, or the
+  "fix" misaligns the interior.
+
+### Metric discipline
+- Interpolation-heavy gains need a blur control (permuted-shift arm).
+- Edge trackers need a shallow threshold + sustained-run rule; deep
+  thresholds lock bimodally onto interior thickness contours.
