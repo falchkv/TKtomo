@@ -270,3 +270,25 @@ def test_seed_report_records_stops_and_coherence():
         assert rep["used"]
         assert rep["coherence"] < 0.4
         assert "left_stop" in rep and "right_stop" in rep
+
+
+def test_complete_track_custom_matcher_is_used_and_thresholded():
+    """A matcher gets all usable seeds and its quality is gated by min_corr."""
+    frames, theta, tu, tv = synthetic_scan(n_views=30)
+    views = [0, 10, 20, 29]
+    seeds = [(j, tu[0, j], tv[0, j]) for j in views]
+    calls = []
+
+    def oracle(frames_hp, seeds_usable, view, pred, max_step):
+        calls.append(len(seeds_usable))
+        return tv[0, view], tu[0, view], 0.9 if view % 2 else 0.1
+
+    params = default_params(min_corr=0.5, fb_check=False)
+    frames_hp = [highpass2d(f) for f in frames]
+    res = complete_track(frames_hp, theta, seeds, params, matcher=oracle)
+    assert calls and all(c == len(views) for c in calls)
+    got = {al.view for al in res.labels}
+    assert got and all(j % 2 == 1 for j in got)
+    for al in res.labels:
+        assert abs(al.u - tu[0, al.view]) < 1e-9
+        assert abs(al.v - tv[0, al.view]) < 1e-9

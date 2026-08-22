@@ -176,10 +176,10 @@ class AutoTrackWorker(QThread):
         self._cancelled = False
         self._hp_cache: dict = {}
 
-    def submit(self, frames, theta, jobs, hp_sigma) -> None:
+    def submit(self, frames, theta, jobs, hp_sigma, matcher=None) -> None:
         self._cancelled = False
         self._job = (frames, np.asarray(theta, float), list(jobs),
-                     float(hp_sigma))
+                     float(hp_sigma), matcher)
         if not self.isRunning():
             self.start()
 
@@ -188,7 +188,7 @@ class AutoTrackWorker(QThread):
 
     def run(self):  # noqa: N802
         while self._job is not None:
-            frames, theta, jobs, hp_sigma = self._job
+            frames, theta, jobs, hp_sigma, matcher = self._job
             self._job = None
             try:
                 from tktomo.tracking.autotrack import (  # noqa: PLC0415
@@ -218,7 +218,7 @@ class AutoTrackWorker(QThread):
                     self.progress.emit(idx, len(jobs), fid)
                     result = complete_track(
                         hp, theta, seeds, params,
-                        cancelled=lambda: self._cancelled)
+                        cancelled=lambda: self._cancelled, matcher=matcher)
                     if result.cancelled:
                         self.finished_tracks.emit([])
                         break
@@ -516,6 +516,24 @@ class TrackModelWindow(QMainWindow):
         run_row.addWidget(self.auto_all_btn)
         auto_layout.addLayout(run_row)
         param_row = QHBoxLayout()
+        self.auto_matcher = QComboBox()
+        self.auto_matcher.addItems(["phase corr", "learned p"])
+        self.auto_matcher.setToolTip(
+            "phase corr: template from the nearest manual label, quality = "
+            "correlation (near chance at spotting a wrong match).\n"
+            "learned p: the 5 nearest manual labels vote on the position "
+            "and a classifier rates each answer with the probability that "
+            "it is within 4 raw px (AUC 0.86 on held-out features). "
+            "Slower (~20 s per 13 features), measured on one dataset.")
+        self._learned = None
+        from tktomo.tracking import learned_match  # noqa: PLC0415
+        ok, why = learned_match.available()
+        if not ok:
+            item = self.auto_matcher.model().item(1)
+            item.setEnabled(False)
+            item.setToolTip(f"unavailable: {why}")
+        self.auto_matcher.currentIndexChanged.connect(self._on_matcher_changed)
+        self.auto_thr_label = QLabel("min corr")
         self.auto_min_corr = QDoubleSpinBox()
         self.auto_min_corr.setRange(0.05, 0.95)
         self.auto_min_corr.setSingleStep(0.05)
@@ -538,12 +556,33 @@ class TrackModelWindow(QMainWindow):
             "Track every accepted match BACK to its seed and reject it "
             "if the round trip misses or correlates poorly. Cheap, only "
             "ever removes labels.")
-        param_row.addWidget(QLabel("min corr"))
+        param_row.addWidget(self.auto_matcher)
+        param_row.addWidget(self.auto_thr_label)
         param_row.addWidget(self.auto_min_corr)
         param_row.addWidget(QLabel("search"))
         param_row.addWidget(self.auto_radius)
         param_row.addWidget(self.auto_fb)
         auto_layout.addLayout(param_row)
+        reject_row = QHBoxLayout()
+        self.auto_reject = QCheckBox("reject auto >")
+        self.auto_reject.setChecked(True)
+        self.auto_reject.setToolTip(
+            "After every fit, drop AUTO labels whose residual exceeds this "
+            "multiple of the Huber scale and refit once. Manual labels are "
+            "never touched. A Huber-weighted 15 px lock-on still drags a "
+            "thinly covered view's shift by several px; removing it does "
+            "not. Measured: dx rms 2.95 -> 2.43 raw px at 10-view anchors.")
+        self.auto_reject_k = QDoubleSpinBox()
+        self.auto_reject_k.setRange(1.0, 20.0)
+        self.auto_reject_k.setSingleStep(0.5)
+        self.auto_reject_k.setValue(3.0)
+        self.auto_reject_k.setSuffix(" x Huber")
+        self.auto_reject.toggled.connect(lambda _: self._request_fit())
+        self.auto_reject_k.valueChanged.connect(lambda _: self._request_fit())
+        reject_row.addWidget(self.auto_reject)
+        reject_row.addWidget(self.auto_reject_k)
+        reject_row.addStretch(1)
+        auto_layout.addLayout(reject_row)
         clear_row = QHBoxLayout()
         clear_feat = QPushButton("Clear auto: feature")
         clear_feat.clicked.connect(lambda: self._clear_auto(False))
@@ -876,6 +915,27 @@ class TrackModelWindow(QMainWindow):
 
     # ---------------------------------------------------------- auto-track
 
+    def _on_matcher_changed(self, index: int) -> None:
+        """The threshold means a correlation or a probability; re-label it."""
+        learned = index == 1
+        self.auto_thr_label.setText("min p" if learned else "min corr")
+        self.auto_min_corr.setValue(0.20 if learned else 0.30)
+        self.auto_min_corr.setToolTip(
+            "Answers with a lower probability of being within 4 raw px end "
+            "the track. 0.20 keeps ~90% of answers from 10-view anchors with "
+            "about 1% worse than 10 px; raise it when coverage is generous."
+            if learned else
+            "Matches below this correlation end the track. The template "
+            "genuinely stops resembling the image ~10-20 views from a "
+            "seed (measured 0.65 at 1 view, 0.23 at 10), so more manual "
+            "labels = longer reach.")
+
+    def _learned_matcher(self):
+        if self._learned is None:
+            from tktomo.tracking.learned_match import LearnedMatcher  # noqa: PLC0415
+            self._learned = LearnedMatcher()
+        return self._learned
+
     def _auto_complete(self, all_features: bool) -> None:
         from tktomo.tracking.autotrack import (  # noqa: PLC0415
             AutoTrackParams,
@@ -924,9 +984,17 @@ class TrackModelWindow(QMainWindow):
         for btn in (self.auto_feature_btn, self.auto_all_btn):
             btn.setEnabled(False)
         self.auto_cancel_btn.setEnabled(True)
+        matcher = None
+        if self.auto_matcher.currentIndex() == 1:
+            try:
+                matcher = self._learned_matcher()
+            except Exception as exc:  # noqa: BLE001 - surface, fall back
+                self._autotrack_done_ui()
+                self.auto_status.setText(f"learned matcher unavailable: {exc}")
+                return
         self.auto_status.setText("preparing…")
         self._autotrack_worker.submit(self._data.data, self._data.angles,
-                                      jobs, hp_sigma=12.0)
+                                      jobs, hp_sigma=12.0, matcher=matcher)
 
     def _autotrack_progress(self, done: int, total: int, fid) -> None:
         if fid is None:
@@ -955,8 +1023,10 @@ class TrackModelWindow(QMainWindow):
                                          float(v_raw), al.quality):
                     added += 1
             qualities = [al.quality for al in res.labels]
+            qname = ("p" if self.auto_matcher.currentIndex() == 1
+                     else "corr")
             line = (f"feature {fid}: +{added} auto labels"
-                    + (f", median corr "
+                    + (f", median {qname} "
                        f"{float(np.median(qualities)):.2f}"
                        if qualities else ""))
             refusals = [w for w in res.warnings if "refused" in w
@@ -1004,13 +1074,35 @@ class TrackModelWindow(QMainWindow):
                                     iters=self.iters.value(),
                                     huber=self.huber.value(),
                                     feature_weight=self._feature_weights())
+            n_rej = self._reject_auto_outliers(ids)
+            if n_rej:
+                u, v, valid, ids = self._labels.to_arrays(
+                    self._data.angles.size, self._model.feature_ids)
+                self._fit = solve_model(u, v, valid, self._fit.model,
+                                        self._mask, iters=self.iters.value(),
+                                        huber=self.huber.value(),
+                                        feature_weight=self._feature_weights())
         except ValueError as exc:
             self.summary_label.setText(f"fit failed: {exc}")
             return
+        if n_rej:
+            self.auto_status.setText(
+                f"rejected {n_rej} auto label(s) with residual > "
+                f"{self.auto_reject_k.value():g} x Huber, refitted")
+            self._refresh_view()
         self._model = self._fit.model
         self._diagnostics = None
         self._push_model_to_ui()
         self._after_evaluate()
+
+    def _reject_auto_outliers(self, ids) -> int:
+        """One pass of `reject_auto_outliers` if the checkbox is on."""
+        if not self.auto_reject.isChecked() or self._fit is None:
+            return 0
+        from tktomo.tracking.labels import reject_auto_outliers  # noqa: PLC0415
+
+        limit = float(self.auto_reject_k.value()) * float(self.huber.value())
+        return reject_auto_outliers(self._labels, self._fit, ids, limit)
 
     def _evaluate(self) -> None:
         """Residuals against the CURRENT model values, no solving."""
@@ -1628,6 +1720,9 @@ class TrackModelWindow(QMainWindow):
             "feature_sizes": {str(k): float(size)
                               for k, size in self._feature_sizes.items()},
             "ghosts": self.ghost_box.isChecked(),
+            "auto_matcher": self.auto_matcher.currentIndex(),
+            "auto_reject": self.auto_reject.isChecked(),
+            "auto_reject_k": self.auto_reject_k.value(),
             "auto_min_corr": self.auto_min_corr.value(),
             "auto_search_radius": self.auto_radius.value(),
             "auto_fb_check": self.auto_fb.isChecked(),
@@ -1642,9 +1737,11 @@ class TrackModelWindow(QMainWindow):
                                mask=self._mask, source=self._source,
                                ui_state=self._ui_state())
 
-    def _load_session(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load session", "", "HDF5 (*.h5)")
+    def _load_session(self, path: str | None = None) -> None:
+        """Load a session; without `path`, ask for one."""
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Load session", "", "HDF5 (*.h5)")
         if not path:
             return
         try:
@@ -1674,6 +1771,9 @@ class TrackModelWindow(QMainWindow):
         self._feature_sizes = {int(k): float(size) for k, size in
                                ui.get("feature_sizes", {}).items()}
         self.ghost_box.setChecked(bool(ui.get("ghosts", False)))
+        self.auto_matcher.setCurrentIndex(int(ui.get("auto_matcher", 0)))
+        self.auto_reject.setChecked(bool(ui.get("auto_reject", True)))
+        self.auto_reject_k.setValue(float(ui.get("auto_reject_k", 3.0)))
         self.auto_min_corr.setValue(float(ui.get("auto_min_corr", 0.30)))
         self.auto_radius.setValue(float(ui.get("auto_search_radius", 8.0)))
         self.auto_fb.setChecked(bool(ui.get("auto_fb_check", True)))
@@ -1776,8 +1876,17 @@ def _fmt(value: float) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("path", nargs="?", help="projection stack (.h5)")
+    parser.add_argument("--session", help="session file (.h5) to load; its "
+                        "stack is loaded from the session's own provenance")
     args = parser.parse_args()
-    return run_app(lambda: TrackModelWindow(args.path))
+
+    def build():
+        win = TrackModelWindow(args.path)
+        if args.session:
+            win._load_session(args.session)
+        return win
+
+    return run_app(build)
 
 
 if __name__ == "__main__":

@@ -43,6 +43,11 @@ recon = [
     "tomopy>=1.14",
     "pystackreg>=0.2.7",
 ]
+# Learned confidence for track auto-completion (tktomo.tracking.learned_match).
+learned = [
+    "scikit-learn>=1.3",
+    "joblib>=1.3",
+]
 # Optional GPU projectors (install astra-toolbox via conda-forge).
 gpu = [
     "astra-toolbox>=2.1",
@@ -74,6 +79,9 @@ ptycho-align-server = "tktomo.ptycho_align.session.server:main"
 
 [tool.setuptools.packages.find]
 include = ["tktomo*"]
+
+[tool.setuptools.package-data]
+"tktomo.tracking" = ["data/*.joblib"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

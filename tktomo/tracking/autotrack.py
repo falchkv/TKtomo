@@ -230,7 +230,8 @@ class TrackResult:
 
 
 def complete_track(frames_hp, theta, seeds, params: AutoTrackParams, *,
-                   progress=None, cancelled=None) -> TrackResult:
+                   progress=None, cancelled=None,
+                   matcher=None) -> TrackResult:
     """Fill unlabeled views around manual seeds by anchored matching.
 
     frames_hp: sequence of ALREADY-HIGHPASSED float32 2D frames.
@@ -238,6 +239,13 @@ def complete_track(frames_hp, theta, seeds, params: AutoTrackParams, *,
     seeds: [(view, u, v)] manual labels in LOADED-frame px, at least 2.
     progress: optional callable(views_done); cancelled: optional
     callable() -> bool, checked per view.
+    matcher: optional replacement for the per-view phase-correlation
+    match, `matcher(frames_hp, seeds_usable, view, pred_vu, max_step)
+    -> (v, u, quality) | None`, given ALL usable seeds so it may use
+    more than the nearest one. `quality` is thresholded by
+    `params.min_corr` exactly like the correlation would be, so set
+    that to whatever the matcher's confidence scale means. The
+    forward-backward check stays phase-correlation based.
 
     Each unlabeled view is assigned to the nearest seed that passed the
     coherence gate; the template is always cut at that seed's manual
@@ -331,11 +339,14 @@ def complete_track(frames_hp, theta, seeds, params: AutoTrackParams, *,
                     pred = (v_pred[j], u_pred[j])
                 else:
                     pred = last_accepted        # bounded hold beyond span
-                hit = match_patch(
-                    frames_hp[seed_view], frames_hp[j], (sv, su),
-                    pred, params.patch, max_step,
-                    upsample=params.upsample, iters=params.iters,
-                    tol=params.tol)
+                if matcher is not None:
+                    hit = matcher(frames_hp, usable, j, pred, max_step)
+                else:
+                    hit = match_patch(
+                        frames_hp[seed_view], frames_hp[j], (sv, su),
+                        pred, params.patch, max_step,
+                        upsample=params.upsample, iters=params.iters,
+                        tol=params.tol)
                 ok = hit is not None and hit[2] >= params.min_corr
                 if ok and params.fb_check:
                     # the round trip must land on the seed AND look like
