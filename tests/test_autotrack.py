@@ -130,12 +130,32 @@ def default_params(**kw):
     return AutoTrackParams(**{"patch": 32, "search_radius": 6.0, **kw})
 
 
+def _pc(params):
+    """Single-anchor phase-correlation matcher, in the complete_track hook
+    shape. Reproduces the removed default branch so the march, coherence
+    gate, fb check and stop logic stay covered."""
+    import numpy as np
+
+    from tktomo.tracking.autotrack import match_patch
+
+    def matcher(frames_hp, seeds_usable, view, pred, max_step):
+        seeds = np.asarray(seeds_usable, float)
+        a = seeds[int(np.argmin(np.abs(seeds[:, 0] - view)))]
+        hit = match_patch(frames_hp[int(a[0])], frames_hp[view], (a[2], a[1]),
+                          pred, params.patch, max_step,
+                          upsample=params.upsample, iters=params.iters,
+                          tol=params.tol)
+        return None if hit is None else (hit[0], hit[1], hit[2])
+    return matcher
+
+
+
 def test_complete_track_recovers_sinusoid():
     frames, theta, truth_u, truth_v = synthetic_scan()
     hp = [highpass2d(f, 8.0) for f in frames]
     seed_views = [5, 30, 55]
     seeds = [(w, truth_u[0, w], truth_v[0, w]) for w in seed_views]
-    result = complete_track(hp, theta, seeds, default_params())
+    result = complete_track(hp, theta, seeds, default_params(), matcher=_pc(default_params()))
     assert not result.warnings
     got = {al.view: al for al in result.labels}
     assert len(got) >= 0.8 * (theta.size - len(seed_views))
@@ -150,7 +170,7 @@ def test_complete_track_two_seeds_linear_fallback():
     hp = [highpass2d(f, 8.0) for f in frames]
     seeds = [(8, truth_u[0, 8], truth_v[0, 8]),
              (20, truth_u[0, 20], truth_v[0, 20])]
-    result = complete_track(hp, theta, seeds, default_params())
+    result = complete_track(hp, theta, seeds, default_params(), matcher=_pc(default_params()))
     # between the seeds the linear prediction is close enough to track
     inner = [al for al in result.labels if 8 < al.view < 20]
     assert len(inner) >= 8
@@ -165,7 +185,7 @@ def test_coherence_gate_refuses_edge():
         frame[38:42, :] = 1.0                 # horizontal filament
         frames.append(frame)
     seeds = [(2, 60.0, 40.0), (10, 60.0, 40.0)]
-    result = complete_track(frames, theta, seeds, default_params())
+    result = complete_track(frames, theta, seeds, default_params(), matcher=_pc(default_params()))
     assert not result.labels
     assert any("not trackable" in w for w in result.warnings)
     assert all(not rep["used"] for rep in result.seed_report)
@@ -207,21 +227,21 @@ def test_forward_backward_gate(monkeypatch):
     params = default_params()
 
     behavior.update(back_miss=0.0, back_q=0.9)
-    clean = at.complete_track(hp, theta, seeds, params)
+    clean = at.complete_track(hp, theta, seeds, params, matcher=_pc(params))
     assert clean.labels                       # good round trips keep labels
 
     behavior.update(back_miss=5.0, back_q=0.9)
-    missed = at.complete_track(hp, theta, seeds, params)
+    missed = at.complete_track(hp, theta, seeds, params, matcher=_pc(params))
     assert not missed.labels                  # round trip misses: rejected
 
     behavior.update(back_miss=0.0, back_q=0.05)
-    cratered = at.complete_track(hp, theta, seeds, params)
+    cratered = at.complete_track(hp, theta, seeds, params, matcher=_pc(params))
     assert not cratered.labels                # backward corr craters: rejected
 
     behavior.update(back_miss=5.0, back_q=0.9)
-    off = at.complete_track(hp, theta, seeds,
-                            AutoTrackParams(**{**params.__dict__,
-                                               "fb_check": False}))
+    off_params = AutoTrackParams(**{**params.__dict__, "fb_check": False})
+    off = at.complete_track(hp, theta, seeds, off_params,
+                            matcher=_pc(off_params))
     assert off.labels                         # gate off: forward rules
 
 
@@ -233,7 +253,7 @@ def test_stop_after_consecutive_failures():
         hp[k] = np.zeros_like(hp[k])
     seeds = [(5, truth_u[0, 5], truth_v[0, 5]),
              (30, truth_u[0, 30], truth_v[0, 30])]
-    result = complete_track(hp, theta, seeds, default_params())
+    result = complete_track(hp, theta, seeds, default_params(), matcher=_pc(default_params()))
     got = {al.view for al in result.labels}
     assert not any(v in got for v in (40, 41, 42))
     assert not any(v in got for v in range(43, 60))   # direction ended
@@ -242,7 +262,7 @@ def test_stop_after_consecutive_failures():
     # a SINGLE corrupted frame is skipped, the march continues past it
     hp2 = [highpass2d(f, 8.0) for f in frames]
     hp2[40] = np.zeros_like(hp2[40])
-    result2 = complete_track(hp2, theta, seeds, default_params())
+    result2 = complete_track(hp2, theta, seeds, default_params(), matcher=_pc(default_params()))
     got2 = {al.view for al in result2.labels}
     assert 40 not in got2
     assert 41 in got2 and 45 in got2
@@ -254,6 +274,7 @@ def test_complete_track_cancel():
     seeds = [(5, truth_u[0, 5], truth_v[0, 5]),
              (30, truth_u[0, 30], truth_v[0, 30])]
     result = complete_track(hp, theta, seeds, default_params(),
+                            matcher=_pc(default_params()),
                             cancelled=lambda: True)
     assert result.cancelled
     assert not result.labels
@@ -264,7 +285,7 @@ def test_seed_report_records_stops_and_coherence():
     hp = [highpass2d(f, 8.0) for f in frames]
     seeds = [(5, truth_u[0, 5], truth_v[0, 5]),
              (30, truth_u[0, 30], truth_v[0, 30])]
-    result = complete_track(hp, theta, seeds, default_params())
+    result = complete_track(hp, theta, seeds, default_params(), matcher=_pc(default_params()))
     assert len(result.seed_report) == 2
     for rep in result.seed_report:
         assert rep["used"]
@@ -292,3 +313,13 @@ def test_complete_track_custom_matcher_is_used_and_thresholded():
     for al in res.labels:
         assert abs(al.u - tu[0, al.view]) < 1e-9
         assert abs(al.v - tv[0, al.view]) < 1e-9
+
+
+def test_complete_track_requires_a_matcher():
+    frames, theta, tu, tv = synthetic_scan(n_views=20)
+    hp = [highpass2d(f) for f in frames]
+    seeds = [(2, tu[0, 2], tv[0, 2]), (10, tu[0, 10], tv[0, 10])]
+    import pytest
+
+    with pytest.raises(ValueError, match="requires a matcher"):
+        complete_track(hp, theta, seeds, default_params())

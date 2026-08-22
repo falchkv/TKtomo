@@ -516,33 +516,20 @@ class TrackModelWindow(QMainWindow):
         run_row.addWidget(self.auto_all_btn)
         auto_layout.addLayout(run_row)
         param_row = QHBoxLayout()
-        self.auto_matcher = QComboBox()
-        self.auto_matcher.addItems(["phase corr", "learned p"])
-        self.auto_matcher.setToolTip(
-            "phase corr: template from the nearest manual label, quality = "
-            "correlation (near chance at spotting a wrong match).\n"
-            "learned p: the 5 nearest manual labels vote on the position "
-            "and a classifier rates each answer with the probability that "
-            "it is within 4 raw px (AUC 0.86 on held-out features). "
-            "Slower (~20 s per 13 features), measured on one dataset.")
         self._learned = None
         from tktomo.tracking import learned_match  # noqa: PLC0415
-        ok, why = learned_match.available()
-        if not ok:
-            item = self.auto_matcher.model().item(1)
-            item.setEnabled(False)
-            item.setToolTip(f"unavailable: {why}")
-        self.auto_matcher.currentIndexChanged.connect(self._on_matcher_changed)
-        self.auto_thr_label = QLabel("min corr")
+        self._learned_ok, self._learned_why = learned_match.available()
+        self.auto_thr_label = QLabel("min p")
         self.auto_min_corr = QDoubleSpinBox()
         self.auto_min_corr.setRange(0.05, 0.95)
         self.auto_min_corr.setSingleStep(0.05)
-        self.auto_min_corr.setValue(0.30)
+        self.auto_min_corr.setValue(0.20)
         self.auto_min_corr.setToolTip(
-            "Matches below this correlation end the track. The template "
-            "genuinely stops resembling the image ~10-20 views from a "
-            "seed (measured 0.65 at 1 view, 0.23 at 10), so more manual "
-            "labels = longer reach.")
+            "The 5 nearest manual labels vote on the position and a "
+            "classifier rates the answer with the probability it is within "
+            "4 raw px. Answers below this probability end the track. 0.20 "
+            "keeps ~90% of answers from 10-view anchors with about 1% worse "
+            "than 10 px; raise it when coverage is generous.")
         self.auto_radius = QDoubleSpinBox()
         self.auto_radius.setRange(2.0, 50.0)
         self.auto_radius.setValue(8.0)
@@ -556,7 +543,6 @@ class TrackModelWindow(QMainWindow):
             "Track every accepted match BACK to its seed and reject it "
             "if the round trip misses or correlates poorly. Cheap, only "
             "ever removes labels.")
-        param_row.addWidget(self.auto_matcher)
         param_row.addWidget(self.auto_thr_label)
         param_row.addWidget(self.auto_min_corr)
         param_row.addWidget(QLabel("search"))
@@ -915,21 +901,6 @@ class TrackModelWindow(QMainWindow):
 
     # ---------------------------------------------------------- auto-track
 
-    def _on_matcher_changed(self, index: int) -> None:
-        """The threshold means a correlation or a probability; re-label it."""
-        learned = index == 1
-        self.auto_thr_label.setText("min p" if learned else "min corr")
-        self.auto_min_corr.setValue(0.20 if learned else 0.30)
-        self.auto_min_corr.setToolTip(
-            "Answers with a lower probability of being within 4 raw px end "
-            "the track. 0.20 keeps ~90% of answers from 10-view anchors with "
-            "about 1% worse than 10 px; raise it when coverage is generous."
-            if learned else
-            "Matches below this correlation end the track. The template "
-            "genuinely stops resembling the image ~10-20 views from a "
-            "seed (measured 0.65 at 1 view, 0.23 at 10), so more manual "
-            "labels = longer reach.")
-
     def _learned_matcher(self):
         if self._learned is None:
             from tktomo.tracking.learned_match import LearnedMatcher  # noqa: PLC0415
@@ -948,6 +919,11 @@ class TrackModelWindow(QMainWindow):
             self.statusBar().showMessage(
                 "auto-complete does not support per-view-cropped stacks "
                 "(the crop already follows the feature)", 6000)
+            return
+        if not self._learned_ok:
+            self.statusBar().showMessage(
+                f"auto-complete needs the learned matcher: "
+                f"{self._learned_why}", 8000)
             return
         manual = self._labels.manual_counts()
         fids = (sorted(f for f, n in manual.items() if n >= 2)
@@ -984,14 +960,12 @@ class TrackModelWindow(QMainWindow):
         for btn in (self.auto_feature_btn, self.auto_all_btn):
             btn.setEnabled(False)
         self.auto_cancel_btn.setEnabled(True)
-        matcher = None
-        if self.auto_matcher.currentIndex() == 1:
-            try:
-                matcher = self._learned_matcher()
-            except Exception as exc:  # noqa: BLE001 - surface, fall back
-                self._autotrack_done_ui()
-                self.auto_status.setText(f"learned matcher unavailable: {exc}")
-                return
+        try:
+            matcher = self._learned_matcher()
+        except Exception as exc:  # noqa: BLE001 - surface and stop
+            self._autotrack_done_ui()
+            self.auto_status.setText(f"learned matcher unavailable: {exc}")
+            return
         self.auto_status.setText("preparing…")
         self._autotrack_worker.submit(self._data.data, self._data.angles,
                                       jobs, hp_sigma=12.0, matcher=matcher)
@@ -1023,10 +997,8 @@ class TrackModelWindow(QMainWindow):
                                          float(v_raw), al.quality):
                     added += 1
             qualities = [al.quality for al in res.labels]
-            qname = ("p" if self.auto_matcher.currentIndex() == 1
-                     else "corr")
             line = (f"feature {fid}: +{added} auto labels"
-                    + (f", median {qname} "
+                    + (f", median p "
                        f"{float(np.median(qualities)):.2f}"
                        if qualities else ""))
             refusals = [w for w in res.warnings if "refused" in w
@@ -1720,7 +1692,6 @@ class TrackModelWindow(QMainWindow):
             "feature_sizes": {str(k): float(size)
                               for k, size in self._feature_sizes.items()},
             "ghosts": self.ghost_box.isChecked(),
-            "auto_matcher": self.auto_matcher.currentIndex(),
             "auto_reject": self.auto_reject.isChecked(),
             "auto_reject_k": self.auto_reject_k.value(),
             "auto_min_corr": self.auto_min_corr.value(),
@@ -1771,10 +1742,9 @@ class TrackModelWindow(QMainWindow):
         self._feature_sizes = {int(k): float(size) for k, size in
                                ui.get("feature_sizes", {}).items()}
         self.ghost_box.setChecked(bool(ui.get("ghosts", False)))
-        self.auto_matcher.setCurrentIndex(int(ui.get("auto_matcher", 0)))
         self.auto_reject.setChecked(bool(ui.get("auto_reject", True)))
         self.auto_reject_k.setValue(float(ui.get("auto_reject_k", 3.0)))
-        self.auto_min_corr.setValue(float(ui.get("auto_min_corr", 0.30)))
+        self.auto_min_corr.setValue(float(ui.get("auto_min_corr", 0.20)))
         self.auto_radius.setValue(float(ui.get("auto_search_radius", 8.0)))
         self.auto_fb.setChecked(bool(ui.get("auto_fb_check", True)))
         self.advance_box.setValue(int(ui.get("advance", 5)))

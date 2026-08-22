@@ -75,20 +75,15 @@ def test_shipped_classifier_loads_and_scores():
     assert hit is not None and 0.0 <= hit[2] <= 1.0
 
 
-def test_app_matcher_selector(qtbot):
+def test_app_uses_learned_matcher_only(qtbot):
     pytest.importorskip("PySide6")
     from tktomo.ui.track_model_app import TrackModelWindow
 
     win = TrackModelWindow()
     qtbot.addWidget(win)
-    assert win.auto_matcher.count() == 2
-    assert win.auto_thr_label.text() == "min corr"
-    assert win.auto_min_corr.value() == pytest.approx(0.30)
-    win.auto_matcher.setCurrentIndex(1)
+    # the phase-corr dropdown is gone; the learned matcher is the only tracker
+    assert not hasattr(win, "auto_matcher")
     assert win.auto_thr_label.text() == "min p"
     assert win.auto_min_corr.value() == pytest.approx(0.20)
-    ui = win._ui_state() if hasattr(win, "_ui_state") else None
-    if ui is not None:
-        assert ui["auto_matcher"] == 1
-    win.auto_matcher.setCurrentIndex(0)
-    assert win.auto_min_corr.value() == pytest.approx(0.30)
+    # with scikit-learn, joblib and the shipped model present it is available
+    assert win._learned_ok is available()[0]

@@ -239,13 +239,14 @@ def complete_track(frames_hp, theta, seeds, params: AutoTrackParams, *,
     seeds: [(view, u, v)] manual labels in LOADED-frame px, at least 2.
     progress: optional callable(views_done); cancelled: optional
     callable() -> bool, checked per view.
-    matcher: optional replacement for the per-view phase-correlation
-    match, `matcher(frames_hp, seeds_usable, view, pred_vu, max_step)
+    matcher (REQUIRED): the per-view matcher,
+    `matcher(frames_hp, seeds_usable, view, pred_vu, max_step)
     -> (v, u, quality) | None`, given ALL usable seeds so it may use
     more than the nearest one. `quality` is thresholded by
-    `params.min_corr` exactly like the correlation would be, so set
-    that to whatever the matcher's confidence scale means. The
-    forward-backward check stays phase-correlation based.
+    `params.min_corr`, so set that to whatever the matcher's confidence
+    scale means. `tktomo.tracking.learned_match.LearnedMatcher` is the
+    shipped one. The forward-backward check stays phase-correlation based
+    (it is a consistency check on the accepted match, not the tracker).
 
     Each unlabeled view is assigned to the nearest seed that passed the
     coherence gate; the template is always cut at that seed's manual
@@ -254,6 +255,11 @@ def complete_track(frames_hp, theta, seeds, params: AutoTrackParams, *,
     per direction, skipping isolated failures and stopping a direction
     after `max_consecutive_failures` in a row.
     """
+    if matcher is None:
+        raise ValueError(
+            "complete_track requires a matcher; pass "
+            "tktomo.tracking.learned_match.LearnedMatcher() "
+            "(the single-anchor phase-correlation completer was removed)")
     theta = np.asarray(theta, float)
     n_views = theta.size
     result = TrackResult()
@@ -339,14 +345,7 @@ def complete_track(frames_hp, theta, seeds, params: AutoTrackParams, *,
                     pred = (v_pred[j], u_pred[j])
                 else:
                     pred = last_accepted        # bounded hold beyond span
-                if matcher is not None:
-                    hit = matcher(frames_hp, usable, j, pred, max_step)
-                else:
-                    hit = match_patch(
-                        frames_hp[seed_view], frames_hp[j], (sv, su),
-                        pred, params.patch, max_step,
-                        upsample=params.upsample, iters=params.iters,
-                        tol=params.tol)
+                hit = matcher(frames_hp, usable, j, pred, max_step)
                 ok = hit is not None and hit[2] >= params.min_corr
                 if ok and params.fb_check:
                     # the round trip must land on the seed AND look like
