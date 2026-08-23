@@ -409,3 +409,36 @@ but every rule transfers.
 - Interpolation-heavy gains need a blur control (permuted-shift arm).
 - Edge trackers need a shallow threshold + sustained-run rule; deep
   thresholds lock bimodally onto interior thickness contours.
+
+### Feature-based (fiducial-style) alignment with tktomo.tracking
+Tracked features are real 3D points: fit u(θ) = c + X·cosθ + Y·sinθ per
+track; per-view residuals medianed across tracks are the per-frame (dx, dy).
+Content-anchored, so immune to level drift. Driving `complete_track`
+programmatically (it was designed around manual keyframes):
+
+- It fits a sinusoid THROUGH >= 3 seeds and extrapolates it as the search
+  prediction. Seeds must be SPREAD across the arc — 3+ clustered seeds make
+  the fit near-singular and every march dies within a few views. Exactly 2
+  seeds -> bounded hold on the last accepted position = incremental
+  bootstrap.
+- `AutoTrackParams.min_corr` thresholds the LearnedMatcher PROBABILITY
+  (operating point 0.20), not a correlation. The shipped classifier is
+  trained at 10-view anchor spacing; seed and re-seed near that spacing or
+  its consistency features go out of distribution and honest stopping kills
+  good tracks.
+- Bootstrap-then-respread: 2-seed bootstrap arc, then re-seed with labels
+  evenly spread over the accepted arc, iterating until growth stalls.
+- Referee with physics, not confidence: sinusoid rms gate over a minimum
+  view count, dedup tracks by fitted (c, X, Y, v0), require enough tracks
+  that the per-view median beats single-track noise, and judge the applied
+  result by FSC. A track with several-px rms is matcher noise when the
+  residual alignment error is sub-px — medianing a handful of such tracks
+  adds noise instead of removing it.
+- Know when to stop: interior density specks decorrelate against the
+  rotating projected background within a few degrees; only surface-fiducial
+  -like features track across a full arc. If auto-seeding starves, the
+  intended workflow is manual keyframes in the tracking UI (persistent
+  features picked by a human, labelled at a handful of spread views).
+- Python >= 3.14 defaults multiprocessing to forkserver (module globals are
+  None in workers); use `mp.get_context('fork')` to share the frame stack
+  copy-on-write when parallelizing over candidates.
