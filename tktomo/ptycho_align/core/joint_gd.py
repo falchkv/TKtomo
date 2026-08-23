@@ -24,7 +24,7 @@ dependency list:
   product, turned into a Gauss-Newton step by dividing by ``<grad, grad>``.
 
 Origin. This is a port of ``joint_align_gd.py`` from the P06 ptycho-tomography
-pipeline (beamtime 11023330), where it ran as the top-end alignment method on 907-918
+campaign pipeline, where it ran as the top-end alignment method on 907-918
 projection lens-1/lens-2 stacks. The original was configured entirely through
 environment variables (``JOINT_SMOKE``, ``JOINT_LONG``, ``JOINT_SCAP``,
 ``JOINT_REFINE``) and ran its whole schedule inside one ``main()``; here the schedule

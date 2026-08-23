@@ -133,7 +133,7 @@ dataset path, and takes `slices=` and `bin_factor=` because a 1488 × 1816² vol
 > up here as extra blur, not as extra truth: the recovered shifts are still exact, but
 > the difficulty of the case is understated by however good the original alignment was.
 
-### Our own case (P06 beamtime 11023330, lens 1)
+### Our own case (a 2026 P06 ptycho-tomography campaign, lens 1)
 
 **No measured data is committed to this repository and none may be.** The benchmark
 ships as code that reads a path you supply. For our own runs, with `$TOMO` pointing at

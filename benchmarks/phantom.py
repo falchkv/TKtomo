@@ -451,7 +451,7 @@ class PerturbationSpec:
 P06_LENS1_SPEC = PerturbationSpec(
     jitter_dy_rms=25.0,
     jitter_dx_rms=7.5,
-    seed=11023330,
+    seed=250611,
 )
 
 

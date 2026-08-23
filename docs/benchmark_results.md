@@ -98,7 +98,7 @@ is not part of what is measured), and the same centre-of-mass warm start. The
 `phase_ramp` / `phase_ramp_step0` pair differs only in whether `remove_phase_ramp`
 ran on the case *before any method saw it*.
 
-**Environment.** `max-wn170`, Python 3.14.0 / NumPy 2.2.6 / SciPy 1.16.3 /
+**Environment.** Python 3.14.0 / NumPy 2.2.6 / SciPy 1.16.3 /
 scikit-image 0.26.0, 32 cores, no GPU. SLURM job `24052451`, 6 min 38 s wall
 for 45 cases. **tomopy is not installed on this cluster**, so `jirr` ran under
 `benchmarks.runner.tomopy_shim` — see §13.

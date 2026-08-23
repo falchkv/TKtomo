@@ -541,7 +541,7 @@ case. That is a reason to *measure* it with the gate, not a reason to assume it.
 
 ## Environment note (not about this stage, but it invalidates results)
 
-`/data/dust/user/litang/.conda/bin/python` — Python 3.14.0 with NumPy 2.2.6, and the
+`python` — Python 3.14.0 with NumPy 2.2.6, and the
 **default interpreter in `tomo/job_cpu_template.sh`** — silently corrupts arrays. For
 arrays above NumPy's elision threshold, inside a function, an expression like `a - b` where
 `a` is a local writes the result *into* `a`:

@@ -31,8 +31,7 @@ that is why ASTRA on a GPU is the production backend.
 
 ## Where this came from
 
-A port of `joint_align_gd.py` from the P06 ptycho-tomography pipeline (DESY beamtime
-11023330), where it ran as the top-end alignment method on 907–918-projection lens-1
+A port of `joint_align_gd.py` from a 2026 P06 ptycho-tomography campaign pipeline, where it ran as the top-end alignment method on 907–918-projection lens-1
 and lens-2 phase stacks. The original was a single `main()` configured entirely by
 environment variables. The port keeps the numerics and changes the shape:
 

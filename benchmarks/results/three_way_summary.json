@@ -9,7 +9,7 @@
   "tomopy_shim": true,
   "skimage": "0.26.0",
   "astra": null,
-  "host": "max-wn170.desy.de",
+  "host": "linux-x86_64",
   "workers": 32,
   "wallclock_total_s": 386.722599029541,
   "slurm_job_id": "24052451"
