@@ -92,10 +92,37 @@ SAME views, so multi-label views become the norm and the
 staggered-labeling trap (warning W6, free shifts absorbing single-label
 views) largely disappears.
 
-Defaults, all measured: min corr 0.30, search radius 8 px (+0.25 px per
+Defaults, all measured: min p 0.20, search radius 8 px (+0.25 px per
 view from the seed), patch size 4x the feature's marker size (clipped
 16 to 96), high-pass sigma 12, coherence gate 0.4, three consecutive
 failures end a direction.
+
+**How a match is scored.** Completion uses a learned matcher (the earlier
+single-anchor phase-correlation completer has been removed). For each
+view the 5 manual labels nearest in angle each match independently, the
+position is their quality-weighted median (same median error as one
+anchor, half the p90), and a gradient-boosted classifier rates the answer
+with the probability that it lies within 4 raw px, from 43 features
+describing how the answer was reached (agreement of the five, the fused
+correlation map, patch structure, residual against the sinusoid). On
+held-out features that probability separates good from bad at AUC 0.92,
+where a plain correlation sits at 0.6; the "min p" box thresholds it and
+0.20 is the measured operating point. Measured end to end on the
+graphite-ball stack: anchors every 10 views plus completion reproduce the
+fully hand-labeled alignment to 1.4 raw px median in dx; 20-view anchors
+are the floor, 30 does not work. Trained on the one available dataset, so
+treat the probabilities as ranks until a second sample confirms them.
+Auto-completion needs scikit-learn and joblib (in the `ui` extra); without
+them the buttons report the matcher as unavailable. Roughly 20 s for the
+whole scan on 8 cores.
+
+**Residual rejection.** With "reject auto >" on (default, 3 x Huber), every
+fit is followed by one pass that removes AUTO labels whose residual exceeds
+that limit and refits. Manual labels are never removed. The Huber loop only
+down-weights a wrong match, and in a view carried by two labels a
+down-weighted 15 px lock-on still moves the free shift by several pixels;
+removing it does not. This pass alone recovered most of the learned
+matcher's end-to-end gain for the plain phase-correlation completer.
 
 ## Fixed and free parameters
 
