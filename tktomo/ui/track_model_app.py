@@ -33,6 +33,7 @@ from pathlib import Path
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -286,12 +287,23 @@ class TrackModelWindow(QMainWindow):
         row_w.setLayout(row)
         left_layout.addWidget(row_w)
 
+        # top: projection viewer and recon slice as tabs; bottom: one
+        # residual plot, 3:1 by default; controls on the right
+        self.tabs = QTabWidget()
+        self.tabs.addTab(left, "Projection")
+        self.tabs.addTab(self._build_recon_panel(), "Recon slice")
+        self.vsplitter = QSplitter(Qt.Orientation.Vertical)
+        self.vsplitter.addWidget(self.tabs)
+        self.vsplitter.addWidget(self._build_plots_panel())
+        self.vsplitter.setStretchFactor(0, 3)
+        self.vsplitter.setStretchFactor(1, 1)
+        self.vsplitter.setSizes([660, 220])
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(left)
-        splitter.addWidget(self._build_tabs())
+        splitter.addWidget(self.vsplitter)
         splitter.addWidget(self._build_controls())
-        splitter.setSizes([620, 460, 360])
+        splitter.setSizes([1040, 420])
         self.setCentralWidget(splitter)
+        self._build_menu()
         self.resize(1500, 900)
 
         if path:
@@ -302,29 +314,63 @@ class TrackModelWindow(QMainWindow):
 
     # ------------------------------------------------------------------ UI
 
-    def _build_tabs(self) -> QWidget:
-        self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_plots_tab(), "Residuals")
-        self._view3d_built = False
-        self._view3d_holder = QWidget()
-        QVBoxLayout(self._view3d_holder)
-        self.tabs.addTab(self._view3d_holder, "3D")
-        self.tabs.addTab(self._build_recon_tab(), "Recon slice")
-        self.tabs.currentChanged.connect(self._tab_changed)
-        return self.tabs
+    def _build_menu(self) -> None:
+        """File menu: everything that reads or writes a file lives here."""
+        menu = self._file_menu = self.menuBar().addMenu("&File")
 
-    def _build_plots_tab(self) -> QWidget:
-        """Two panes, each with a plot-kind dropdown. Defaults dx and dy.
+        def add(text, slot, shortcut=None, tip=None):
+            action = QAction(text, self)
+            action.triggered.connect(slot)
+            if shortcut:
+                action.setShortcut(QKeySequence(shortcut))
+            if tip:
+                action.setStatusTip(tip)
+                action.setToolTip(tip)
+            menu.addAction(action)
+            return action
+
+        add("Load stack…", lambda: self._load(None), "Ctrl+O",
+            "Open a projection stack (.h5). Replaces the labels and model.")
+        menu.addSeparator()
+        add("Load session…", lambda: self._load_session(None), "Ctrl+Shift+O",
+            "Restore labels, model, masks and UI state from a session file.")
+        add("Save session…", self._save_session, "Ctrl+S",
+            "Write labels, model, masks and UI state to a session file. "
+            "The stack itself is referenced by path, not copied.")
+        menu.addSeparator()
+        export = menu.addMenu("Export")
+        for text, slot, tip in (
+                ("Model + astra vectors (.h5)…", self._export_model,
+                 "Fitted model in raw detector coordinates plus ASTRA "
+                 "parallel3d_vec geometry."),
+                ("slogger shifts.h5…", self._export_shifts,
+                 "Per-view shifts in the slogger layout, on the loaded "
+                 "(binned, cropped) grid."),
+                ("Aligned projection stack…", self._export_aligned,
+                 "The loaded stack re-warped by the fitted per-view shifts.")):
+            action = QAction(text, self)
+            action.triggered.connect(slot)
+            action.setToolTip(tip)
+            action.setStatusTip(tip)
+            export.addAction(action)
+        menu.addSeparator()
+        add("Quit", self.close, "Ctrl+Q")
+
+    def _build_plots_panel(self) -> QWidget:
+        """One residual plot with a plot-kind dropdown. Default labels per view.
 
         Clicking in any angle-axis plot jumps to the nearest frame, which
-        turns the plots into navigation: see a gap or a bad point, click
+        turns the plot into navigation: see a gap or a bad point, click
         it, and you are looking at that projection.
         """
         holder = QWidget()
         layout = QVBoxLayout(holder)
+        layout.setContentsMargins(0, 0, 0, 0)
+        panes = QHBoxLayout()
+        layout.addLayout(panes, 1)
         self._plot_selectors: list[QComboBox] = []
         self._plot_widgets: list[pg.PlotWidget] = []
-        for default in ("dx shifts", "dy shifts"):
+        for default in ("labels per view",):
             combo = QComboBox()
             combo.addItems(PLOT_KINDS)
             combo.setCurrentText(default)
@@ -334,8 +380,14 @@ class TrackModelWindow(QMainWindow):
             plot.showGrid(x=True, y=True, alpha=0.3)
             plot.scene().sigMouseClicked.connect(
                 lambda ev, c=combo: self._plot_clicked(ev, c))
-            layout.addWidget(combo)
-            layout.addWidget(plot, 1)
+            pane = QVBoxLayout()
+            head = QHBoxLayout()
+            head.addWidget(QLabel("Residuals:"))
+            head.addWidget(combo)
+            head.addStretch(1)
+            pane.addLayout(head)
+            pane.addWidget(plot, 1)
+            panes.addLayout(pane, 1)
             self._plot_selectors.append(combo)
             self._plot_widgets.append(plot)
         hint = QLabel("click in a plot to jump to the nearest frame; "
@@ -364,7 +416,7 @@ class TrackModelWindow(QMainWindow):
         deg = np.rad2deg(self._data.angles)
         self._set_view(int(np.argmin(np.abs(deg - x_deg))))
 
-    def _build_recon_tab(self) -> QWidget:
+    def _build_recon_panel(self) -> QWidget:
         from tktomo.ptycho_align.ui.panels.base import (  # noqa: PLC0415
             StackDisplay,
         )
@@ -450,18 +502,6 @@ class TrackModelWindow(QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
 
-        top = QHBoxLayout()
-        load_btn = QPushButton("Load stack…")
-        load_btn.clicked.connect(lambda: self._load(None))
-        top.addWidget(load_btn)
-        session_save = QPushButton("Save session…")
-        session_save.clicked.connect(self._save_session)
-        session_load = QPushButton("Load session…")
-        session_load.clicked.connect(self._load_session)
-        top.addWidget(session_save)
-        top.addWidget(session_load)
-        layout.addLayout(top)
-
         feat_box = QGroupBox("Features (digit keys switch, click places)")
         feat_layout = QVBoxLayout(feat_box)
         self.feature_table = QTableWidget(0, 9)
@@ -485,17 +525,24 @@ class TrackModelWindow(QMainWindow):
         drop_btn.clicked.connect(self._drop_feature)
         feat_row.addWidget(new_btn)
         feat_row.addWidget(drop_btn)
-        feat_row.addWidget(QLabel("advance"))
+        feat_layout.addLayout(feat_row)
+        adv_row = QHBoxLayout()
+        self.active_label = QLabel("active feature: 0")
+        adv_row.addWidget(self.active_label, 1)
+        adv_row.addWidget(QLabel("advance"))
         self.advance_box = QSpinBox()
         self.advance_box.setRange(0, 100)
         self.advance_box.setValue(5)
-        feat_row.addWidget(self.advance_box)
-        feat_row.addWidget(QLabel("views/click"))
-        feat_layout.addLayout(feat_row)
-        self.active_label = QLabel("active feature: 0")
-        feat_layout.addWidget(self.active_label)
-        self.ghost_box = QCheckBox("Show active feature's labels from "
-                                   "other frames (small circles)")
+        self.advance_box.setToolTip(
+            "How many views the viewer steps forward after each placed "
+            "label. 0 stays on the current view.")
+        adv_row.addWidget(self.advance_box)
+        adv_row.addWidget(QLabel("views/click"))
+        feat_layout.addLayout(adv_row)
+        self.ghost_box = QCheckBox("Ghost labels from other frames")
+        self.ghost_box.setToolTip(
+            "Draw the active feature's labels from OTHER frames as faint "
+            "half-size circles, to judge where the next click belongs.")
         self.ghost_box.toggled.connect(lambda _c: self._refresh_view())
         feat_layout.addWidget(self.ghost_box)
         layout.addWidget(feat_box)
@@ -598,16 +645,20 @@ class TrackModelWindow(QMainWindow):
             box.valueChanged.connect(self._degrees_changed)
             deg_row.addWidget(QLabel(f"deg {label}"))
             deg_row.addWidget(box)
+        deg_row.addStretch(1)
         deg_holder = QWidget()
         deg_holder.setLayout(deg_row)
-        self._model_form.addRow("Polynomial degrees:", deg_holder)
+        deg_holder.setToolTip(
+            "Polynomial degree in theta of the axis center c, the in-plane "
+            "tilt alpha and the out-of-plane tilt beta.")
+        self._model_form.addRow("Degrees:", deg_holder)
         self._coef_rows: dict[str, list[tuple[QCheckBox, QDoubleSpinBox]]] = {
             "c": [], "alpha": [], "beta": []}
         self._rebuild_coef_rows()
         self.free_dx = QCheckBox("dx free")
-        self.free_dx.setChecked(True)
+        self.free_dx.setChecked(False)
         self.free_dy = QCheckBox("dy free")
-        self.free_dy.setChecked(True)
+        self.free_dy.setChecked(False)
         self.free_dx.setToolTip(
             "dx: one HORIZONTAL displacement of the whole projection per "
             "view, the per-view alignment error the model corrects.\n"
@@ -640,14 +691,16 @@ class TrackModelWindow(QMainWindow):
             "Set every per-view vertical shift to zero (projections "
             "assumed vertically aligned). Combine with an unchecked "
             "'dy free' to keep zeros through the next fit.")
-        shift_row = QHBoxLayout()
-        for w in (self.free_dx, zero_dx, self.free_dy, zero_dy):
-            shift_row.addWidget(w)
-            if isinstance(w, QCheckBox):
-                w.toggled.connect(lambda _c: self._request_fit())
-        shift_holder = QWidget()
-        shift_holder.setLayout(shift_row)
-        self._model_form.addRow("Per-view shifts:", shift_holder)
+        for label, check, zero in (("Shift dx:", self.free_dx, zero_dx),
+                                   ("Shift dy:", self.free_dy, zero_dy)):
+            check.toggled.connect(lambda _c: self._request_fit())
+            shift_row = QHBoxLayout()
+            shift_row.addWidget(check)
+            shift_row.addWidget(zero)
+            shift_row.addStretch(1)
+            shift_holder = QWidget()
+            shift_holder.setLayout(shift_row)
+            self._model_form.addRow(label, shift_holder)
         # Frozen shifts are invisible state that changes what a fit means;
         # this line keeps them visible so "why does my fit depend on
         # earlier clicking" has an on-screen answer.
@@ -668,11 +721,15 @@ class TrackModelWindow(QMainWindow):
         robust_row = QHBoxLayout()
         robust_row.addWidget(QLabel("huber k"))
         robust_row.addWidget(self.huber)
-        robust_row.addWidget(QLabel("IRLS iters"))
+        robust_row.addWidget(QLabel("iters"))
         robust_row.addWidget(self.iters)
+        robust_row.addStretch(1)
         robust_holder = QWidget()
         robust_holder.setLayout(robust_row)
-        self._model_form.addRow("Robustness:", robust_holder)
+        robust_holder.setToolTip(
+            "Huber threshold k in units of the residual scale, and the "
+            "number of reweighting (IRLS) passes per fit.")
+        self._model_form.addRow("Robust:", robust_holder)
         layout.addWidget(model_box)
 
         fit_row = QHBoxLayout()
@@ -690,7 +747,19 @@ class TrackModelWindow(QMainWindow):
         fit_row.addWidget(fit_btn)
         fit_row.addWidget(self.auto_fit)
         fit_row.addWidget(diag_btn)
+        layout.addLayout(fit_row)
+        fit_row = QHBoxLayout()
+        unlabeled_btn = QPushButton("Next unlabelled")
+        unlabeled_btn.setToolTip(
+            "Step forward (wrapping around) to the next projection that "
+            "carries no label at all, always leaving the current one even "
+            "if it is unlabelled itself. Once every projection has a "
+            "label, steps to the next one with the fewest labels. Views "
+            "without labels are where the per-view shifts are only "
+            "interpolated, never measured.")
+        unlabeled_btn.clicked.connect(self._goto_next_unlabelled)
         fit_row.addWidget(outlier_btn)
+        fit_row.addWidget(unlabeled_btn)
         layout.addLayout(fit_row)
 
         self.summary_label = QLabel("no fit yet")
@@ -701,22 +770,16 @@ class TrackModelWindow(QMainWindow):
         self.warnings_box.setMaximumHeight(140)
         layout.addWidget(self.warnings_box)
 
-        export_box = QGroupBox("Export")
-        export_layout = QVBoxLayout(export_box)
-        for text, slot in (
-                ("Model + astra vectors (.h5)…", self._export_model),
-                ("slogger shifts.h5…", self._export_shifts),
-                ("Aligned projection stack…", self._export_aligned)):
-            btn = QPushButton(text)
-            btn.clicked.connect(slot)
-            export_layout.addWidget(btn)
-        layout.addWidget(export_box)
         layout.addStretch(1)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(panel)
-        scroll.setMinimumWidth(340)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setMinimumWidth(
+            panel.minimumSizeHint().width() + scroll.frameWidth() * 2
+            + scroll.verticalScrollBar().sizeHint().width())
         return scroll
 
     # --------------------------------------------------------- model sync
@@ -734,6 +797,11 @@ class TrackModelWindow(QMainWindow):
                 ("beta", "β", degrees[2], 5, 0.001)):
             for k in range(degree + 1):
                 check = QCheckBox("fix")
+                if group == "beta":
+                    # out-of-plane tilt is fixed at zero until asked for:
+                    # it is weakly constrained by few features and trades
+                    # off against y and dy
+                    check.setChecked(True)
                 spin = QDoubleSpinBox()
                 spin.setDecimals(decimals)
                 spin.setRange(-1e6, 1e6)
@@ -883,6 +951,19 @@ class TrackModelWindow(QMainWindow):
         if np.allclose(sizes, sizes[0] if sizes.size else 1.0):
             return None                    # uniform sizes = unweighted
         return 1.0 / np.clip(sizes, 1e-3, None)
+
+    def _goto_next_unlabelled(self) -> None:
+        """Forward (wrapping) to the next view with no labels, or, once
+        every view has some, to the next view with the fewest labels."""
+        if self._data is None:
+            return
+        counts = self._label_counts_per_view()
+        targets = np.flatnonzero(counts == counts.min())
+        targets = targets[targets != self._view]
+        if targets.size == 0:
+            return
+        ahead = targets[targets > self._view]
+        self._set_view(int(ahead[0] if ahead.size else targets[0]))
 
     def _goto_worst_outlier(self) -> None:
         if self._fit is None or self._fit.residual_u.size == 0:
@@ -1104,7 +1185,6 @@ class TrackModelWindow(QMainWindow):
         self._refresh_feature_table()
         self._refresh_plots()
         self._refresh_view()
-        self._refresh_3d()
         self.summary_label.setText(
             f"rms u {fit.rms_u:.3f} px, v {fit.rms_v:.3f} px "
             f"({fit.residual_u.size} labels, "
@@ -1462,121 +1542,6 @@ class TrackModelWindow(QMainWindow):
                     plot.plot(edges, counts, stepMode="center",
                               fillLevel=0, brush=pg.mkBrush(*color),
                               pen=pg.mkPen(*color))
-
-    # ----------------------------------------------------------------- 3D
-
-    def _tab_changed(self, index: int) -> None:
-        if self.tabs.widget(index) is self._view3d_holder:
-            self._build_3d_once()
-            self._refresh_3d()
-
-    def _build_3d_once(self) -> None:
-        if self._view3d_built:
-            return
-        self._view3d_built = True
-        layout = self._view3d_holder.layout()
-        try:
-            import pyqtgraph.opengl as gl  # noqa: PLC0415
-        except Exception as exc:  # ImportError or missing GL driver
-            layout.addWidget(QLabel(
-                f"3D view needs PyOpenGL (pip install PyOpenGL).\n{exc}"))
-            self._gl = None
-            return
-        self._gl = gl
-        self.view3d = gl.GLViewWidget()
-        self.view3d.setCameraPosition(distance=600)
-        self._gl_grid = gl.GLGridItem()
-        self._gl_grid.scale(20, 20, 1)
-        self._gl_centered = False
-        self.view3d.addItem(self._gl_grid)
-        self._gl_axis = gl.GLLinePlotItem(width=2, antialias=True)
-        self.view3d.addItem(self._gl_axis)
-        self._gl_points = gl.GLScatterPlotItem(pxMode=True, size=9)
-        self.view3d.addItem(self._gl_points)
-        self._gl_cloud = gl.GLScatterPlotItem(pxMode=True, size=3)
-        self.view3d.addItem(self._gl_cloud)
-        self._gl_arcs: list = []
-        layout.addWidget(self.view3d)
-
-    def _refresh_3d(self) -> None:
-        if not self._view3d_built or getattr(self, "_gl", None) is None:
-            return
-        if self._fit is None:
-            return
-        gl = self._gl
-        model = self._fit.model
-        i, j = self._fit.obs
-
-        # The horizontal grid plane sits at the stack's CENTER ROW (in raw
-        # coordinates, like everything in the scene), so height reads
-        # relative to the middle of the field of view instead of raw zero,
-        # which for a cropped stack is nowhere near the data.
-        if self._data is not None:
-            center_row = (self._data.data.shape[1] - 1) / 2.0
-            view = self._view if self._chain.view_origin is not None else None
-            _, v_center = self._chain.to_parent(0.0, center_row, view=view)
-            z_grid = -float(v_center)
-            self._gl_grid.resetTransform()
-            self._gl_grid.scale(20, 20, 1)
-            self._gl_grid.translate(0, 0, z_grid)
-            if not self._gl_centered:
-                self._gl_centered = True
-                self.view3d.opts["center"] = pg.Vector(0, 0, z_grid)
-                self.view3d.update()
-        counts = self._labels.counts()
-        keep = np.array([counts.get(int(f), 0) > 0
-                         for f in model.feature_ids], bool)
-
-        # fitted feature points in the rotating frame; z is the detector row
-        # direction, drawn negated so "up in the image" is up on screen
-        pos = np.column_stack([model.a[keep], model.b[keep],
-                               -model.y[keep]])
-        colors = np.array([(*feature_color(int(f)), 255)
-                           for f in model.feature_ids[keep]],
-                          float) / 255.0
-        self._gl_points.setData(pos=pos, color=colors)
-
-        # back-projected labels: feature position + residual along the view
-        # direction (u residual on e_s, v residual vertical)
-        ct, sn = np.cos(model.theta[j]), np.sin(model.theta[j])
-        cloud = np.column_stack([
-            model.a[i] + self._fit.residual_u * ct,
-            model.b[i] + self._fit.residual_u * sn,
-            -(model.y[i] + self._fit.residual_v)])
-        cloud_colors = np.array(
-            [(*feature_color(int(model.feature_ids[fi])), 110)
-             for fi in i], float) / 255.0
-        self._gl_cloud.setData(pos=cloud, color=cloud_colors)
-
-        for item in self._gl_arcs:
-            self.view3d.removeItem(item)
-        self._gl_arcs.clear()
-        for row in np.flatnonzero(keep):
-            radius = float(np.hypot(model.a[row], model.b[row]))
-            phase = float(np.arctan2(model.b[row], model.a[row]))
-            arc_theta = np.linspace(0, 2 * np.pi, 90)
-            pts = np.column_stack([
-                radius * np.cos(phase + arc_theta),
-                radius * np.sin(phase + arc_theta),
-                np.full(arc_theta.size, -model.y[row])])
-            color = (*(np.array(feature_color(
-                int(model.feature_ids[row]))) / 255.0), 0.35)
-            item = gl.GLLinePlotItem(pos=pts, color=color, width=1,
-                                     antialias=True)
-            self.view3d.addItem(item)
-            self._gl_arcs.append(item)
-
-        # the rotation axis: x = y = 0 in the rotating frame BY DEFINITION;
-        # c(theta) drift and tilts live in the projection model, so the
-        # interesting part is drawn as the axis plus its detector-frame
-        # center curve is in the Residuals tab.
-        if pos.size:
-            z0, z1 = float(cloud[:, 2].min()) - 30, float(
-                cloud[:, 2].max()) + 30
-        else:
-            z0, z1 = -100, 100
-        self._gl_axis.setData(pos=np.array([[0, 0, z0], [0, 0, z1]]),
-                              color=(1, 1, 1, 0.9))
 
     # -------------------------------------------------------------- recon
 

@@ -37,7 +37,10 @@ The active feature's predicted cross is drawn larger and in its feature
 color (others stay white). A toggle shows the active feature's labels
 from OTHER frames as faint half-size circles, useful for judging where
 the next click belongs. The "Worst outlier" button jumps to the label
-with the largest residual and makes its feature active.
+with the largest residual and makes its feature active. "Next
+unlabelled" steps forward (wrapping) to the next projection with no
+label at all, and once every projection has one, to the next with the
+fewest labels.
 
 Each feature has an editable marker SIZE (image pixels) in the table.
 Match it to the physical feature: circles are drawn at that diameter in
@@ -127,7 +130,11 @@ matcher's end-to-end gain for the plain phase-correlation completer.
 ## Fixed and free parameters
 
 Every polynomial coefficient has a "fix" checkbox and an editable value;
-`dx` and `dy` are fixed or freed as whole groups; a feature row can be
+The out-of-plane tilt beta starts fixed at zero (few features constrain
+it and it trades off against y and dy), untick "fix" to fit it.
+`dx` and `dy` are fixed or freed as whole groups and start FIXED (at
+zero) so the first fits explain the labels with axis geometry alone;
+free them once several features share views. A feature row can be
 pinned, which fixes its (a, b, y). Editing any value re-evaluates the
 residuals WITHOUT fitting, so the response to "what if the center were
 here" is immediate; the next fit overwrites free values and respects fixed
@@ -153,8 +160,8 @@ shown but loses every argument with it.
 
 ## Plots and views without labels
 
-The middle panel holds two plot panes, each with a dropdown selecting
-what it shows (defaults: dx and dy shifts). Available: dx/dy shifts,
+The bottom panel holds one plot pane with a dropdown selecting what it
+shows (default: labels per view). Available: dx/dy shifts,
 labels per view, residual u/v colored by feature, per-view MAD spread,
 axis center c(theta), tilts alpha/beta, residual histogram. Clicking in
 any angle-axis plot jumps to the nearest frame, so a gap or a bad point
@@ -167,6 +174,11 @@ label verbatim), the dashed curve is the interpolation, and red base
 ticks mark frames with NO labels at all. The "labels per view" plot
 shows the coverage directly, with the same red ticks and an orange
 guide line at two labels.
+
+## Files
+
+Loading a stack, saving and loading a session, and every export live in
+the File menu (Ctrl+O stack, Ctrl+Shift+O session, Ctrl+S save session).
 
 ## Exports
 
@@ -187,7 +199,8 @@ guide line at two labels.
 
 ## Recon slice
 
-The Recon tab reconstructs one detector row with tomopy gridrec at the
+The Recon slice tab (top panel, next to the projection view)
+reconstructs one detector row with tomopy gridrec at the
 fitted center, after applying each view's full 2D correction: the dx/dy
 shifts, the c(theta) drift, and derotation by the in-plane tilt
 alpha(theta), so the slice responds to the tilt parameters. Only beta
@@ -200,11 +213,3 @@ reconstruction runs on a single worker thread with single-flight
 scheduling: tomopy segfaults when called from two threads at once, so a
 request arriving while one runs replaces the pending one instead of
 queueing.
-
-## 3D view
-
-Fitted feature positions (a, b, y) in the rotating frame, the circle each
-feature traces in the lab frame, the rotation axis, and every label
-back-projected through the model as a residual cloud around its feature.
-Needs PyOpenGL (in the `ui` extra); without it the tab shows a hint and
-everything else works.

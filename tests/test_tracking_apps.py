@@ -260,7 +260,7 @@ def test_plot_panes_defaults_kinds_and_missing_frames(tracker):
     from tktomo.ui.track_model_app import PLOT_KINDS
 
     assert [c.currentText() for c in tracker._plot_selectors] \
-        == ["dx shifts", "dy shifts"]
+        == ["labels per view"]
     # "labels per view" renders from labels alone, before any fit exists
     tracker._set_active(0)
     tracker._set_view(4)
@@ -274,8 +274,35 @@ def test_plot_panes_defaults_kinds_and_missing_frames(tracker):
     tracker._fit_now()
     # every kind renders without raising, and produces data items
     for kind in PLOT_KINDS:
-        tracker._plot_selectors[1].setCurrentText(kind)
-        assert tracker._plot_widgets[1].getPlotItem().listDataItems(), kind
+        tracker._plot_selectors[0].setCurrentText(kind)
+        assert tracker._plot_widgets[0].getPlotItem().listDataItems(), kind
+
+
+def test_next_unlabelled_button_walks_the_gaps(tracker):
+    n = tracker._data.angles.size
+    tracker._set_active(0)
+    for view in (0, 1, 3):
+        tracker._set_view(view)
+        tracker._place(60.0, 40.0)
+    tracker._set_view(0)
+    tracker._goto_next_unlabelled()
+    assert tracker._view == 2
+    tracker._goto_next_unlabelled()     # leaves the unlabelled current view
+    assert tracker._view == 4
+    tracker._set_view(n - 1)
+    tracker._goto_next_unlabelled()     # wraps around
+    assert tracker._view == 2
+    # every view labelled once, view 1 twice: steps among the single-label
+    # views and skips view 1
+    for view in range(n):
+        tracker._set_view(view)
+        tracker._place(60.0, 40.0)
+    tracker._set_active(1)
+    tracker._set_view(1)
+    tracker._place(30.0, 20.0)
+    tracker._set_view(0)
+    tracker._goto_next_unlabelled()
+    assert tracker._view == 2
 
 
 def test_plot_click_jumps_to_nearest_frame(tracker):
@@ -559,19 +586,17 @@ def test_recon_binning_rescales_geometry(tracker):
     assert binned["row_in_slab"] <= full["row_in_slab"] // 2 + 1
 
 
-def test_3d_grid_sits_at_center_row(tracker):
-    truth = truth_for(tracker)
-    label_from_truth(tracker, truth)
-    tracker._fit_now()
-    tracker._build_3d_once()
-    if tracker._gl is None:
-        pytest.skip("no OpenGL in this environment")
-    tracker._refresh_3d()
-    from PySide6.QtGui import QVector3D
-    z = tracker._gl_grid.transform().map(QVector3D(0, 0, 0)).z()
-    # identity chain: grid at the stack's center row, scene z negated
-    center_row = (tracker._data.data.shape[1] - 1) / 2.0
-    assert z == pytest.approx(-center_row)
+def test_tracker_file_menu_holds_io_actions(tracker):
+    """Load/save/export live in the File menu, not on the control panel."""
+    from PySide6.QtWidgets import QPushButton
+    assert [a.text() for a in tracker.menuBar().actions()] == ["&File"]
+    texts = [a.text() for a in tracker._file_menu.actions()]
+    assert "Load stack…" in texts
+    assert "Save session…" in texts
+    assert "Export" in texts
+    labels = [b.text() for b in tracker.findChildren(QPushButton)]
+    assert not any("session" in x or "Load stack" in x for x in labels)
+    assert not tracker.free_dx.isChecked() and not tracker.free_dy.isChecked()
 
 
 def test_tracker_recon_single_flight(tracker, qtbot):
@@ -591,12 +616,6 @@ def test_tracker_recon_single_flight(tracker, qtbot):
     qtbot.wait(50)
     image = tracker.recon_display.image_view.getImageItem().image
     assert image is not None and image.ndim == 2
-
-
-def test_tracker_3d_tab_degrades_or_builds(tracker):
-    tracker._build_3d_once()
-    assert tracker._view3d_built
-    tracker._refresh_3d()         # must not raise, with or without OpenGL
 
 
 def test_trajectory_overlay_excludes_per_view_jitter(tracker):
@@ -725,6 +744,8 @@ def test_end_to_end_known_shifts_recovered(qtbot):
         for view in range(40):
             win._set_view(view)
             win._place(u_t[f, view], v_t[f, view])
+    win.free_dx.setChecked(True)     # shifts are frozen by default
+    win.free_dy.setChecked(True)
     win._fit_now()
     fit = win._fit
     assert fit.rms_u < 1e-6 and fit.rms_v < 1e-6

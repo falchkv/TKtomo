@@ -33,9 +33,6 @@ ui = [
     "colorcet>=3.0",
     "cmocean>=3.0",
     "cmasher>=1.6",
-    # for the track-model app's 3D view (pyqtgraph.opengl); the app degrades
-    # to a hint label without it, so it is a soft requirement at runtime
-    "PyOpenGL>=3.1",
     # the track-model app's auto-completion is the learned matcher only
     "scikit-learn>=1.3",
     "joblib>=1.3",

@@ -5,7 +5,9 @@ libraries are imported lazily and only maps whose source is installed are
 advertised by :func:`available_colormaps`, so the UI dropdown never lists a map
 it cannot build. Grayscale is always available as a dependency-free fallback.
 
-A curated entry is ``display_name -> (source, source_name)``.
+A curated entry is ``display_name -> (source, source_name)``. The
+``builtin`` source is computed here with numpy alone (grayscale and the
+DECTRIS ALBULA scales), so those names are always available.
 """
 
 from __future__ import annotations
@@ -16,6 +18,9 @@ _N = 256
 
 # Curated selection. Perceptually-uniform, colour-vision-deficiency friendly.
 _CURATED: dict[str, tuple[str, str]] = {
+    # dependency-free, computed below
+    "albula": ("builtin", "albula_hdr"),
+    "albula-hot": ("builtin", "albula_hot"),
     # matplotlib built-ins (uniform)
     "viridis": ("matplotlib", "viridis"),
     "plasma": ("matplotlib", "plasma"),
@@ -40,9 +45,49 @@ def _grayscale_lut() -> np.ndarray:
     return np.stack([ramp, ramp, ramp], axis=1)
 
 
+def _albula_hot_ramp(s: np.ndarray) -> np.ndarray:
+    """Black to red to orange to yellow to white over ``s`` in [0, 1].
+
+    Breakpoints measured from the gradient bar of the ALBULA histogram
+    widget: red saturates 30 % in, green at 63 %, blue starts at 67 %.
+    """
+    r = np.clip(s / 0.30, 0.0, 1.0)
+    g = np.clip((s - 0.30) / (0.63 - 0.30), 0.0, 1.0)
+    b = np.clip((s - 0.67) / (1.0 - 0.67), 0.0, 1.0)
+    return np.stack([r, g, b], axis=-1)
+
+
+def _albula_lut(hdr: bool) -> np.ndarray:
+    """The DECTRIS ALBULA "High Dynamic Range" scale as an RGB table.
+
+    Two ramps glued together: an inverted grey wedge (white at the bottom
+    of the scale falling to black at the mid point) followed by the hot
+    wedge. Weak signal reads as dark streaks on white, strong signal as a
+    red to yellow core. ``hdr=False`` returns only the hot wedge.
+    """
+    t = np.linspace(0.0, 1.0, _N)
+    if not hdr:
+        rgb = _albula_hot_ramp(t)
+    else:
+        split = 0.5
+        rgb = np.zeros((_N, 3))
+        grey = t < split
+        rgb[grey] = (1.0 - t[grey] / split)[:, None]
+        rgb[~grey] = _albula_hot_ramp((t[~grey] - split) / (1.0 - split))
+    return (rgb * 255).astype(np.uint8)
+
+
+_BUILTIN = {
+    "albula_hdr": lambda: _albula_lut(hdr=True),
+    "albula_hot": lambda: _albula_lut(hdr=False),
+}
+
+
 def _load_lut(source: str, source_name: str) -> np.ndarray:
     """Return an ``(_N, 3)`` uint8 RGB lookup table, or raise ImportError."""
     samples = np.linspace(0.0, 1.0, _N)
+    if source == "builtin":
+        return _BUILTIN[source_name]()
     if source == "matplotlib":
         import matplotlib  # noqa: PLC0415
 
@@ -70,7 +115,8 @@ def available_colormaps() -> list[str]:
     names = ["grayscale"]
     for name, (source, _sn) in _CURATED.items():
         try:
-            __import__(source)
+            if source != "builtin":
+                __import__(source)
             names.append(name)
         except ImportError:
             continue
