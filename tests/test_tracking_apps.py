@@ -766,3 +766,38 @@ def test_end_to_end_known_shifts_recovered(qtbot):
     aligned = export_aligned_stack(base, m, CoordinateChain())
     assert aligned.data.shape == base.data.shape
     assert np.isfinite(aligned.data).all()
+
+
+def test_viewbox_drops_touchpad_momentum_but_not_wheel_notches(tracker):
+    from PySide6.QtCore import Qt
+    from tktomo.ptycho_align.ui.panels.base import NoMomentumViewBox
+
+    vb = tracker.viewer.image_view.getView()
+    assert isinstance(vb, NoMomentumViewBox)
+    vb.setRange(xRange=(0, 100), yRange=(0, 100), padding=0)
+    before = vb.viewRange()
+
+    class Ev:
+        def __init__(self, phase):
+            self._phase = phase
+
+        def phase(self):
+            return self._phase
+
+        def delta(self):
+            return 120
+
+        def pos(self):
+            from PySide6.QtCore import QPointF
+            return QPointF(50, 50)
+
+        def accept(self):
+            pass
+
+        def ignore(self):
+            pass
+
+    vb.wheelEvent(Ev(Qt.ScrollPhase.ScrollMomentum))
+    assert vb.viewRange() == before          # momentum tail ignored
+    vb.wheelEvent(Ev(Qt.ScrollPhase.NoScrollPhase))
+    assert vb.viewRange() != before          # a real notch still zooms

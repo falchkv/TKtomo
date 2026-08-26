@@ -12,6 +12,7 @@ from collections.abc import Callable
 
 import numpy as np
 import pyqtgraph as pg
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -41,6 +42,26 @@ def diverging_colormap_name() -> str:
     return next(name for name in _DIVERGING_PREFERENCES if name in available)
 
 
+class NoMomentumViewBox(pg.ViewBox):
+    """A ViewBox that ignores a touchpad's kinetic scroll tail.
+
+    A mouse wheel sends one event per notch. A touchpad sends a stream of
+    small events and, after the fingers lift, keeps sending "momentum"
+    events that decay over a second or so. Fed into the exponential zoom,
+    that tail keeps zooming after the gesture ended and overshoots. Qt
+    tags those events with ``ScrollPhase.ScrollMomentum``, so they are
+    dropped here; every other event (mouse wheels report ``NoScrollPhase``)
+    reaches the stock handler untouched.
+    """
+
+    def wheelEvent(self, ev, axis=None):
+        phase = getattr(ev, "phase", None)
+        if phase is not None and phase() == Qt.ScrollPhase.ScrollMomentum:
+            ev.accept()
+            return
+        super().wheelEvent(ev, axis)
+
+
 class StackDisplay(QWidget):
     """An ImageView over a 3-D stack, scrolled externally (not by pyqtgraph's slider).
 
@@ -51,7 +72,7 @@ class StackDisplay(QWidget):
     def __init__(self, *, default_colormap: str = "viridis", parent: QWidget | None = None) -> None:
         super().__init__(parent)
 
-        self.image_view = pg.ImageView()
+        self.image_view = pg.ImageView(view=NoMomentumViewBox())
         self.image_view.ui.roiBtn.hide()
         self.image_view.ui.menuBtn.hide()
         # Row 0 at the top, like every other image viewer in the world.
