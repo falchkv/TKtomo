@@ -293,32 +293,31 @@ def aligned_view_transforms(model: AxisModel, chain: CoordinateChain,
     return out
 
 
-def export_aligned_stack(data, model: AxisModel, chain: CoordinateChain, *,
-                         order: int = 1, progress=None):
-    """Warp every projection by its `aligned_view_transforms` transform.
+def warp_stack(frames, transforms, *, order: int = 1, progress=None) -> np.ndarray:
+    """Resample every frame by its transform; `frames[k]` is read one at a time.
 
-    `data` is a `ProjectionData` in the chain's loaded frame; returns a new
-    `ProjectionData` (one affine resample per view: shift and rotation are
-    composed, not applied twice). Metadata records the fixed center on both
-    grids and what was NOT applied (beta, alpha drift), so a downstream
-    reconstruction cannot mistake best-effort for exact.
+    `progress(done, total) -> bool` returning False cancels (RuntimeError).
     """
     from tktomo.align.transform import apply_transform  # noqa: PLC0415
-    from tktomo.io import ProjectionData  # noqa: PLC0415
 
-    transforms = aligned_view_transforms(model, chain)
-    n = data.data.shape[0]
+    n = len(frames)
     if len(transforms) != n:
         raise ValueError("model and stack view counts differ")
-    out = np.empty_like(data.data, dtype=np.float32)
+    out = None
     for k in range(n):
-        out[k] = apply_transform(np.asarray(data.data[k], np.float32),
-                                 transforms[k], order=order)
+        frame = np.asarray(frames[k], np.float32)
+        if out is None:
+            out = np.empty((n, *frame.shape), np.float32)
+        out[k] = apply_transform(frame, transforms[k], order=order)
         if progress is not None and not progress(k + 1, n):
             raise RuntimeError("aligned-stack export cancelled")
+    return out if out is not None else np.empty((0, 0, 0), np.float32)
 
+
+def aligned_metadata(base: dict, model: AxisModel, chain: CoordinateChain) -> dict:
+    """The provenance the aligned stack carries: what was applied and what was NOT."""
     c_ref = model.center_at_mean_theta()
-    metadata = dict(data.metadata)
+    metadata = dict(base)
     metadata.update({
         "aligned_by": "track_model_app",
         "center_raw_px": float(c_ref),
@@ -330,5 +329,22 @@ def export_aligned_stack(data, model: AxisModel, chain: CoordinateChain, *,
             "alpha_coef_higher": model.alpha_coef[1:].tolist(),
         }),
     })
-    return ProjectionData(data=out, angles=data.angles.copy(),
-                          metadata=metadata)
+    return metadata
+
+
+def export_aligned_stack(data, model: AxisModel, chain: CoordinateChain, *,
+                         order: int = 1, progress=None):
+    """Warp every projection by its `aligned_view_transforms` transform.
+
+    `data` is a `ProjectionData` in the chain's loaded frame; returns a new
+    `ProjectionData` (one affine resample per view: shift and rotation are
+    composed, not applied twice). Metadata records the fixed center on both
+    grids and what was NOT applied (beta, alpha drift), so a downstream
+    reconstruction cannot mistake best-effort for exact.
+    """
+    from tktomo.io import ProjectionData  # noqa: PLC0415
+
+    transforms = aligned_view_transforms(model, chain)
+    out = warp_stack(data.data, transforms, order=order, progress=progress)
+    return ProjectionData(data=out, angles=np.asarray(data.angles).copy(),
+                          metadata=aligned_metadata(data.metadata, model, chain))

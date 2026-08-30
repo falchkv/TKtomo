@@ -55,7 +55,7 @@ from tktomo.ptycho_align.session.types import (
 
 logger = logging.getLogger("tktomo.ptycho_align")
 
-__all__ = ["Disconnected", "RemoteSession"]
+__all__ = ["Disconnected", "RemoteClient", "RemoteSession"]
 
 #: How often the poller asks for new events. Fast enough that a step feels immediate,
 #: slow enough to be nothing on a link shared with plane reads.
@@ -70,8 +70,13 @@ class Disconnected(SessionError):
     """The engine did not answer. The run, if any, is still going on over there."""
 
 
-class RemoteSession:
-    """Drives an engine on a server. Satisfies :class:`AlignmentSession`."""
+class RemoteClient:
+    """The transport half of a remote session: sockets, request ids, events, ``wait``.
+
+    Knows nothing about engines. :class:`RemoteSession` adds the ptycho-align verbs on
+    top; the tracking client adds its own. Subclasses override :meth:`_resync` to say
+    what to do when the event ring has rolled past what this client last saw.
+    """
 
     def __init__(
         self,
@@ -171,18 +176,15 @@ class RemoteSession:
             # stale view with fresh events; resync from a summary instead.
             logger.info("Missed events %s..%s; resyncing", self._seq, batch.oldest_seq)
             self._seq = batch.last_seq
-            try:
-                summary = self.summary()
-            except Exception:
-                return
-            self._fan_out(
-                Event(seq=batch.last_seq, kind=EVENT_SUMMARY, payload={"summary": summary})
-            )
+            self._resync(batch.last_seq)
             return
 
         for event in batch.events:
             self._seq = max(self._seq, event.seq)
             self._fan_out(event)
+
+    def _resync(self, seq: int) -> None:
+        """Recover after missed events. The base client has no state to refresh."""
 
     def _fan_out(self, event: Event) -> None:
         with self._subscriber_lock:
@@ -207,6 +209,107 @@ class RemoteSession:
     def poll_events(self, since_seq: int, max_n: int = 256) -> EventBatch:
         return self._call("poll_events", since_seq, max_n)
 
+    def cancel_job(self, job_id: str) -> None:
+        self._call("cancel_job", job_id)
+
+    # -- lifecycle ---------------------------------------------------------------------
+
+    def job_state(self, job_id: str) -> JobState | None:
+        return self._call("job_state", job_id)
+
+    def wait(self, handle: JobHandle, timeout: float | None = None) -> Any:
+        """Poll until the job is settled, then return or raise its outcome.
+
+        Matches ``EngineHost.wait``: ``KeyError`` for a job that never existed,
+        ``TimeoutError`` if it outlasts ``timeout``, the job's own exception if it
+        failed -- and, less obviously, the same guarantee about *events*. When the local
+        version returns, every subscriber has already been handed the job's events,
+        because it blocks on a flag set after they are emitted. So this asks
+        ``job_settled``, which reports that same flag along with the sequence number it
+        was true at, and then holds until the poller has delivered up to there.
+
+        Delivery is left to the poller rather than done here. Pumping on the calling
+        thread would be quicker, but it would mean events reaching subscribers on
+        whichever thread happened to call ``wait`` -- an asymmetry with the local session
+        that the conformance suite rightly refuses.
+
+        The polling is on this side rather than the server's so that an hour-long run
+        does not occupy the server loop for an hour, stalling the plane reads the user is
+        scrubbing through while it runs.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        interval = 0.005
+        while True:
+            reply = self._call("job_settled", handle.job_id)
+            if reply["settled"]:
+                self._await_delivery(reply["seq"])
+                return self._outcome(handle)
+            if self.job_state(handle.job_id) is None:
+                raise KeyError(f"No such job: {handle.job_id}")
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"{handle.kind} did not finish within {timeout}s")
+            time.sleep(interval)
+            # Back off to the event cadence: a 60-minute run does not need 200 status
+            # questions a second, and it is the first few iterations that feel slow.
+            interval = min(interval * 1.5, self._poll_interval)
+
+    def _await_delivery(self, seq: int, grace: float = 5.0) -> None:
+        """Hold until the poller has handed subscribers everything up to ``seq``.
+
+        Bounded, because a dead or stopped poller would otherwise turn a finished job
+        into a hang. Exceeding the grace period means events were lost, not that the job
+        failed, so it is logged and the result still returned.
+        """
+        deadline = time.monotonic() + grace
+        while self._seq < seq:
+            if self._stop.is_set() or time.monotonic() > deadline:
+                logger.warning("Events up to %s were not delivered within %gs", seq, grace)
+                return
+            time.sleep(0.002)
+
+    def _outcome(self, handle: JobHandle) -> Any:
+        state = self.job_state(handle.job_id)
+        if state is None:
+            raise KeyError(f"No such job: {handle.job_id}")
+        if state.error is not None:
+            raise state.error
+        return state.result
+
+    def close(self) -> None:
+        """Disconnect. The engine keeps running; reconnecting picks it back up.
+
+        The socket is closed under the lock where it can be: a zmq socket
+        belongs to one thread at a time, and by now the poller is not the
+        only other caller (the tracking client prefetches frames on a thread
+        of its own). Bounded, because a call that is waiting out its timeout
+        must not hold a window open, and closing under it is no worse than
+        the unlocked close this replaced.
+        """
+        self._stop.set()
+        if self._poller.is_alive():
+            self._poller.join(timeout=2.0)
+        held = self._lock.acquire(timeout=2.0)
+        try:
+            self._socket.close(0)
+            self._context.term()
+        finally:
+            if held:
+                self._lock.release()
+
+
+class RemoteSession(RemoteClient):
+    """Drives an engine on a server. Satisfies :class:`AlignmentSession`."""
+
+    def _resync(self, seq: int) -> None:
+        # The accumulated history is no longer a prefix of the server's, so replaying
+        # from here would interleave a stale view with fresh events; hand subscribers a
+        # fresh summary instead.
+        try:
+            summary = self.summary()
+        except Exception:
+            return
+        self._fan_out(Event(seq=seq, kind=EVENT_SUMMARY, payload={"summary": summary}))
+
     # -- state -------------------------------------------------------------------------
 
     def summary(self, since_iteration: int = 0) -> SessionSummary:
@@ -225,9 +328,6 @@ class RemoteSession:
 
     def cancel_run(self) -> None:
         self._call("cancel_run")
-
-    def cancel_job(self, job_id: str) -> None:
-        self._call("cancel_job", job_id)
 
     # -- queries -----------------------------------------------------------------------
 
@@ -300,74 +400,3 @@ class RemoteSession:
 
     def export(self, kind: str, path: str) -> JobHandle:
         return self._call("export", kind, path)
-
-    # -- lifecycle ---------------------------------------------------------------------
-
-    def job_state(self, job_id: str) -> JobState | None:
-        return self._call("job_state", job_id)
-
-    def wait(self, handle: JobHandle, timeout: float | None = None) -> Any:
-        """Poll until the job is settled, then return or raise its outcome.
-
-        Matches ``EngineHost.wait``: ``KeyError`` for a job that never existed,
-        ``TimeoutError`` if it outlasts ``timeout``, the job's own exception if it
-        failed -- and, less obviously, the same guarantee about *events*. When the local
-        version returns, every subscriber has already been handed the job's events,
-        because it blocks on a flag set after they are emitted. So this asks
-        ``job_settled``, which reports that same flag along with the sequence number it
-        was true at, and then holds until the poller has delivered up to there.
-
-        Delivery is left to the poller rather than done here. Pumping on the calling
-        thread would be quicker, but it would mean events reaching subscribers on
-        whichever thread happened to call ``wait`` -- an asymmetry with the local session
-        that the conformance suite rightly refuses.
-
-        The polling is on this side rather than the server's so that an hour-long run
-        does not occupy the server loop for an hour, stalling the plane reads the user is
-        scrubbing through while it runs.
-        """
-        deadline = None if timeout is None else time.monotonic() + timeout
-        interval = 0.005
-        while True:
-            reply = self._call("job_settled", handle.job_id)
-            if reply["settled"]:
-                self._await_delivery(reply["seq"])
-                return self._outcome(handle)
-            if self.job_state(handle.job_id) is None:
-                raise KeyError(f"No such job: {handle.job_id}")
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(f"{handle.kind} did not finish within {timeout}s")
-            time.sleep(interval)
-            # Back off to the event cadence: a 60-minute run does not need 200 status
-            # questions a second, and it is the first few iterations that feel slow.
-            interval = min(interval * 1.5, self._poll_interval)
-
-    def _await_delivery(self, seq: int, grace: float = 5.0) -> None:
-        """Hold until the poller has handed subscribers everything up to ``seq``.
-
-        Bounded, because a dead or stopped poller would otherwise turn a finished job
-        into a hang. Exceeding the grace period means events were lost, not that the job
-        failed, so it is logged and the result still returned.
-        """
-        deadline = time.monotonic() + grace
-        while self._seq < seq:
-            if self._stop.is_set() or time.monotonic() > deadline:
-                logger.warning("Events up to %s were not delivered within %gs", seq, grace)
-                return
-            time.sleep(0.002)
-
-    def _outcome(self, handle: JobHandle) -> Any:
-        state = self.job_state(handle.job_id)
-        if state is None:
-            raise KeyError(f"No such job: {handle.job_id}")
-        if state.error is not None:
-            raise state.error
-        return state.result
-
-    def close(self) -> None:
-        """Disconnect. The engine keeps running; reconnecting picks it back up."""
-        self._stop.set()
-        if self._poller.is_alive():
-            self._poller.join(timeout=2.0)
-        self._socket.close(0)
-        self._context.term()

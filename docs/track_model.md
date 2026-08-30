@@ -33,6 +33,15 @@ stored in raw coordinates through the stack's provenance chain, so they
 survive reloading the same data at another binning or crop, including
 feature-crop stacks from `tktomo-feature-isolation`.
 
+The **bin** box next to the view slider mean-pools the projections by 1,
+2, 4 or 8 at any time, without reloading. It applies where the pixels are
+(on the server for a remote stack, so a frame shrinks by the factor
+squared before it crosses the link) and to everything downstream: the
+view, auto-complete, the recon slice and the aligned export all see the
+binned grid. Labels stay in raw pixels, so switching back and forth loses
+nothing; marker sizes and the recon row follow the grid. The factor is
+saved with the session and restored on load.
+
 The active feature's predicted cross is drawn larger and in its feature
 color (others stay white). A toggle shows the active feature's labels
 from OTHER frames as faint half-size circles, useful for judging where
@@ -179,6 +188,61 @@ guide line at two labels.
 
 Loading a stack, saving and loading a session, and every export live in
 the File menu (Ctrl+O stack, Ctrl+Shift+O session, Ctrl+S save session).
+
+## Remote stack (`tktomo-track-server`)
+
+Labelling needs many clicks but only one projection at a time, so for a
+large dataset the stack can stay on the machine that holds it (a Maxwell
+node) while the window runs natively on your laptop. A small server on the
+node serves one frame per view change; the live recon slice, auto-complete
+and the aligned-stack export run on the node too, and only their results
+come back. The whole stack never crosses the wire.
+
+```bash
+# On the node (h5py and tomopy; scikit-learn and joblib for auto-complete;
+# no Qt needed). The path is optional: File > Open remote stack… also works.
+tktomo-track-server /beegfs/.../stack_preproc.h5
+
+# On your laptop, through an SSH tunnel to that node:
+ssh -N -L 5611:localhost:5611 <node>
+python -m tktomo.ui.track_model_app --connect tcp://127.0.0.1:5611
+```
+
+With `--connect`, paths name files on the node: "Open remote stack…" asks
+for one by text, the HDF5 dataset browser lists the remote file, and
+"Export aligned stack" asks for an output path on the node and writes
+there. Model and shift exports and session files are small and stay
+local; a session records the endpoint it was labelled against, and loads
+against the same server without re-reading the stack when it is still
+open there.
+
+> There is no authentication or encryption. Bind to `127.0.0.1` (the
+> default) and use an SSH tunnel; never expose the port.
+
+### What it does to keep view changes quick
+
+A tunnelled link is latency-cheap and bandwidth-poor. Measured from a
+laptop to a DESY node: 4 ms round trip, 0.4 to 0.6 MB/s, so a 1.3 MB
+float32 frame took about two seconds and the transfer was the whole cost
+of changing view. Two things narrow that:
+
+- **Frames are packed to display precision.** Each one is quantised to 16
+  bits over its own min/max and zlib'd, which is a little over 2x, and
+  costs about 20 ms of node CPU. The error is bounded by 1/131070 of the
+  frame's range, far below anything a display or an eye resolves, and
+  frames are only ever displayed: auto-complete, the recon slice and the
+  aligned export all run on the node, on the real pixels. A frame holding
+  NaN or inf goes verbatim, and `--exact-frames` turns the packing off
+  altogether.
+- **The next few views are fetched while you work.** A background thread
+  reads ahead in the direction you are moving, in the stride you are
+  moving (the advance box means a session may step five views at a time),
+  so a labelling pass down the stack mostly finds each frame already
+  there. It fetches one frame at a time and re-plans after each, so a
+  view you ask for never waits behind more than one prefetch.
+
+A revisited view costs nothing either way: the client keeps the last 64 MB
+of frames.
 
 ## Exports
 
