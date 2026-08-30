@@ -198,6 +198,44 @@ node serves one frame per view change; the live recon slice, auto-complete
 and the aligned-stack export run on the node too, and only their results
 come back. The whole stack never crosses the wire.
 
+### On Maxwell: `tktomo-track-maxwell`
+
+All you need is an ssh alias for the login node (here `maxwell`) that logs
+you in with a key, and `rsync` on the laptop. Then, from a checkout of this
+repo with the `ui` extra installed:
+
+```bash
+tktomo-track-maxwell setup        # once: rsync the source and build a conda env
+                                  # (conda-forge: tomopy, pyzmq, h5py, sklearn, ...)
+                                  # under /gpfs/petra3/scratch/$USER/tktomo
+
+tktomo-track-maxwell start /asap3/.../stack_preproc.h5
+                                  # syncs the source, submits a SLURM job
+                                  # (maxcpu, 4 h, 8 cpus by default), waits for
+                                  # the node, opens the tunnel, starts the window;
+                                  # closing the window cancels the job
+
+tktomo-track-maxwell status       # your server jobs and the tunnel
+tktomo-track-maxwell stop         # cancel them and close the tunnel
+```
+
+Options worth knowing: `--host` (another ssh alias), `--partition`,
+`--time`, `--cpus`, `--mem`, `--port`, `--keep` (leave the job running
+when the window closes, reconnect later with `start --no-sync`), `--no-app`
+(just the tunnel, print the connect line), `--exact-frames`. The stack path
+is optional; File > Open remote stack… asks for one on the node. Job logs
+land in `<remote-dir>/jobs/slurm-<id>.out` on the cluster. The default
+`--remote-dir` is Maxwell's per-user scratch (no quota, cleaned after three
+months, and `setup` rebuilds it in minutes); a home directory's quota is
+usually too small for the env.
+
+Why it looks like this: a compute node cannot ssh out, so the laptop
+tunnels *in* through the login node once SLURM has said which node the job
+got, and the same key that opened the login node is offered to the compute
+node. The server binds the node's loopback only.
+
+### By hand, on any machine
+
 ```bash
 # On the node (h5py and tomopy; scikit-learn and joblib for auto-complete;
 # no Qt needed). The path is optional: File > Open remote stack… also works.

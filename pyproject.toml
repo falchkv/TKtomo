@@ -73,6 +73,8 @@ tktomo-feature-isolation = "tktomo.ui.feature_isolation_app:main"
 tktomo-track-model = "tktomo.ui.track_model_app:main"
 # Serves a projection stack to a remote track-model window (no GUI needed).
 tktomo-track-server = "tktomo.tracking.remote.server:main"
+# Starts that server on a Maxwell node via SLURM, tunnels to it, runs the window.
+tktomo-track-maxwell = "tktomo.tracking.remote.launch:main"
 tktomo-blender-sim = "tktomo.blender_sim.cli:main"
 ptycho-align = "tktomo.ptycho_align.ui.main_window:main"
 # Serves an engine to a remote ptycho-align window. No GUI, so it installs and runs
