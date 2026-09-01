@@ -61,7 +61,7 @@ from tktomo.ptycho_align.session.types import (
     StackSpec,
 )
 
-__all__ = ["CodecError", "decode", "encode"]
+__all__ = ["CodecError", "decode", "encode", "register_errors", "register_types"]
 
 # Tags. Short because they repeat once per node, and prefixed so they cannot collide
 # with a genuine dict key -- every real dict is wrapped, so no untagged mapping ever
@@ -117,6 +117,25 @@ _ERRORS_BY_NAME = {cls.__name__: cls for cls in _ERRORS}
 
 class CodecError(Exception):
     """A payload contained something with no defined representation on the wire."""
+
+
+def register_types(*types: type) -> None:
+    """Let further dataclasses cross the wire.
+
+    For a sibling host (the tracking server) whose payloads this module has no business
+    importing. Both ends must register the same types, which is why they live in one
+    module the client and the host both import.
+    """
+    for cls in types:
+        if not dc.is_dataclass(cls):
+            raise TypeError(f"{cls.__name__} is not a dataclass")
+        _BY_NAME[cls.__name__] = cls
+
+
+def register_errors(*types: type[BaseException]) -> None:
+    """Let further exception types arrive as themselves rather than as SessionError."""
+    for cls in types:
+        _ERRORS_BY_NAME[cls.__name__] = cls
 
 
 # -- encoding -------------------------------------------------------------------------

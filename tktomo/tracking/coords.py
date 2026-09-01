@@ -35,16 +35,25 @@ class CoordinateChain:
                 loaded (binned) frame of the file.
     view_origin optional (n_views, 2) [v, u] per-view crop origins in the
                 file's binned frame, written by the feature-isolation app.
+    rebin       a further mean-pool applied to the loaded frame at run time
+                (the "bin" control of the track-model app), so the grid on
+                screen is the file's grid divided by `rebin`. Applied first,
+                before everything above, which all describes the file.
+
+    `scale` (binning * rebin) is the loaded px -> raw px factor.
     """
 
     binning: int = 1
     crop: tuple[int, int, int, int] = (0, 0, 0, 0)
     extra_crop: tuple[int, int, int, int] | None = None
     view_origin: np.ndarray | None = None
+    rebin: int = 1
 
     def __post_init__(self) -> None:
         if self.binning < 1:
             raise ValueError(f"binning must be >= 1, got {self.binning}")
+        if self.rebin < 1:
+            raise ValueError(f"rebin must be >= 1, got {self.rebin}")
         if self.view_origin is not None:
             origin = np.asarray(self.view_origin, float)
             if origin.ndim != 2 or origin.shape[1] != 2:
@@ -53,9 +62,24 @@ class CoordinateChain:
 
     # -- loaded frame -> file's binned frame ------------------------------
 
+    @property
+    def scale(self) -> int:
+        """Loaded px per raw px, everything composed."""
+        return int(self.binning) * int(self.rebin)
+
+    def with_rebin(self, rebin: int) -> "CoordinateChain":
+        """The same file provenance, shown at another run-time binning."""
+        return CoordinateChain(binning=self.binning, crop=self.crop,
+                               extra_crop=self.extra_crop,
+                               view_origin=self.view_origin, rebin=int(rebin))
+
     def _file_frame(self, u, v, view):
         u = np.asarray(u, float)
         v = np.asarray(v, float)
+        if self.rebin > 1:
+            k, half = self.rebin, (self.rebin - 1) / 2.0
+            u = u * k + half
+            v = v * k + half
         if self.extra_crop is not None:
             v = v + self.extra_crop[0]
             u = u + self.extra_crop[2]
@@ -91,14 +115,18 @@ class CoordinateChain:
         if self.extra_crop is not None:
             v = v - self.extra_crop[0]
             u = u - self.extra_crop[2]
+        if self.rebin > 1:
+            k, half = self.rebin, (self.rebin - 1) / 2.0
+            u = (u - half) / k
+            v = (v - half) / k
         return u, v
 
     def shift_to_parent(self, d):
-        """A displacement in loaded px is a displacement in raw px times b."""
-        return np.asarray(d, float) * self.binning
+        """A displacement in loaded px is a displacement in raw px times scale."""
+        return np.asarray(d, float) * self.scale
 
     def shift_from_parent(self, d_raw):
-        return np.asarray(d_raw, float) / self.binning
+        return np.asarray(d_raw, float) / self.scale
 
     def parent_to_grid(self, u_raw, grid_binning: int):
         """Raw px -> a grid of the SAME raw crop but binning `grid_binning`.
@@ -125,4 +153,5 @@ class CoordinateChain:
             "extra_crop": (None if self.extra_crop is None
                            else [int(x) for x in self.extra_crop]),
             "has_view_origin": self.view_origin is not None,
+            "rebin": int(self.rebin),
         }

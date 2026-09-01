@@ -285,3 +285,35 @@ def test_an_unknown_error_type_is_named_rather_than_swallowed():
     assert isinstance(back, SessionError)
     assert "Exotic" in str(back)
     assert "something specific" in str(back)
+
+
+def test_register_types_and_errors_extend_the_wire():
+    import dataclasses as dc
+
+    from tktomo.ptycho_align.session.codec import (
+        CodecError,
+        decode,
+        encode,
+        register_errors,
+        register_types,
+    )
+    from tktomo.ptycho_align.session.protocol import SessionError
+
+    @dc.dataclass
+    class Extra:
+        n: int
+        name: str
+
+    class ExtraError(SessionError):
+        pass
+
+    with pytest.raises(CodecError):
+        encode(Extra(1, "x"))
+    register_types(Extra)
+    assert decode(encode(Extra(1, "x"))) == Extra(1, "x")
+
+    assert not isinstance(decode(encode(ExtraError("boom"))), ExtraError)
+    register_errors(ExtraError)
+    assert isinstance(decode(encode(ExtraError("boom"))), ExtraError)
+    with pytest.raises(TypeError):
+        register_types(int)

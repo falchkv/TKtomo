@@ -40,7 +40,7 @@ def tracker(qtbot):
 
 
 def truth_for(win, n_feat=4):
-    model = AxisModel.blank(win._data.angles, np.arange(n_feat))
+    model = AxisModel.blank(win._stack.angles, np.arange(n_feat))
     model.a = np.linspace(-25, 25, n_feat)
     model.b = np.linspace(18, -18, n_feat)
     model.y = np.linspace(30, 95, n_feat)
@@ -52,7 +52,7 @@ def label_from_truth(win, truth, every=4):
     u_t, v_t = truth.predict()
     for f in range(truth.feature_ids.size):
         win._set_active(f)
-        for view in range(0, win._data.angles.size, every):
+        for view in range(0, win._stack.angles.size, every):
             win._set_view(view)
             win._place(u_t[f, view], v_t[f, view])
 
@@ -227,12 +227,12 @@ def test_recon_slice_responds_to_alpha(tracker, monkeypatch):
             self.finished_slice = _StubSignal()
             self.failed = _StubSignal()
 
-        def submit(self, slab, theta, sy, sx, rot_deg, center, row_in_slab):
-            jobs.append({"slab_rows": slab.shape[1],
-                         "slab_width": slab.shape[2],
-                         "sx": np.array(sx), "center": center,
-                         "rot": np.array(rot_deg),
-                         "row_in_slab": row_in_slab})
+        def submit(self, req):
+            jobs.append({"slab_rows": req.hi - req.lo,
+                         "slab_width": tracker._stack.shape[2],
+                         "sx": np.array(req.sx), "center": req.center,
+                         "rot": np.array(req.rot_deg),
+                         "row_in_slab": req.row_in_slab})
 
     tracker._recon_worker = StubWorker()
     tracker._model.alpha_coef[0] = 0.0
@@ -243,7 +243,7 @@ def test_recon_slice_responds_to_alpha(tracker, monkeypatch):
     flat, tilted = jobs
     assert np.allclose(flat["rot"], 0.0)
     assert np.allclose(tilted["rot"], np.rad2deg(0.02))   # rot = -deg(alpha)
-    width = tracker._data.data.shape[2]
+    width = tracker._stack.shape[2]
     assert (tilted["slab_rows"] - flat["slab_rows"]
             >= int(0.02 * width / 2) - 1)                 # margin widened
     # requested row 64 sits at its own index inside the (clipped) slab
@@ -260,7 +260,7 @@ def test_plot_panes_defaults_kinds_and_missing_frames(tracker):
     from tktomo.ui.track_model_app import PLOT_KINDS
 
     assert [c.currentText() for c in tracker._plot_selectors] \
-        == ["dx shifts", "dy shifts"]
+        == ["labels per view"]
     # "labels per view" renders from labels alone, before any fit exists
     tracker._set_active(0)
     tracker._set_view(4)
@@ -274,15 +274,42 @@ def test_plot_panes_defaults_kinds_and_missing_frames(tracker):
     tracker._fit_now()
     # every kind renders without raising, and produces data items
     for kind in PLOT_KINDS:
-        tracker._plot_selectors[1].setCurrentText(kind)
-        assert tracker._plot_widgets[1].getPlotItem().listDataItems(), kind
+        tracker._plot_selectors[0].setCurrentText(kind)
+        assert tracker._plot_widgets[0].getPlotItem().listDataItems(), kind
+
+
+def test_next_unlabelled_button_walks_the_gaps(tracker):
+    n = tracker._stack.angles.size
+    tracker._set_active(0)
+    for view in (0, 1, 3):
+        tracker._set_view(view)
+        tracker._place(60.0, 40.0)
+    tracker._set_view(0)
+    tracker._goto_next_unlabelled()
+    assert tracker._view == 2
+    tracker._goto_next_unlabelled()     # leaves the unlabelled current view
+    assert tracker._view == 4
+    tracker._set_view(n - 1)
+    tracker._goto_next_unlabelled()     # wraps around
+    assert tracker._view == 2
+    # every view labelled once, view 1 twice: steps among the single-label
+    # views and skips view 1
+    for view in range(n):
+        tracker._set_view(view)
+        tracker._place(60.0, 40.0)
+    tracker._set_active(1)
+    tracker._set_view(1)
+    tracker._place(30.0, 20.0)
+    tracker._set_view(0)
+    tracker._goto_next_unlabelled()
+    assert tracker._view == 2
 
 
 def test_plot_click_jumps_to_nearest_frame(tracker):
     truth = truth_for(tracker)
     label_from_truth(tracker, truth)
     tracker._fit_now()
-    deg = np.rad2deg(tracker._data.angles)
+    deg = np.rad2deg(tracker._stack.angles)
     step = deg[1] - deg[0]
     tracker._jump_to_angle(deg[37] + 0.4 * step)
     assert tracker._view == 37
@@ -490,7 +517,7 @@ def test_auto_complete_refused_on_moving_crop(qtbot):
     from tktomo.tracking.coords import CoordinateChain
 
     win, truth_u, truth_v = _blob_stack_window(qtbot)
-    n = win._data.data.shape[0]
+    n = win._stack.shape[0]
     win._chain = CoordinateChain(binning=1,
                                  view_origin=np.zeros((n, 2)))
     win._set_active(0)
@@ -537,11 +564,16 @@ def test_recon_binning_rescales_geometry(tracker):
         finished_slice = _StubSignal()
         failed = _StubSignal()
 
-        def submit(self, slab, theta, sy, sx, rot_deg, center, row_in_slab):
-            jobs.append({"width": slab.shape[2], "sx": np.array(sx),
-                         "sy": np.array(sy), "center": center,
-                         "row_in_slab": row_in_slab,
-                         "rot": np.array(rot_deg)})
+        def submit(self, req):
+            # the binning is applied inside reconstruct_slice; mirror the
+            # pixel-center rule here to check what the plan carries
+            b = req.extra_bin
+            jobs.append({"width": tracker._stack.shape[2] // b,
+                         "sx": np.array(req.sx) / b,
+                         "sy": np.array(req.sy) / b,
+                         "center": (req.center - (b - 1) / 2.0) / b,
+                         "row_in_slab": req.row_in_slab // b,
+                         "rot": np.array(req.rot_deg)})
 
     tracker._recon_worker = StubWorker()
     tracker.recon_bin.setCurrentText("1")
@@ -559,19 +591,17 @@ def test_recon_binning_rescales_geometry(tracker):
     assert binned["row_in_slab"] <= full["row_in_slab"] // 2 + 1
 
 
-def test_3d_grid_sits_at_center_row(tracker):
-    truth = truth_for(tracker)
-    label_from_truth(tracker, truth)
-    tracker._fit_now()
-    tracker._build_3d_once()
-    if tracker._gl is None:
-        pytest.skip("no OpenGL in this environment")
-    tracker._refresh_3d()
-    from PySide6.QtGui import QVector3D
-    z = tracker._gl_grid.transform().map(QVector3D(0, 0, 0)).z()
-    # identity chain: grid at the stack's center row, scene z negated
-    center_row = (tracker._data.data.shape[1] - 1) / 2.0
-    assert z == pytest.approx(-center_row)
+def test_tracker_file_menu_holds_io_actions(tracker):
+    """Load/save/export live in the File menu, not on the control panel."""
+    from PySide6.QtWidgets import QPushButton
+    assert [a.text() for a in tracker.menuBar().actions()] == ["&File"]
+    texts = [a.text() for a in tracker._file_menu.actions()]
+    assert "Load stack…" in texts
+    assert "Save session…" in texts
+    assert "Export" in texts
+    labels = [b.text() for b in tracker.findChildren(QPushButton)]
+    assert not any("session" in x or "Load stack" in x for x in labels)
+    assert not tracker.free_dx.isChecked() and not tracker.free_dy.isChecked()
 
 
 def test_tracker_recon_single_flight(tracker, qtbot):
@@ -591,12 +621,6 @@ def test_tracker_recon_single_flight(tracker, qtbot):
     qtbot.wait(50)
     image = tracker.recon_display.image_view.getImageItem().image
     assert image is not None and image.ndim == 2
-
-
-def test_tracker_3d_tab_degrades_or_builds(tracker):
-    tracker._build_3d_once()
-    assert tracker._view3d_built
-    tracker._refresh_3d()         # must not raise, with or without OpenGL
 
 
 def test_trajectory_overlay_excludes_per_view_jitter(tracker):
@@ -725,6 +749,8 @@ def test_end_to_end_known_shifts_recovered(qtbot):
         for view in range(40):
             win._set_view(view)
             win._place(u_t[f, view], v_t[f, view])
+    win.free_dx.setChecked(True)     # shifts are frozen by default
+    win.free_dy.setChecked(True)
     win._fit_now()
     fit = win._fit
     assert fit.rms_u < 1e-6 and fit.rms_v < 1e-6
@@ -745,3 +771,154 @@ def test_end_to_end_known_shifts_recovered(qtbot):
     aligned = export_aligned_stack(base, m, CoordinateChain())
     assert aligned.data.shape == base.data.shape
     assert np.isfinite(aligned.data).all()
+
+
+def test_viewbox_drops_touchpad_momentum_but_not_wheel_notches(tracker):
+    from PySide6.QtCore import Qt
+    from tktomo.ptycho_align.ui.panels.base import NoMomentumViewBox
+
+    vb = tracker.viewer.image_view.getView()
+    assert isinstance(vb, NoMomentumViewBox)
+    vb.setRange(xRange=(0, 100), yRange=(0, 100), padding=0)
+    before = vb.viewRange()
+
+    class Ev:
+        def __init__(self, phase):
+            self._phase = phase
+
+        def phase(self):
+            return self._phase
+
+        def delta(self):
+            return 120
+
+        def pos(self):
+            from PySide6.QtCore import QPointF
+            return QPointF(50, 50)
+
+        def accept(self):
+            pass
+
+        def ignore(self):
+            pass
+
+    vb.wheelEvent(Ev(Qt.ScrollPhase.ScrollMomentum))
+    assert vb.viewRange() == before          # momentum tail ignored
+    vb.wheelEvent(Ev(Qt.ScrollPhase.NoScrollPhase))
+    assert vb.viewRange() != before          # a real notch still zooms
+
+
+def test_window_over_remote_source(qtbot, tmp_path):
+    """The window on a served stack: one frame per view, jobs on the host."""
+    pytest.importorskip("zmq")
+    pytest.importorskip("msgpack")
+    from tests.helpers_tracking import write_blob_file
+    from tktomo.tracking.remote import RemoteStackSource, make_server
+
+    path, stack, theta, truth_u, truth_v = write_blob_file(tmp_path / "b.h5")
+    server = make_server("tcp://127.0.0.1:*").start()
+    server.host.wait(server.host.open_stack(path))
+    source = RemoteStackSource(server.endpoint, timeout=60.0)
+    try:
+        win = TrackModelWindow(source=source)
+        qtbot.addWidget(win)
+        assert "stack on" in win.windowTitle()
+        assert win._stack.shape == stack.shape
+        assert win._chain.binning == 2                  # adopted from the file
+        assert win._source["endpoint"] == server.endpoint
+        assert "Open remote stack…" in [a.text() for a in
+                                        win._file_menu.actions()]
+        misses = source.cache.misses
+        win._set_view(3)
+        win._set_view(3)
+        assert source.cache.misses == misses + 1        # prefetch does not count
+        tol = float(stack[3].max() - stack[3].min()) / 65535
+        assert np.allclose(win.viewer._raw_image, stack[3], rtol=0, atol=tol)
+
+        # the views the user is about to walk onto arrive on their own, in
+        # the stride they are walking, so the ones stepped over cost nothing
+        assert win._prefetch is not None
+        win._set_view(8)                                # a five-view advance
+        qtbot.waitUntil(lambda: source.cached(13) and source.cached(18),
+                        timeout=10000)
+        assert not source.cached(11)
+
+        ok, why = source.autotrack_available()
+        if ok:
+            win.auto_fit.setChecked(False)
+            win.advance_box.setValue(0)
+            win._set_active(0)
+            for w in (5, 20, 35):
+                win._set_view(w)
+                # labels are RAW coordinates; the chain maps the loaded px
+                win._place(float(truth_u[w]), float(truth_v[w]))
+            win._auto_complete(False)
+            worker = win._autotrack_worker
+            with qtbot.waitSignal(worker.finished_tracks, timeout=120000):
+                pass
+            qtbot.waitUntil(lambda: not worker.isRunning(), timeout=5000)
+            assert win._labels.counts_per_view(stack.shape[0]).sum() >= 20
+        win.close()
+    finally:
+        source.close()
+        server.stop()
+
+
+def test_bin_control_keeps_raw_labels_and_model(tracker):
+    """Switching the run-time binning changes the grid, not the labels."""
+    win = tracker
+    truth = truth_for(win)
+    label_from_truth(win, truth)
+    win._fit_now()
+    n, ny, nx = win._stack.shape
+    u_raw, v_raw, valid, _ = win._labels.to_arrays(n, truth.feature_ids)
+    win._feature_sizes[0] = 12.0
+    win.slice_row.setValue(20)
+
+    win.bin_combo.setCurrentIndex(win.bin_combo.findData(2))
+    assert win._chain.rebin == 2 and win._chain.scale == 2
+    assert win._stack.shape == (n, ny // 2, nx // 2)
+    assert win.slider.maximum() == n - 1
+    u2, v2, valid2, _ = win._labels.to_arrays(n, truth.feature_ids)
+    np.testing.assert_array_equal(valid, valid2)
+    np.testing.assert_allclose(u_raw[valid], u2[valid2])
+    np.testing.assert_allclose(v_raw[valid], v2[valid2])
+    assert win._feature_sizes[0] == pytest.approx(6.0)
+    assert win.slice_row.value() == 10                       # same raw row
+    assert win._source["rebin"] == 2
+    # a label placed on the binned grid lands at the raw position it shows
+    win._set_active(0)
+    win._set_view(3)
+    win._place(10.0, 7.0)
+    u_new, v_new = win._labels.to_arrays(n, truth.feature_ids)[:2]
+    assert u_new[0, 3] == pytest.approx(10.0 * 2 + 0.5)
+    assert v_new[0, 3] == pytest.approx(7.0 * 2 + 0.5)
+    # fitting on the binned grid still recovers the raw-px centre
+    win._fit_now()
+    assert abs(float(win._model.c_coef[0]) - 64.0) < 1.0
+
+    win.bin_combo.setCurrentIndex(win.bin_combo.findData(1))
+    assert win._chain.rebin == 1 and win._stack.shape == (n, ny, nx)
+    assert win._feature_sizes[0] == pytest.approx(12.0)
+    assert win.slice_row.value() == 20
+
+
+def test_bin_survives_a_session_round_trip(tracker, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QFileDialog, QMessageBox
+
+    win = tracker
+    label_from_truth(win, truth_for(win))
+    win.bin_combo.setCurrentIndex(win.bin_combo.findData(2))
+    win._feature_sizes[1] = 5.0
+    path = str(tmp_path / "session.h5")
+    monkeypatch.setattr(QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (path, "")))
+    monkeypatch.setattr(QMessageBox, "information",
+                        staticmethod(lambda *a, **k: None))
+    win._save_session()
+    win.bin_combo.setCurrentIndex(win.bin_combo.findData(1))
+    assert win._feature_sizes[1] == pytest.approx(10.0)
+    win._load_session(path)
+    assert win._chain.rebin == 2
+    assert win.bin_combo.currentData() == 2
+    assert win._feature_sizes[1] == pytest.approx(5.0)

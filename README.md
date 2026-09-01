@@ -60,7 +60,10 @@ The manual feature-tracking pair (`tktomo-feature-isolation`,
 `tktomo-track-model`: label features, fit rotation axis + tilt drift +
 per-view shifts, export shifts/ASTRA geometry/aligned stack) is documented in
 [`docs/feature_isolation.md`](docs/feature_isolation.md) and
-[`docs/track_model.md`](docs/track_model.md).
+[`docs/track_model.md`](docs/track_model.md). For a stack that lives on the
+Maxwell cluster, `tktomo-track-maxwell setup` once and then
+`tktomo-track-maxwell start <stack.h5>` runs the server on a compute node and
+the window on your laptop (details in the track-model docs).
 
 ### `ptycho-align` — interactive reprojection alignment
 

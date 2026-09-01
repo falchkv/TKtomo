@@ -31,6 +31,7 @@ from typing import Any, Callable
 
 from tktomo.ptycho_align.session.codec import decode, encode
 from tktomo.ptycho_align.session.engine_host import EngineHost
+from tktomo.ptycho_align.session.jobs import JobHost, job_verbs
 
 logger = logging.getLogger("tktomo.ptycho_align")
 
@@ -54,13 +55,11 @@ def _verbs(host: EngineHost) -> dict[str, Callable[..., Any]]:
     return {
         # state
         "summary": host.summary,
-        "poll_events": lambda since_seq, max_n=256: host.events.since(since_seq, max_n),
         "telemetry": host.telemetry,
         # cheap mutations
         "set_config": host.set_config,
         "set_center": host.set_center,
         "cancel_run": host.cancel_run,
-        "cancel_job": host.cancel_job,
         # queries
         "list_hdf5": host.list_hdf5,
         "run_preflight": host.run_preflight,
@@ -84,26 +83,32 @@ def _verbs(host: EngineHost) -> dict[str, Callable[..., Any]]:
         "materialize": host.materialize,
         "save_session": host.save_session,
         "export": host.export,
-        # lifecycle
-        "job_state": host.job_state,
-        # Settled-ness and the current sequence number together, because the client
-        # needs both to reproduce local `wait`'s guarantee and asking twice would leave
-        # a window in which more events arrive between the two answers.
-        "job_settled": lambda job_id: {
-            "settled": host.job_settled(job_id),
-            "seq": host.events.last_seq,
-        },
+        # lifecycle: poll_events, job_state, job_settled, cancel_job
+        **job_verbs(host),
     }
 
 
 class SessionServer:
-    """A ZeroMQ ROUTER in front of an :class:`EngineHost`."""
+    """A ZeroMQ ROUTER in front of a :class:`JobHost`.
 
-    def __init__(self, host: EngineHost | None = None, address: str = DEFAULT_ADDRESS) -> None:
+    By default the host is a ptycho-align :class:`EngineHost` served through
+    :func:`_verbs`; another host passes its own allowlist as ``verbs``. The transport,
+    request ids and error handling are the same either way.
+    """
+
+    def __init__(
+        self,
+        host: JobHost | None = None,
+        address: str = DEFAULT_ADDRESS,
+        *,
+        verbs: dict[str, Callable[..., Any]] | None = None,
+        name: str = "session-server",
+    ) -> None:
         import zmq  # noqa: PLC0415
 
         self.host = host if host is not None else EngineHost()
-        self._verbs = _verbs(self.host)
+        self._verbs = verbs if verbs is not None else _verbs(self.host)
+        self._name = name
         self._zmq = zmq
         self._context = zmq.Context()
         self._socket = self._context.socket(zmq.ROUTER)
@@ -119,7 +124,7 @@ class SessionServer:
 
     def start(self) -> "SessionServer":
         """Serve on a background thread. Returns self so it can be chained."""
-        self._thread = threading.Thread(target=self.serve_forever, name="session-server")
+        self._thread = threading.Thread(target=self.serve_forever, name=self._name)
         self._thread.daemon = True
         self._thread.start()
         return self

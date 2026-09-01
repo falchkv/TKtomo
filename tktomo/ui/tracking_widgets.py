@@ -23,7 +23,7 @@ from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -358,103 +358,201 @@ class AnglesDialog(QDialog):
                                       float(self.stop.value()), self._n))
 
 
-def load_stack_interactive(parent: QWidget, path: str | None = None):
-    """The shared "Load stack…" flow.
+class _SourceJobThread(QThread):
+    """Runs one blocking StackSource call with progress/cancel callbacks."""
 
-    Returns (ProjectionData, CoordinateChain, source_dict) or None if the
-    user cancelled. `source_dict` is JSON-able and sufficient to re-load
-    the same data (used by the session file).
+    progress = Signal(float, str)
+
+    def __init__(self, fn, parent=None) -> None:
+        super().__init__(parent)
+        self._fn = fn
+        self.cancelled = False
+        self.result = None
+        self.error: BaseException | None = None
+
+    def run(self):  # noqa: N802
+        try:
+            self.result = self._fn(
+                lambda fraction, message: self.progress.emit(float(fraction),
+                                                             str(message)),
+                lambda: self.cancelled)
+        except BaseException as exc:  # noqa: BLE001 - reported to the caller
+            self.error = exc
+
+
+def run_source_job(parent: QWidget, title: str, fn, *,
+                   error_title: str = "Failed"):
+    """Run `fn(progress, cancelled)` off the GUI thread behind a progress dialog.
+
+    `fn` is a blocking StackSource verb (open a stack, export). Returns its
+    result, or None if the user cancelled or it raised (a warning names the
+    error). The dialog's Cancel flips the `cancelled()` flag the verb polls,
+    so a remote job is cancelled on the host rather than abandoned.
+    """
+    from PySide6.QtWidgets import QApplication, QProgressDialog  # noqa: PLC0415
+
+    dialog = QProgressDialog(title, "Cancel", 0, 1000, parent)
+    dialog.setWindowModality(Qt.WindowModality.WindowModal)
+    dialog.setMinimumDuration(300)
+    dialog.setValue(0)
+    thread = _SourceJobThread(fn, parent)
+
+    def on_progress(fraction: float, message: str) -> None:
+        dialog.setValue(int(max(0.0, min(1.0, fraction)) * 1000))
+        if message:
+            dialog.setLabelText(f"{title}\n{message}")
+
+    def on_cancel() -> None:
+        thread.cancelled = True
+
+    thread.progress.connect(on_progress)
+    dialog.canceled.connect(on_cancel)
+    thread.start()
+    while thread.isRunning():
+        QApplication.processEvents()
+        thread.wait(20)
+    # closing a QProgressDialog emits canceled(); that must not count as
+    # the user cancelling a job that has just finished
+    dialog.canceled.disconnect(on_cancel)
+    dialog.close()
+    if thread.error is not None:
+        if not thread.cancelled:
+            QMessageBox.warning(parent, error_title, str(thread.error))
+        return None
+    if thread.cancelled:
+        return None
+    return thread.result
+
+
+def pick_stack_path(parent: QWidget, source=None) -> str | None:
+    """Ask for a stack path: a file dialog here, a typed path on a remote host."""
+    if source is not None and getattr(source, "is_remote", False):
+        from PySide6.QtWidgets import QInputDialog  # noqa: PLC0415
+
+        path, ok = QInputDialog.getText(
+            parent, "Open remote stack",
+            f"Path of the stack on {source.describe()}:")
+        return path.strip() if ok and path.strip() else None
+    path, _ = QFileDialog.getOpenFileName(
+        parent, "Load projection stack", "",
+        "Stacks (*.h5 *.hdf5 *.nx *.nxs *.tif *.tiff *.npy *.npz);;"
+        "All files (*)")
+    return path or None
+
+
+def open_stack_interactive(parent: QWidget, source, path: str):
+    """Open `path` on `source` with the provenance dialogs.
+
+    Returns (StackInfo, CoordinateChain, source_dict) or None if the user
+    cancelled. `source_dict` is JSON-able and sufficient to re-load the same
+    data (used by the session file); it records the endpoint when the
+    source is remote. Format detection, directory listing and the read all
+    happen on the source, i.e. where the file is.
     """
     from tktomo.ptycho_align.core.dataset import (  # noqa: PLC0415
         jsonable_load_kwargs,
-        load_dataset,
     )
     from tktomo.ptycho_align.ui.panels.hdf5_browser import (  # noqa: PLC0415
         Hdf5BrowserDialog,
     )
-    from tktomo.tracking import stackio  # noqa: PLC0415
 
-    if path is None:
-        path, _ = QFileDialog.getOpenFileName(
-            parent, "Load projection stack", "",
-            "Stacks (*.h5 *.hdf5 *.nx *.nxs *.tif *.tiff *.npy *.npz);;"
-            "All files (*)")
-        if not path:
-            return None
     path = str(path)
-
     try:
-        kind = stackio.detect_format(path)
+        kind = source.detect_format(path)
         if kind is not None:
-            data, chain = stackio.load_tracking_stack(path)
-            dialog = ProvenanceDialog(parent, binning=chain.binning,
-                                      crop=chain.crop, from_file=True)
+            info = run_source_job(
+                parent, "Reading stack…",
+                lambda progress, cancelled: source.open_stack(
+                    path, progress=progress, cancelled=cancelled),
+                error_title="Could not load stack")
+            if info is None:
+                return None
+            dialog = ProvenanceDialog(parent, binning=info.binning,
+                                      crop=info.crop, from_file=True)
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return None
             binning, crop = dialog.values()
             chain = CoordinateChain(binning=binning, crop=crop,
-                                    view_origin=chain.view_origin)
-            source = {"path": path, "kind": kind}
+                                    view_origin=info.view_origin)
+            src = {"path": path, "kind": kind}
         elif Path(path).suffix.lower() in (".h5", ".hdf5", ".nx", ".nxs"):
-            browser = Hdf5BrowserDialog(path, parent)
+            browser = Hdf5BrowserDialog(path, parent,
+                                        entries=source.list_hdf5(path))
             if browser.exec() != QDialog.DialogCode.Accepted:
                 return None
             kwargs = browser.selection()
-            data = load_dataset(path, **kwargs)
-            extra = kwargs.get("crop")
-            data, chain, ok = _finish_generic(parent, data,
-                                              extra_crop=extra)
-            if not ok:
+            load_kwargs = jsonable_load_kwargs(kwargs)
+            info = run_source_job(
+                parent, "Reading stack…",
+                lambda progress, cancelled: source.open_stack(
+                    path, load_kwargs=load_kwargs, progress=progress,
+                    cancelled=cancelled),
+                error_title="Could not load stack")
+            if info is None:
                 return None
-            source = {"path": path, "kind": "generic_h5",
-                      "load_kwargs": jsonable_load_kwargs(kwargs)}
+            chain = _generic_chain(parent, extra_crop=kwargs.get("crop"))
+            if chain is None:
+                return None
+            src = {"path": path, "kind": "generic_h5",
+                   "load_kwargs": load_kwargs}
         else:
-            data = _load_tiff_or_npy(parent, path)
-            if data is None:
+            info = run_source_job(
+                parent, "Reading stack…",
+                lambda progress, cancelled: source.open_stack(
+                    path, progress=progress, cancelled=cancelled),
+                error_title="Could not load stack")
+            if info is None:
                 return None
-            data, chain, ok = _finish_generic(parent, data, extra_crop=None)
-            if not ok:
+            if info.kind == "tiff":
+                dialog = AnglesDialog(parent, n_views=info.shape[0])
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    return None
+                info = source.set_angles(dialog.angles_rad())
+            chain = _generic_chain(parent, extra_crop=None)
+            if chain is None:
                 return None
-            source = {"path": path, "kind": "tiff"}
+            src = {"path": path, "kind": info.kind}
     except Exception as exc:  # a bad file must not take the app down
         QMessageBox.warning(parent, "Could not load stack", str(exc))
         return None
 
-    source["binning"] = chain.binning
-    source["crop"] = list(chain.crop)
-    return data, chain, source
+    src["binning"] = chain.binning
+    src["crop"] = list(chain.crop)
+    if getattr(source, "is_remote", False):
+        src["endpoint"] = source.describe()
+    return info, chain, src
 
 
-def _finish_generic(parent, data, *, extra_crop):
+def _generic_chain(parent, *, extra_crop) -> CoordinateChain | None:
     dialog = ProvenanceDialog(parent, binning=1, crop=(0, 0, 0, 0),
                               from_file=False)
     if dialog.exec() != QDialog.DialogCode.Accepted:
-        return data, None, False
+        return None
     binning, crop = dialog.values()
     if extra_crop is not None and not isinstance(extra_crop, tuple):
         extra_crop = tuple(int(x) for x in
                            (extra_crop.as_tuple()
                             if hasattr(extra_crop, "as_tuple")
                             else extra_crop))
-    chain = CoordinateChain(binning=binning, crop=crop,
-                            extra_crop=extra_crop)
-    return data, chain, True
+    return CoordinateChain(binning=binning, crop=crop, extra_crop=extra_crop)
 
 
-def _load_tiff_or_npy(parent, path: str):
-    from tktomo.io import ProjectionData  # noqa: PLC0415
+def load_stack_interactive(parent: QWidget, path: str | None = None):
+    """The in-process "Load stack…" flow (feature-isolation app).
 
-    p = Path(path)
-    if p.suffix.lower() in (".npy", ".npz"):
-        from tktomo.ptycho_align.core.dataset import load_npy  # noqa: PLC0415
-        return load_npy(p)
-    import tifffile  # noqa: PLC0415
-    stack = np.asarray(tifffile.imread(str(p)), np.float32)
-    if stack.ndim != 3:
-        raise ValueError(f"{p.name} is not a 3-D stack "
-                         f"(shape {stack.shape})")
-    dialog = AnglesDialog(parent, n_views=stack.shape[0])
-    if dialog.exec() != QDialog.DialogCode.Accepted:
+    Returns (ProjectionData, CoordinateChain, source_dict) or None if the
+    user cancelled. The same dialogs as `open_stack_interactive`, on a fresh
+    `LocalStackSource`, handing back the in-memory stack.
+    """
+    from tktomo.tracking.stacksource import LocalStackSource  # noqa: PLC0415
+
+    if path is None:
+        path = pick_stack_path(parent)
+        if not path:
+            return None
+    source = LocalStackSource()
+    result = open_stack_interactive(parent, source, str(path))
+    if result is None:
         return None
-    return ProjectionData(data=stack, angles=dialog.angles_rad(),
-                          metadata={"source_path": str(p)})
+    _info, chain, src = result
+    return source.data, chain, src

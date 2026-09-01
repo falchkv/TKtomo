@@ -33,11 +33,23 @@ stored in raw coordinates through the stack's provenance chain, so they
 survive reloading the same data at another binning or crop, including
 feature-crop stacks from `tktomo-feature-isolation`.
 
+The **bin** box next to the view slider mean-pools the projections by 1,
+2, 4 or 8 at any time, without reloading. It applies where the pixels are
+(on the server for a remote stack, so a frame shrinks by the factor
+squared before it crosses the link) and to everything downstream: the
+view, auto-complete, the recon slice and the aligned export all see the
+binned grid. Labels stay in raw pixels, so switching back and forth loses
+nothing; marker sizes and the recon row follow the grid. The factor is
+saved with the session and restored on load.
+
 The active feature's predicted cross is drawn larger and in its feature
 color (others stay white). A toggle shows the active feature's labels
 from OTHER frames as faint half-size circles, useful for judging where
 the next click belongs. The "Worst outlier" button jumps to the label
-with the largest residual and makes its feature active.
+with the largest residual and makes its feature active. "Next
+unlabelled" steps forward (wrapping) to the next projection with no
+label at all, and once every projection has one, to the next with the
+fewest labels.
 
 Each feature has an editable marker SIZE (image pixels) in the table.
 Match it to the physical feature: circles are drawn at that diameter in
@@ -127,7 +139,11 @@ matcher's end-to-end gain for the plain phase-correlation completer.
 ## Fixed and free parameters
 
 Every polynomial coefficient has a "fix" checkbox and an editable value;
-`dx` and `dy` are fixed or freed as whole groups; a feature row can be
+The out-of-plane tilt beta starts fixed at zero (few features constrain
+it and it trades off against y and dy), untick "fix" to fit it.
+`dx` and `dy` are fixed or freed as whole groups and start FIXED (at
+zero) so the first fits explain the labels with axis geometry alone;
+free them once several features share views. A feature row can be
 pinned, which fixes its (a, b, y). Editing any value re-evaluates the
 residuals WITHOUT fitting, so the response to "what if the center were
 here" is immediate; the next fit overwrites free values and respects fixed
@@ -153,8 +169,8 @@ shown but loses every argument with it.
 
 ## Plots and views without labels
 
-The middle panel holds two plot panes, each with a dropdown selecting
-what it shows (defaults: dx and dy shifts). Available: dx/dy shifts,
+The bottom panel holds one plot pane with a dropdown selecting what it
+shows (default: labels per view). Available: dx/dy shifts,
 labels per view, residual u/v colored by feature, per-view MAD spread,
 axis center c(theta), tilts alpha/beta, residual histogram. Clicking in
 any angle-axis plot jumps to the nearest frame, so a gap or a bad point
@@ -167,6 +183,104 @@ label verbatim), the dashed curve is the interpolation, and red base
 ticks mark frames with NO labels at all. The "labels per view" plot
 shows the coverage directly, with the same red ticks and an orange
 guide line at two labels.
+
+## Files
+
+Loading a stack, saving and loading a session, and every export live in
+the File menu (Ctrl+O stack, Ctrl+Shift+O session, Ctrl+S save session).
+
+## Remote stack (`tktomo-track-server`)
+
+Labelling needs many clicks but only one projection at a time, so for a
+large dataset the stack can stay on the machine that holds it (a Maxwell
+node) while the window runs natively on your laptop. A small server on the
+node serves one frame per view change; the live recon slice, auto-complete
+and the aligned-stack export run on the node too, and only their results
+come back. The whole stack never crosses the wire.
+
+### On Maxwell: `tktomo-track-maxwell`
+
+All you need is an ssh alias for the login node (here `maxwell`) that logs
+you in with a key, and `rsync` on the laptop. Then, from a checkout of this
+repo with the `ui` extra installed:
+
+```bash
+tktomo-track-maxwell setup        # once: rsync the source and build a conda env
+                                  # (conda-forge: tomopy, pyzmq, h5py, sklearn, ...)
+                                  # under /gpfs/petra3/scratch/$USER/tktomo
+
+tktomo-track-maxwell start /asap3/.../stack_preproc.h5
+                                  # syncs the source, submits a SLURM job
+                                  # (maxcpu, 4 h, 8 cpus by default), waits for
+                                  # the node, opens the tunnel, starts the window;
+                                  # closing the window cancels the job
+
+tktomo-track-maxwell status       # your server jobs and the tunnel
+tktomo-track-maxwell stop         # cancel them and close the tunnel
+```
+
+Options worth knowing: `--host` (another ssh alias), `--partition`,
+`--time`, `--cpus`, `--mem`, `--port`, `--keep` (leave the job running
+when the window closes, reconnect later with `start --no-sync`), `--no-app`
+(just the tunnel, print the connect line), `--exact-frames`. The stack path
+is optional; File > Open remote stack… asks for one on the node. Job logs
+land in `<remote-dir>/jobs/slurm-<id>.out` on the cluster. The default
+`--remote-dir` is Maxwell's per-user scratch (no quota, cleaned after three
+months, and `setup` rebuilds it in minutes); a home directory's quota is
+usually too small for the env.
+
+Why it looks like this: a compute node cannot ssh out, so the laptop
+tunnels *in* through the login node once SLURM has said which node the job
+got, and the same key that opened the login node is offered to the compute
+node. The server binds the node's loopback only.
+
+### By hand, on any machine
+
+```bash
+# On the node (h5py and tomopy; scikit-learn and joblib for auto-complete;
+# no Qt needed). The path is optional: File > Open remote stack… also works.
+tktomo-track-server /beegfs/.../stack_preproc.h5
+
+# On your laptop, through an SSH tunnel to that node:
+ssh -N -L 5611:localhost:5611 <node>
+python -m tktomo.ui.track_model_app --connect tcp://127.0.0.1:5611
+```
+
+With `--connect`, paths name files on the node: "Open remote stack…" asks
+for one by text, the HDF5 dataset browser lists the remote file, and
+"Export aligned stack" asks for an output path on the node and writes
+there. Model and shift exports and session files are small and stay
+local; a session records the endpoint it was labelled against, and loads
+against the same server without re-reading the stack when it is still
+open there.
+
+> There is no authentication or encryption. Bind to `127.0.0.1` (the
+> default) and use an SSH tunnel; never expose the port.
+
+### What it does to keep view changes quick
+
+A tunnelled link is latency-cheap and bandwidth-poor. Measured from a
+laptop to a DESY node: 4 ms round trip, 0.4 to 0.6 MB/s, so a 1.3 MB
+float32 frame took about two seconds and the transfer was the whole cost
+of changing view. Two things narrow that:
+
+- **Frames are packed to display precision.** Each one is quantised to 16
+  bits over its own min/max and zlib'd, which is a little over 2x, and
+  costs about 20 ms of node CPU. The error is bounded by 1/131070 of the
+  frame's range, far below anything a display or an eye resolves, and
+  frames are only ever displayed: auto-complete, the recon slice and the
+  aligned export all run on the node, on the real pixels. A frame holding
+  NaN or inf goes verbatim, and `--exact-frames` turns the packing off
+  altogether.
+- **The next few views are fetched while you work.** A background thread
+  reads ahead in the direction you are moving, in the stride you are
+  moving (the advance box means a session may step five views at a time),
+  so a labelling pass down the stack mostly finds each frame already
+  there. It fetches one frame at a time and re-plans after each, so a
+  view you ask for never waits behind more than one prefetch.
+
+A revisited view costs nothing either way: the client keeps the last 64 MB
+of frames.
 
 ## Exports
 
@@ -187,7 +301,8 @@ guide line at two labels.
 
 ## Recon slice
 
-The Recon tab reconstructs one detector row with tomopy gridrec at the
+The Recon slice tab (top panel, next to the projection view)
+reconstructs one detector row with tomopy gridrec at the
 fitted center, after applying each view's full 2D correction: the dx/dy
 shifts, the c(theta) drift, and derotation by the in-plane tilt
 alpha(theta), so the slice responds to the tilt parameters. Only beta
@@ -200,11 +315,3 @@ reconstruction runs on a single worker thread with single-flight
 scheduling: tomopy segfaults when called from two threads at once, so a
 request arriving while one runs replaces the pending one instead of
 queueing.
-
-## 3D view
-
-Fitted feature positions (a, b, y) in the rotating frame, the circle each
-feature traces in the lab frame, the rotation axis, and every label
-back-projected through the model as a residual cloud around its feature.
-Needs PyOpenGL (in the `ui` extra); without it the tab shows a hint and
-everything else works.

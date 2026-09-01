@@ -33,9 +33,6 @@ ui = [
     "colorcet>=3.0",
     "cmocean>=3.0",
     "cmasher>=1.6",
-    # for the track-model app's 3D view (pyqtgraph.opengl); the app degrades
-    # to a hint label without it, so it is a soft requirement at runtime
-    "PyOpenGL>=3.1",
     # the track-model app's auto-completion is the learned matcher only
     "scikit-learn>=1.3",
     "joblib>=1.3",
@@ -74,6 +71,10 @@ tktomo-alignment = "tktomo.ui.alignment_app:main"
 tktomo-feature-alignment = "tktomo.ui.feature_alignment_app:main"
 tktomo-feature-isolation = "tktomo.ui.feature_isolation_app:main"
 tktomo-track-model = "tktomo.ui.track_model_app:main"
+# Serves a projection stack to a remote track-model window (no GUI needed).
+tktomo-track-server = "tktomo.tracking.remote.server:main"
+# Starts that server on a Maxwell node via SLURM, tunnels to it, runs the window.
+tktomo-track-maxwell = "tktomo.tracking.remote.launch:main"
 tktomo-blender-sim = "tktomo.blender_sim.cli:main"
 ptycho-align = "tktomo.ptycho_align.ui.main_window:main"
 # Serves an engine to a remote ptycho-align window. No GUI, so it installs and runs

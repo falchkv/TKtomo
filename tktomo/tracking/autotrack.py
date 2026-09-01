@@ -381,3 +381,81 @@ def complete_track(frames_hp, theta, seeds, params: AutoTrackParams, *,
                         params.max_consecutive_failures else None
     result.labels.sort(key=lambda al: al.view)
     return result
+
+
+# ---------------------------------------------------------------------------
+# batch driver, shared by the local worker thread and the remote stack host
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class AutoTrackJob:
+    """One feature to complete: its manual seeds in LOADED-frame px."""
+
+    fid: int
+    seeds: tuple                    # ((view, u, v), ...)
+    params: AutoTrackParams
+
+
+class HighpassCache:
+    """The high-passed copy of one stack, kept so repeated runs skip ~7 s.
+
+    Keyed by the stack's identity and sigma; at most one stack is cached.
+    The stack is NOT copied: frames are read one at a time from whatever
+    `stack[k]` returns.
+    """
+
+    def __init__(self) -> None:
+        self._key = None
+        self._frames: list | None = None
+
+    def clear(self) -> None:
+        self._key, self._frames = None, None
+
+    def frames(self, stack, sigma: float, *, progress=None,
+               cancelled=None) -> list | None:
+        """The high-passed frames, or None if cancelled before finishing.
+
+        `progress(done, total, None)` every ten frames; `cancelled()` is
+        polled per frame.
+        """
+        key = (id(stack), float(sigma))
+        if self._key == key and self._frames is not None:
+            return self._frames
+        self.clear()
+        n = len(stack)
+        hp = []
+        for k in range(n):
+            if cancelled is not None and cancelled():
+                return None
+            hp.append(highpass2d(np.asarray(stack[k], np.float32), sigma))
+            if progress is not None and k % 10 == 0:
+                progress(k + 1, n, None)
+        self._key, self._frames = key, hp
+        return hp
+
+
+def run_autotrack(stack, theta, jobs, *, hp_sigma: float, matcher,
+                  cache: HighpassCache | None = None, progress=None,
+                  cancelled=None) -> list:
+    """Complete every job's track; returns [(fid, TrackResult)].
+
+    Returns [] when cancelled (during the high-pass or mid-track), so the
+    caller never applies a half-finished batch. `progress(done, total, fid)`
+    is called once per job with its index, and with fid=None during the
+    high-pass; `cancelled() -> bool` is polled throughout.
+    """
+    cache = cache if cache is not None else HighpassCache()
+    theta = np.asarray(theta, float)
+    hp = cache.frames(stack, hp_sigma, progress=progress, cancelled=cancelled)
+    if hp is None:
+        return []
+    out = []
+    for idx, job in enumerate(jobs):
+        if progress is not None:
+            progress(idx, len(jobs), job.fid)
+        result = complete_track(hp, theta, list(job.seeds), job.params,
+                                cancelled=cancelled, matcher=matcher)
+        if result.cancelled:
+            return []
+        out.append((job.fid, result))
+    return out

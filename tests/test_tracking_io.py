@@ -248,3 +248,46 @@ def test_load_rejects_foreign_h5(tmp_path):
     assert detect_format(path) is None
     with pytest.raises(ValueError):
         load_tracking_stack(path)
+
+
+def test_chain_rebin_composes_exactly():
+    """A run-time rebin on top of file provenance: pixel centres map to the
+    same raw position as the file grid does, and the inverse is exact."""
+    from tktomo.tracking.coords import CoordinateChain
+
+    origin = np.array([[3.0, 7.0], [1.0, 2.0]])
+    base = CoordinateChain(binning=2, crop=(8, 690, 10, 1942),
+                           extra_crop=(4, 0, 6, 0), view_origin=origin)
+    chain = base.with_rebin(4)
+    assert chain.scale == 8 and chain.rebin == 4
+    assert chain.to_dict()["rebin"] == 4
+    # loaded pixel (u, v) on the rebinned grid covers file pixels
+    # 4u..4u+3, whose centre is 4u + 1.5 on the file grid
+    u_raw, v_raw = chain.to_parent(5.0, 2.0, view=1)
+    u_ref, v_ref = base.to_parent(5.0 * 4 + 1.5, 2.0 * 4 + 1.5, view=1)
+    assert u_raw == pytest.approx(u_ref) and v_raw == pytest.approx(v_ref)
+    u, v = chain.from_parent(u_raw, v_raw, view=1)
+    assert u == pytest.approx(5.0) and v == pytest.approx(2.0)
+    assert chain.shift_to_parent(1.0) == pytest.approx(8.0)
+    with pytest.raises(ValueError):
+        CoordinateChain(rebin=0)
+
+
+def test_local_source_set_binning_keeps_the_base():
+    from tktomo.io import ProjectionData
+    from tktomo.tracking.stacksource import LocalStackSource
+
+    stack = np.random.default_rng(0).normal(size=(5, 12, 20)).astype(np.float32)
+    src = LocalStackSource(ProjectionData(data=stack,
+                                          angles=np.linspace(0, np.pi, 5)))
+    epoch = src.info().epoch
+    info = src.set_binning(2)
+    assert info.shape == (5, 6, 10) and info.rebin == 2
+    assert info.epoch != epoch
+    expected = stack[0].reshape(6, 2, 10, 2).mean(axis=(1, 3))
+    np.testing.assert_allclose(src.view(0), expected, rtol=1e-6)
+    # bin 4 pools the ORIGINAL (12 -> 3 rows), not the bin-2 result
+    assert src.set_binning(4).shape == (5, 3, 5)
+    assert src.set_binning(1).shape == (5, 12, 20)
+    np.testing.assert_array_equal(src.view(0), stack[0])
+    assert src.set_binning(1) is src.info()          # no-op returns the same info

@@ -27,12 +27,12 @@ Run with::
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -41,11 +41,11 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
-    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSlider,
@@ -58,13 +58,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from tktomo.io import ProjectionData, save_projections
+from tktomo.io import ProjectionData
 from tktomo.io.phantom import generate_phantom
 from tktomo.tracking import sessionio
 from tktomo.tracking.coords import CoordinateChain
 from tktomo.tracking.diagnostics import run_diagnostics
 from tktomo.tracking.export import (
-    export_aligned_stack,
+    aligned_metadata,
+    aligned_view_transforms,
     write_model_h5,
     write_slogger_shifts,
 )
@@ -75,11 +76,20 @@ from tktomo.tracking.model import (
     residuals,
     solve_model,
 )
+from tktomo.tracking.recon import plan_slice
+from tktomo.tracking.stacksource import (
+    AlignedExportRequest,
+    LocalStackSource,
+    StackSource,
+    ViewPrefetcher,
+)
 from tktomo.ui.common import run_app
 from tktomo.ui.tracking_widgets import (
     MarkableStackView,
     feature_color,
-    load_stack_interactive,
+    open_stack_interactive,
+    pick_stack_path,
+    run_source_job,
 )
 
 # plot kinds selectable in the two residual panes; the first two are the
@@ -98,7 +108,7 @@ PLOT_KINDS = [
 
 
 class ReconWorker(QThread):
-    """Runs tomopy gridrec off the GUI thread, one job at a time.
+    """Runs the live gridrec slice off the GUI thread, one job at a time.
 
     TomoPy segfaults when reconstructing from two threads at once, and a
     stray call on the GUI thread freezes the app for seconds, so ALL
@@ -106,52 +116,34 @@ class ReconWorker(QThread):
     keeps a dirty flag: a request arriving while the worker is busy
     replaces the pending one and runs when the current job finishes
     (single-flight; intermediate states are never queued up).
+
+    The numerics live in `tktomo.tracking.recon`; the worker only hands the
+    `SliceRequest` to the stack source, which cuts the slab wherever the
+    pixels are (in this process, or on a node) and returns the slice.
     """
 
     finished_slice = Signal(object)      # 2-D array
     failed = Signal(str)
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, source: StackSource, parent=None) -> None:
         super().__init__(parent)
+        self._source = source
         self._job = None
 
-    def submit(self, slab, theta, sy, sx, rot_deg, center, row_in_slab):
-        self._job = (np.array(slab, np.float32), np.asarray(theta, float),
-                     np.asarray(sy, float), np.asarray(sx, float),
-                     np.asarray(rot_deg, float), float(center),
-                     int(row_in_slab))
+    def set_source(self, source: StackSource) -> None:
+        self._source = source
+
+    def submit(self, req) -> None:
+        self._job = req
         if not self.isRunning():
             self.start()
 
     def run(self):  # noqa: N802
         while self._job is not None:
-            slab, theta, sy, sx, rot_deg, center, row_in_slab = self._job
+            req = self._job
             self._job = None
             try:
-                from tktomo.align.transform import (  # noqa: PLC0415
-                    Transform,
-                    apply_transform,
-                )
-                from tktomo.recon import get_backend  # noqa: PLC0415
-
-                # Full per-view 2D correction, same semantics as the
-                # aligned-stack export: shift AND derotation by the
-                # in-plane tilt alpha(theta), so the slice responds to the
-                # tilt parameters. (The rotation is about the slab center;
-                # versus the full-image center that is one constant
-                # vertical offset, identical for every view.) beta needs
-                # 3D geometry and stays out, as everywhere in 2D.
-                for k in range(slab.shape[0]):
-                    t = Transform(dx=sx[k], dy=sy[k], rotation=rot_deg[k])
-                    if not t.is_identity():
-                        slab[k] = apply_transform(slab[k], t, order=1)
-                # the requested detector row's position inside the slab;
-                # NOT the slab middle, which drifts when the slab is
-                # clipped at the top or bottom of the stack
-                sino = slab[:, row_in_slab:row_in_slab + 1, :]
-                volume = get_backend("tomopy").reconstruct(
-                    sino, theta, center=center, algorithm="gridrec")
-                self.finished_slice.emit(np.asarray(volume)[0])
+                self.finished_slice.emit(self._source.gridrec_slice(req))
             except Exception as exc:  # noqa: BLE001 - report, don't crash
                 self.failed.emit(str(exc))
 
@@ -161,25 +153,27 @@ class AutoTrackWorker(QThread):
 
     Same single-flight contract as ReconWorker: `submit` overwrites the
     pending job, `run()` loops until none is left, results leave only via
-    signals. The 540 MB stack is NOT copied (read-only numpy access from
-    this one thread); the highpassed copy is cached per (stack, sigma) so
-    repeated runs skip the ~7 s preprocessing.
+    signals. The stack is never copied here: the source owns the pixels
+    and the high-pass cache, and `tktomo.tracking.autotrack.run_autotrack`
+    does the work wherever the source lives.
     """
 
     progress = Signal(int, int, object)     # done, total, fid (None = highpass)
     finished_tracks = Signal(object)        # [(fid, TrackResult)]
     failed = Signal(str)
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, source: StackSource, parent=None) -> None:
         super().__init__(parent)
+        self._source = source
         self._job = None
         self._cancelled = False
-        self._hp_cache: dict = {}
 
-    def submit(self, frames, theta, jobs, hp_sigma, matcher=None) -> None:
+    def set_source(self, source: StackSource) -> None:
+        self._source = source
+
+    def submit(self, jobs, hp_sigma: float = 12.0) -> None:
         self._cancelled = False
-        self._job = (frames, np.asarray(theta, float), list(jobs),
-                     float(hp_sigma), matcher)
+        self._job = (list(jobs), float(hp_sigma))
         if not self.isRunning():
             self.start()
 
@@ -188,53 +182,28 @@ class AutoTrackWorker(QThread):
 
     def run(self):  # noqa: N802
         while self._job is not None:
-            frames, theta, jobs, hp_sigma, matcher = self._job
+            jobs, hp_sigma = self._job
             self._job = None
             try:
-                from tktomo.tracking.autotrack import (  # noqa: PLC0415
-                    complete_track,
-                    highpass2d,
-                )
-
-                key = (id(frames), hp_sigma)
-                if key not in self._hp_cache:
-                    self._hp_cache.clear()      # at most one stack cached
-                    n = len(frames)
-                    hp = []
-                    for k in range(n):
-                        if self._cancelled:
-                            break
-                        hp.append(highpass2d(frames[k], hp_sigma))
-                        if k % 10 == 0:
-                            self.progress.emit(k + 1, n, None)
-                    else:
-                        self._hp_cache[key] = hp
-                if self._cancelled or key not in self._hp_cache:
-                    self.finished_tracks.emit([])
-                    continue
-                hp = self._hp_cache[key]
-                out = []
-                for idx, (fid, seeds, params) in enumerate(jobs):
-                    self.progress.emit(idx, len(jobs), fid)
-                    result = complete_track(
-                        hp, theta, seeds, params,
-                        cancelled=lambda: self._cancelled, matcher=matcher)
-                    if result.cancelled:
-                        self.finished_tracks.emit([])
-                        break
-                    out.append((fid, result))
-                else:
-                    self.finished_tracks.emit(out)
+                out = self._source.autotrack(
+                    jobs, hp_sigma=hp_sigma, progress=self.progress.emit,
+                    cancelled=lambda: self._cancelled)
+                self.finished_tracks.emit(list(out))
             except Exception as exc:  # noqa: BLE001 - report, don't crash
                 self.failed.emit(str(exc))
 
 
 class TrackModelWindow(QMainWindow):
-    def __init__(self, path: str | None = None) -> None:
+    def __init__(self, path: str | None = None,
+                 source: StackSource | None = None) -> None:
         super().__init__()
-        self.setWindowTitle("TKtomo track model")
+        self._stack: StackSource = (source if source is not None
+                                    else LocalStackSource())
+        title = "TKtomo track model"
+        if self._stack.is_remote:
+            title += f"  [stack on {self._stack.describe()}]"
+        self.setWindowTitle(title)
 
-        self._data: ProjectionData | None = None
         self._chain = CoordinateChain()
         self._source: dict = {}
         self._labels = LabelStore()
@@ -260,6 +229,7 @@ class TrackModelWindow(QMainWindow):
         self._recon_timer.timeout.connect(self._request_recon)
         self._recon_worker: ReconWorker | None = None
         self._autotrack_worker: AutoTrackWorker | None = None
+        self._prefetch: ViewPrefetcher | None = None
 
         self.viewer = MarkableStackView()
         self.viewer.placeRequested.connect(self._place)
@@ -273,11 +243,24 @@ class TrackModelWindow(QMainWindow):
         self.view_box = QSpinBox()
         self.view_box.valueChanged.connect(self._set_view)
         self.angle_label = QLabel("")
+        self.bin_combo = QComboBox()
+        for k in (1, 2, 4, 8):
+            self.bin_combo.addItem(str(k), k)
+        self.bin_combo.setToolTip(
+            "Mean-pool the projections by this factor before anything "
+            "looks at them: the view, auto-track, the recon slice and the "
+            "aligned export. Labels are kept in raw pixels, so switching "
+            "back and forth loses nothing. On a remote stack a frame "
+            "shrinks by the factor squared, which is what makes a slow "
+            "link bearable.")
+        self.bin_combo.currentIndexChanged.connect(self._bin_combo_changed)
         row = QHBoxLayout()
         row.addWidget(QLabel("View:"))
         row.addWidget(self.slider, 1)
         row.addWidget(self.view_box)
         row.addWidget(self.angle_label)
+        row.addWidget(QLabel("bin:"))
+        row.addWidget(self.bin_combo)
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -286,45 +269,106 @@ class TrackModelWindow(QMainWindow):
         row_w.setLayout(row)
         left_layout.addWidget(row_w)
 
+        # top: projection viewer and recon slice as tabs; bottom: one
+        # residual plot, 3:1 by default; controls on the right
+        self.tabs = QTabWidget()
+        self.tabs.addTab(left, "Projection")
+        self.tabs.addTab(self._build_recon_panel(), "Recon slice")
+        self.vsplitter = QSplitter(Qt.Orientation.Vertical)
+        self.vsplitter.addWidget(self.tabs)
+        self.vsplitter.addWidget(self._build_plots_panel())
+        self.vsplitter.setStretchFactor(0, 3)
+        self.vsplitter.setStretchFactor(1, 1)
+        self.vsplitter.setSizes([660, 220])
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(left)
-        splitter.addWidget(self._build_tabs())
+        splitter.addWidget(self.vsplitter)
         splitter.addWidget(self._build_controls())
-        splitter.setSizes([620, 460, 360])
+        splitter.setSizes([1040, 420])
         self.setCentralWidget(splitter)
+        self._build_menu()
         self.resize(1500, 900)
 
         if path:
             self._load(path)
+        elif self._stack.is_remote:
+            info = self._stack.info()
+            if info is not None:
+                # the server was started with a stack: adopt it as-is, with
+                # the provenance its file declares
+                chain = CoordinateChain(binning=info.binning, crop=info.crop,
+                                        view_origin=info.view_origin,
+                                        rebin=info.rebin)
+                self._adopt_stack(chain, {
+                    "path": info.path, "kind": info.kind,
+                    "binning": chain.binning, "crop": list(chain.crop),
+                    "endpoint": self._stack.describe()})
         else:
             self._show_data(generate_phantom(60, 128, 48, max_shift=3.0),
                             CoordinateChain(), {"kind": "phantom"})
 
     # ------------------------------------------------------------------ UI
 
-    def _build_tabs(self) -> QWidget:
-        self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_plots_tab(), "Residuals")
-        self._view3d_built = False
-        self._view3d_holder = QWidget()
-        QVBoxLayout(self._view3d_holder)
-        self.tabs.addTab(self._view3d_holder, "3D")
-        self.tabs.addTab(self._build_recon_tab(), "Recon slice")
-        self.tabs.currentChanged.connect(self._tab_changed)
-        return self.tabs
+    def _build_menu(self) -> None:
+        """File menu: everything that reads or writes a file lives here."""
+        menu = self._file_menu = self.menuBar().addMenu("&File")
 
-    def _build_plots_tab(self) -> QWidget:
-        """Two panes, each with a plot-kind dropdown. Defaults dx and dy.
+        def add(text, slot, shortcut=None, tip=None):
+            action = QAction(text, self)
+            action.triggered.connect(slot)
+            if shortcut:
+                action.setShortcut(QKeySequence(shortcut))
+            if tip:
+                action.setStatusTip(tip)
+                action.setToolTip(tip)
+            menu.addAction(action)
+            return action
+
+        add("Open remote stack…" if self._stack.is_remote else "Load stack…",
+            lambda: self._load(None), "Ctrl+O",
+            ("Open a projection stack by its path on "
+             f"{self._stack.describe()}. Replaces the labels and model.")
+            if self._stack.is_remote else
+            "Open a projection stack (.h5). Replaces the labels and model.")
+        menu.addSeparator()
+        add("Load session…", lambda: self._load_session(None), "Ctrl+Shift+O",
+            "Restore labels, model, masks and UI state from a session file.")
+        add("Save session…", self._save_session, "Ctrl+S",
+            "Write labels, model, masks and UI state to a session file. "
+            "The stack itself is referenced by path, not copied.")
+        menu.addSeparator()
+        export = menu.addMenu("Export")
+        for text, slot, tip in (
+                ("Model + astra vectors (.h5)…", self._export_model,
+                 "Fitted model in raw detector coordinates plus ASTRA "
+                 "parallel3d_vec geometry."),
+                ("slogger shifts.h5…", self._export_shifts,
+                 "Per-view shifts in the slogger layout, on the loaded "
+                 "(binned, cropped) grid."),
+                ("Aligned projection stack…", self._export_aligned,
+                 "The loaded stack re-warped by the fitted per-view shifts.")):
+            action = QAction(text, self)
+            action.triggered.connect(slot)
+            action.setToolTip(tip)
+            action.setStatusTip(tip)
+            export.addAction(action)
+        menu.addSeparator()
+        add("Quit", self.close, "Ctrl+Q")
+
+    def _build_plots_panel(self) -> QWidget:
+        """One residual plot with a plot-kind dropdown. Default labels per view.
 
         Clicking in any angle-axis plot jumps to the nearest frame, which
-        turns the plots into navigation: see a gap or a bad point, click
+        turns the plot into navigation: see a gap or a bad point, click
         it, and you are looking at that projection.
         """
         holder = QWidget()
         layout = QVBoxLayout(holder)
+        layout.setContentsMargins(0, 0, 0, 0)
+        panes = QHBoxLayout()
+        layout.addLayout(panes, 1)
         self._plot_selectors: list[QComboBox] = []
         self._plot_widgets: list[pg.PlotWidget] = []
-        for default in ("dx shifts", "dy shifts"):
+        for default in ("labels per view",):
             combo = QComboBox()
             combo.addItems(PLOT_KINDS)
             combo.setCurrentText(default)
@@ -334,8 +378,14 @@ class TrackModelWindow(QMainWindow):
             plot.showGrid(x=True, y=True, alpha=0.3)
             plot.scene().sigMouseClicked.connect(
                 lambda ev, c=combo: self._plot_clicked(ev, c))
-            layout.addWidget(combo)
-            layout.addWidget(plot, 1)
+            pane = QVBoxLayout()
+            head = QHBoxLayout()
+            head.addWidget(QLabel("Residuals:"))
+            head.addWidget(combo)
+            head.addStretch(1)
+            pane.addLayout(head)
+            pane.addWidget(plot, 1)
+            panes.addLayout(pane, 1)
             self._plot_selectors.append(combo)
             self._plot_widgets.append(plot)
         hint = QLabel("click in a plot to jump to the nearest frame; "
@@ -359,12 +409,12 @@ class TrackModelWindow(QMainWindow):
         event.accept()
 
     def _jump_to_angle(self, x_deg: float) -> None:
-        if self._data is None:
+        if self._stack.info() is None:
             return
-        deg = np.rad2deg(self._data.angles)
+        deg = np.rad2deg(self._stack.angles)
         self._set_view(int(np.argmin(np.abs(deg - x_deg))))
 
-    def _build_recon_tab(self) -> QWidget:
+    def _build_recon_panel(self) -> QWidget:
         from tktomo.ptycho_align.ui.panels.base import (  # noqa: PLC0415
             StackDisplay,
         )
@@ -409,7 +459,7 @@ class TrackModelWindow(QMainWindow):
     def _slice_clicked(self, event) -> None:
         if event.button() != Qt.MouseButton.LeftButton or event.double():
             return
-        if self._last_recon_info is None or self._data is None:
+        if self._last_recon_info is None or self._stack.info() is None:
             return
         view_box = self.recon_display.image_view.getView()
         if not view_box.sceneBoundingRect().contains(event.scenePos()):
@@ -435,7 +485,7 @@ class TrackModelWindow(QMainWindow):
         n = int(info["width"])
         axis_row = n // 2 - 1
         axis_col = (n + 1) // 2
-        scale = info["extra_bin"] * self._chain.binning
+        scale = info["extra_bin"] * self._chain.scale
         a_raw = (col - axis_col) * scale
         b_raw = -(row - axis_row) * scale
         y_raw = float(self._chain.to_parent(0.0, info["row_loaded"])[1])
@@ -449,18 +499,6 @@ class TrackModelWindow(QMainWindow):
     def _build_controls(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
-
-        top = QHBoxLayout()
-        load_btn = QPushButton("Load stack…")
-        load_btn.clicked.connect(lambda: self._load(None))
-        top.addWidget(load_btn)
-        session_save = QPushButton("Save session…")
-        session_save.clicked.connect(self._save_session)
-        session_load = QPushButton("Load session…")
-        session_load.clicked.connect(self._load_session)
-        top.addWidget(session_save)
-        top.addWidget(session_load)
-        layout.addLayout(top)
 
         feat_box = QGroupBox("Features (digit keys switch, click places)")
         feat_layout = QVBoxLayout(feat_box)
@@ -485,17 +523,24 @@ class TrackModelWindow(QMainWindow):
         drop_btn.clicked.connect(self._drop_feature)
         feat_row.addWidget(new_btn)
         feat_row.addWidget(drop_btn)
-        feat_row.addWidget(QLabel("advance"))
+        feat_layout.addLayout(feat_row)
+        adv_row = QHBoxLayout()
+        self.active_label = QLabel("active feature: 0")
+        adv_row.addWidget(self.active_label, 1)
+        adv_row.addWidget(QLabel("advance"))
         self.advance_box = QSpinBox()
         self.advance_box.setRange(0, 100)
         self.advance_box.setValue(5)
-        feat_row.addWidget(self.advance_box)
-        feat_row.addWidget(QLabel("views/click"))
-        feat_layout.addLayout(feat_row)
-        self.active_label = QLabel("active feature: 0")
-        feat_layout.addWidget(self.active_label)
-        self.ghost_box = QCheckBox("Show active feature's labels from "
-                                   "other frames (small circles)")
+        self.advance_box.setToolTip(
+            "How many views the viewer steps forward after each placed "
+            "label. 0 stays on the current view.")
+        adv_row.addWidget(self.advance_box)
+        adv_row.addWidget(QLabel("views/click"))
+        feat_layout.addLayout(adv_row)
+        self.ghost_box = QCheckBox("Ghost labels from other frames")
+        self.ghost_box.setToolTip(
+            "Draw the active feature's labels from OTHER frames as faint "
+            "half-size circles, to judge where the next click belongs.")
         self.ghost_box.toggled.connect(lambda _c: self._refresh_view())
         feat_layout.addWidget(self.ghost_box)
         layout.addWidget(feat_box)
@@ -516,9 +561,7 @@ class TrackModelWindow(QMainWindow):
         run_row.addWidget(self.auto_all_btn)
         auto_layout.addLayout(run_row)
         param_row = QHBoxLayout()
-        self._learned = None
-        from tktomo.tracking import learned_match  # noqa: PLC0415
-        self._learned_ok, self._learned_why = learned_match.available()
+        self._learned_ok, self._learned_why = self._stack.autotrack_available()
         self.auto_thr_label = QLabel("min p")
         self.auto_min_corr = QDoubleSpinBox()
         self.auto_min_corr.setRange(0.05, 0.95)
@@ -598,16 +641,20 @@ class TrackModelWindow(QMainWindow):
             box.valueChanged.connect(self._degrees_changed)
             deg_row.addWidget(QLabel(f"deg {label}"))
             deg_row.addWidget(box)
+        deg_row.addStretch(1)
         deg_holder = QWidget()
         deg_holder.setLayout(deg_row)
-        self._model_form.addRow("Polynomial degrees:", deg_holder)
+        deg_holder.setToolTip(
+            "Polynomial degree in theta of the axis center c, the in-plane "
+            "tilt alpha and the out-of-plane tilt beta.")
+        self._model_form.addRow("Degrees:", deg_holder)
         self._coef_rows: dict[str, list[tuple[QCheckBox, QDoubleSpinBox]]] = {
             "c": [], "alpha": [], "beta": []}
         self._rebuild_coef_rows()
         self.free_dx = QCheckBox("dx free")
-        self.free_dx.setChecked(True)
+        self.free_dx.setChecked(False)
         self.free_dy = QCheckBox("dy free")
-        self.free_dy.setChecked(True)
+        self.free_dy.setChecked(False)
         self.free_dx.setToolTip(
             "dx: one HORIZONTAL displacement of the whole projection per "
             "view, the per-view alignment error the model corrects.\n"
@@ -640,14 +687,16 @@ class TrackModelWindow(QMainWindow):
             "Set every per-view vertical shift to zero (projections "
             "assumed vertically aligned). Combine with an unchecked "
             "'dy free' to keep zeros through the next fit.")
-        shift_row = QHBoxLayout()
-        for w in (self.free_dx, zero_dx, self.free_dy, zero_dy):
-            shift_row.addWidget(w)
-            if isinstance(w, QCheckBox):
-                w.toggled.connect(lambda _c: self._request_fit())
-        shift_holder = QWidget()
-        shift_holder.setLayout(shift_row)
-        self._model_form.addRow("Per-view shifts:", shift_holder)
+        for label, check, zero in (("Shift dx:", self.free_dx, zero_dx),
+                                   ("Shift dy:", self.free_dy, zero_dy)):
+            check.toggled.connect(lambda _c: self._request_fit())
+            shift_row = QHBoxLayout()
+            shift_row.addWidget(check)
+            shift_row.addWidget(zero)
+            shift_row.addStretch(1)
+            shift_holder = QWidget()
+            shift_holder.setLayout(shift_row)
+            self._model_form.addRow(label, shift_holder)
         # Frozen shifts are invisible state that changes what a fit means;
         # this line keeps them visible so "why does my fit depend on
         # earlier clicking" has an on-screen answer.
@@ -668,11 +717,15 @@ class TrackModelWindow(QMainWindow):
         robust_row = QHBoxLayout()
         robust_row.addWidget(QLabel("huber k"))
         robust_row.addWidget(self.huber)
-        robust_row.addWidget(QLabel("IRLS iters"))
+        robust_row.addWidget(QLabel("iters"))
         robust_row.addWidget(self.iters)
+        robust_row.addStretch(1)
         robust_holder = QWidget()
         robust_holder.setLayout(robust_row)
-        self._model_form.addRow("Robustness:", robust_holder)
+        robust_holder.setToolTip(
+            "Huber threshold k in units of the residual scale, and the "
+            "number of reweighting (IRLS) passes per fit.")
+        self._model_form.addRow("Robust:", robust_holder)
         layout.addWidget(model_box)
 
         fit_row = QHBoxLayout()
@@ -690,7 +743,19 @@ class TrackModelWindow(QMainWindow):
         fit_row.addWidget(fit_btn)
         fit_row.addWidget(self.auto_fit)
         fit_row.addWidget(diag_btn)
+        layout.addLayout(fit_row)
+        fit_row = QHBoxLayout()
+        unlabeled_btn = QPushButton("Next unlabelled")
+        unlabeled_btn.setToolTip(
+            "Step forward (wrapping around) to the next projection that "
+            "carries no label at all, always leaving the current one even "
+            "if it is unlabelled itself. Once every projection has a "
+            "label, steps to the next one with the fewest labels. Views "
+            "without labels are where the per-view shifts are only "
+            "interpolated, never measured.")
+        unlabeled_btn.clicked.connect(self._goto_next_unlabelled)
         fit_row.addWidget(outlier_btn)
+        fit_row.addWidget(unlabeled_btn)
         layout.addLayout(fit_row)
 
         self.summary_label = QLabel("no fit yet")
@@ -701,22 +766,16 @@ class TrackModelWindow(QMainWindow):
         self.warnings_box.setMaximumHeight(140)
         layout.addWidget(self.warnings_box)
 
-        export_box = QGroupBox("Export")
-        export_layout = QVBoxLayout(export_box)
-        for text, slot in (
-                ("Model + astra vectors (.h5)…", self._export_model),
-                ("slogger shifts.h5…", self._export_shifts),
-                ("Aligned projection stack…", self._export_aligned)):
-            btn = QPushButton(text)
-            btn.clicked.connect(slot)
-            export_layout.addWidget(btn)
-        layout.addWidget(export_box)
         layout.addStretch(1)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(panel)
-        scroll.setMinimumWidth(340)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setMinimumWidth(
+            panel.minimumSizeHint().width() + scroll.frameWidth() * 2
+            + scroll.verticalScrollBar().sizeHint().width())
         return scroll
 
     # --------------------------------------------------------- model sync
@@ -734,6 +793,11 @@ class TrackModelWindow(QMainWindow):
                 ("beta", "β", degrees[2], 5, 0.001)):
             for k in range(degree + 1):
                 check = QCheckBox("fix")
+                if group == "beta":
+                    # out-of-plane tilt is fixed at zero until asked for:
+                    # it is weakly constrained by few features and trades
+                    # off against y and dy
+                    check.setChecked(True)
                 spin = QDoubleSpinBox()
                 spin.setDecimals(decimals)
                 spin.setRange(-1e6, 1e6)
@@ -758,12 +822,12 @@ class TrackModelWindow(QMainWindow):
 
     def _sync_model(self) -> None:
         """Make model/mask rows match the label store's feature ids."""
-        if self._data is None:
+        if self._stack.info() is None:
             return
         ids = self._labels.feature_ids()
         if self._active not in ids:
             ids = sorted(set(ids) | {self._active})
-        theta = self._data.angles
+        theta = self._stack.angles
         degrees = (self.deg_c.value(), self.deg_a.value(), self.deg_b.value())
         old = self._model
         model = AxisModel.blank(theta, np.asarray(ids, int), degrees)
@@ -830,7 +894,7 @@ class TrackModelWindow(QMainWindow):
     # ------------------------------------------------------------- labels
 
     def _place(self, u: float, v: float) -> None:
-        if self._data is None:
+        if self._stack.info() is None:
             return
         u_raw, v_raw = self._chain.to_parent(u, v, view=self._view)
         self._labels.set(self._active, self._view, float(u_raw),
@@ -844,7 +908,7 @@ class TrackModelWindow(QMainWindow):
         self._request_fit()
 
     def _delete_near(self, u: float, v: float) -> None:
-        if self._data is None:
+        if self._stack.info() is None:
             return
         u_raw, v_raw = self._chain.to_parent(u, v, view=self._view)
         near = self._labels.nearest(self._view, float(u_raw), float(v_raw))
@@ -884,6 +948,19 @@ class TrackModelWindow(QMainWindow):
             return None                    # uniform sizes = unweighted
         return 1.0 / np.clip(sizes, 1e-3, None)
 
+    def _goto_next_unlabelled(self) -> None:
+        """Forward (wrapping) to the next view with no labels, or, once
+        every view has some, to the next view with the fewest labels."""
+        if self._stack.info() is None:
+            return
+        counts = self._label_counts_per_view()
+        targets = np.flatnonzero(counts == counts.min())
+        targets = targets[targets != self._view]
+        if targets.size == 0:
+            return
+        ahead = targets[targets > self._view]
+        self._set_view(int(ahead[0] if ahead.size else targets[0]))
+
     def _goto_worst_outlier(self) -> None:
         if self._fit is None or self._fit.residual_u.size == 0:
             return
@@ -901,19 +978,14 @@ class TrackModelWindow(QMainWindow):
 
     # ---------------------------------------------------------- auto-track
 
-    def _learned_matcher(self):
-        if self._learned is None:
-            from tktomo.tracking.learned_match import LearnedMatcher  # noqa: PLC0415
-            self._learned = LearnedMatcher()
-        return self._learned
-
     def _auto_complete(self, all_features: bool) -> None:
         from tktomo.tracking.autotrack import (  # noqa: PLC0415
+            AutoTrackJob,
             AutoTrackParams,
             patch_size,
         )
 
-        if self._data is None:
+        if self._stack.info() is None:
             return
         if self._chain.view_origin is not None:
             self.statusBar().showMessage(
@@ -947,10 +1019,11 @@ class TrackModelWindow(QMainWindow):
                 search_radius=float(self.auto_radius.value()),
                 min_corr=float(self.auto_min_corr.value()),
                 fb_check=self.auto_fb.isChecked())
-            jobs.append((fid, seeds, params))
+            jobs.append(AutoTrackJob(fid=fid, seeds=tuple(seeds),
+                                     params=params))
 
         if self._autotrack_worker is None:
-            self._autotrack_worker = AutoTrackWorker(self)
+            self._autotrack_worker = AutoTrackWorker(self._stack, self)
             self._autotrack_worker.finished_tracks.connect(
                 self._autotrack_finished)
             self._autotrack_worker.progress.connect(self._autotrack_progress)
@@ -960,15 +1033,8 @@ class TrackModelWindow(QMainWindow):
         for btn in (self.auto_feature_btn, self.auto_all_btn):
             btn.setEnabled(False)
         self.auto_cancel_btn.setEnabled(True)
-        try:
-            matcher = self._learned_matcher()
-        except Exception as exc:  # noqa: BLE001 - surface and stop
-            self._autotrack_done_ui()
-            self.auto_status.setText(f"learned matcher unavailable: {exc}")
-            return
         self.auto_status.setText("preparing…")
-        self._autotrack_worker.submit(self._data.data, self._data.angles,
-                                      jobs, hp_sigma=12.0, matcher=matcher)
+        self._autotrack_worker.submit(jobs, hp_sigma=12.0)
 
     def _autotrack_progress(self, done: int, total: int, fid) -> None:
         if fid is None:
@@ -1034,11 +1100,11 @@ class TrackModelWindow(QMainWindow):
             self._fit_timer.start()
 
     def _fit_now(self) -> None:
-        if self._data is None or len(self._labels) == 0:
+        if self._stack.info() is None or len(self._labels) == 0:
             return
         self._sync_model()
         u, v, valid, ids = self._labels.to_arrays(
-            self._data.angles.size, self._model.feature_ids)
+            self._stack.angles.size, self._model.feature_ids)
         if not valid.any():
             return
         try:
@@ -1049,7 +1115,7 @@ class TrackModelWindow(QMainWindow):
             n_rej = self._reject_auto_outliers(ids)
             if n_rej:
                 u, v, valid, ids = self._labels.to_arrays(
-                    self._data.angles.size, self._model.feature_ids)
+                    self._stack.angles.size, self._model.feature_ids)
                 self._fit = solve_model(u, v, valid, self._fit.model,
                                         self._mask, iters=self.iters.value(),
                                         huber=self.huber.value(),
@@ -1078,13 +1144,13 @@ class TrackModelWindow(QMainWindow):
 
     def _evaluate(self) -> None:
         """Residuals against the CURRENT model values, no solving."""
-        if self._data is None or self._model is None:
+        if self._stack.info() is None or self._model is None:
             return
         if len(self._labels) == 0:
             return
         self._sync_model_dims_only()
         u, v, valid, _ids = self._labels.to_arrays(
-            self._data.angles.size, self._model.feature_ids)
+            self._stack.angles.size, self._model.feature_ids)
         if not valid.any():
             return
         self._fit = residuals(u, v, valid, self._model)
@@ -1104,7 +1170,6 @@ class TrackModelWindow(QMainWindow):
         self._refresh_feature_table()
         self._refresh_plots()
         self._refresh_view()
-        self._refresh_3d()
         self.summary_label.setText(
             f"rms u {fit.rms_u:.3f} px, v {fit.rms_v:.3f} px "
             f"({fit.residual_u.size} labels, "
@@ -1138,18 +1203,18 @@ class TrackModelWindow(QMainWindow):
         self.shift_state_label.setText("   ".join(parts))
 
     def _run_diagnostics(self) -> None:
-        if self._fit is None or self._data is None:
+        if self._fit is None or self._stack.info() is None:
             return
         self._sync_model()
         u, v, valid, _ids = self._labels.to_arrays(
-            self._data.angles.size, self._model.feature_ids)
+            self._stack.angles.size, self._model.feature_ids)
         self._diagnostics = run_diagnostics(u, v, valid, self._model,
                                             self._mask, self._fit,
                                             self._feature_weights())
         d = self._diagnostics
         chain = self._chain
         center_grid = chain.parent_to_grid(d["center_estimate_raw_px"],
-                                           chain.binning)
+                                           chain.scale)
         QMessageBox.information(
             self, "Diagnostics",
             f"center c(θ̄): {d['center_estimate_raw_px']:.2f} raw px "
@@ -1174,10 +1239,12 @@ class TrackModelWindow(QMainWindow):
         self._set_view(self._view + delta)
 
     def _set_view(self, view: int) -> None:
-        if self._data is None:
+        if self._stack.info() is None:
             return
-        view = int(np.clip(view, 0, self._data.data.shape[0] - 1))
-        self._view = view
+        view = int(np.clip(view, 0, self._stack.shape[0] - 1))
+        step, self._view = view - self._view, view
+        if self._prefetch is not None:
+            self._prefetch.want(view, step)
         for widget in (self.slider, self.view_box):
             widget.blockSignals(True)
             widget.setValue(view)
@@ -1185,12 +1252,12 @@ class TrackModelWindow(QMainWindow):
         self._refresh_view()
 
     def _refresh_view(self) -> None:
-        if self._data is None:
+        if self._stack.info() is None:
             return
         view = self._view
         self.angle_label.setText(
-            f"{np.rad2deg(self._data.angles[view]):7.2f}°")
-        self.viewer.set_image(self._data.data[view])
+            f"{np.rad2deg(self._stack.angles[view]):7.2f}°")
+        self.viewer.set_image(self._stack.view(view))
 
         sizes = {fid: self._feature_sizes.get(fid, 10.0)
                  for fid in self._labels.feature_ids()}
@@ -1212,7 +1279,7 @@ class TrackModelWindow(QMainWindow):
 
         preds = []
         if self._fit is not None and self._model is not None \
-                and self._model.theta.size == self._data.angles.size:
+                and self._model.theta.size == self._stack.angles.size:
             u_pred, v_pred = self._model.predict()
             for row, fid in enumerate(self._model.feature_ids):
                 if self._labels.counts().get(int(fid), 0) == 0:
@@ -1248,7 +1315,7 @@ class TrackModelWindow(QMainWindow):
         # projected into THIS view through the model
         if self._probe is not None and self._model is not None:
             a, b, y = self._probe
-            theta_v = float(self._data.angles[view])
+            theta_v = float(self._stack.angles[view])
             ct, sn = np.cos(theta_v), np.sin(theta_v)
             s = a * ct + b * sn
             t = -a * sn + b * ct
@@ -1343,14 +1410,14 @@ class TrackModelWindow(QMainWindow):
             self._evaluate()
 
     def _refresh_plots(self) -> None:
-        if self._data is None:
+        if self._stack.info() is None:
             return
         for combo, plot in zip(self._plot_selectors, self._plot_widgets):
             plot.clear()
             self._render_plot(combo.currentText(), plot)
 
     def _label_counts_per_view(self) -> np.ndarray:
-        return self._labels.counts_per_view(self._data.angles.size)
+        return self._labels.counts_per_view(self._stack.angles.size)
 
     def _render_shift_plot(self, plot, values, observed, color,
                            name: str) -> None:
@@ -1358,7 +1425,7 @@ class TrackModelWindow(QMainWindow):
         frames made explicit: orange dots where ONE label carries the view
         (its shift is that label, warning W4) and red base ticks where NO
         label exists (the shift is pure interpolation)."""
-        deg = np.rad2deg(self._data.angles)
+        deg = np.rad2deg(self._stack.angles)
         counts = self._label_counts_per_view()
         plot.setLabel("left", f"{name} [raw px]")
         plot.setLabel("bottom", "angle [deg]")
@@ -1381,7 +1448,7 @@ class TrackModelWindow(QMainWindow):
                       symbolBrush=(255, 60, 60), symbolPen=None)
 
     def _render_plot(self, kind: str, plot) -> None:
-        deg = np.rad2deg(self._data.angles)
+        deg = np.rad2deg(self._stack.angles)
         fit = self._fit
 
         if kind == "labels per view":
@@ -1463,121 +1530,6 @@ class TrackModelWindow(QMainWindow):
                               fillLevel=0, brush=pg.mkBrush(*color),
                               pen=pg.mkPen(*color))
 
-    # ----------------------------------------------------------------- 3D
-
-    def _tab_changed(self, index: int) -> None:
-        if self.tabs.widget(index) is self._view3d_holder:
-            self._build_3d_once()
-            self._refresh_3d()
-
-    def _build_3d_once(self) -> None:
-        if self._view3d_built:
-            return
-        self._view3d_built = True
-        layout = self._view3d_holder.layout()
-        try:
-            import pyqtgraph.opengl as gl  # noqa: PLC0415
-        except Exception as exc:  # ImportError or missing GL driver
-            layout.addWidget(QLabel(
-                f"3D view needs PyOpenGL (pip install PyOpenGL).\n{exc}"))
-            self._gl = None
-            return
-        self._gl = gl
-        self.view3d = gl.GLViewWidget()
-        self.view3d.setCameraPosition(distance=600)
-        self._gl_grid = gl.GLGridItem()
-        self._gl_grid.scale(20, 20, 1)
-        self._gl_centered = False
-        self.view3d.addItem(self._gl_grid)
-        self._gl_axis = gl.GLLinePlotItem(width=2, antialias=True)
-        self.view3d.addItem(self._gl_axis)
-        self._gl_points = gl.GLScatterPlotItem(pxMode=True, size=9)
-        self.view3d.addItem(self._gl_points)
-        self._gl_cloud = gl.GLScatterPlotItem(pxMode=True, size=3)
-        self.view3d.addItem(self._gl_cloud)
-        self._gl_arcs: list = []
-        layout.addWidget(self.view3d)
-
-    def _refresh_3d(self) -> None:
-        if not self._view3d_built or getattr(self, "_gl", None) is None:
-            return
-        if self._fit is None:
-            return
-        gl = self._gl
-        model = self._fit.model
-        i, j = self._fit.obs
-
-        # The horizontal grid plane sits at the stack's CENTER ROW (in raw
-        # coordinates, like everything in the scene), so height reads
-        # relative to the middle of the field of view instead of raw zero,
-        # which for a cropped stack is nowhere near the data.
-        if self._data is not None:
-            center_row = (self._data.data.shape[1] - 1) / 2.0
-            view = self._view if self._chain.view_origin is not None else None
-            _, v_center = self._chain.to_parent(0.0, center_row, view=view)
-            z_grid = -float(v_center)
-            self._gl_grid.resetTransform()
-            self._gl_grid.scale(20, 20, 1)
-            self._gl_grid.translate(0, 0, z_grid)
-            if not self._gl_centered:
-                self._gl_centered = True
-                self.view3d.opts["center"] = pg.Vector(0, 0, z_grid)
-                self.view3d.update()
-        counts = self._labels.counts()
-        keep = np.array([counts.get(int(f), 0) > 0
-                         for f in model.feature_ids], bool)
-
-        # fitted feature points in the rotating frame; z is the detector row
-        # direction, drawn negated so "up in the image" is up on screen
-        pos = np.column_stack([model.a[keep], model.b[keep],
-                               -model.y[keep]])
-        colors = np.array([(*feature_color(int(f)), 255)
-                           for f in model.feature_ids[keep]],
-                          float) / 255.0
-        self._gl_points.setData(pos=pos, color=colors)
-
-        # back-projected labels: feature position + residual along the view
-        # direction (u residual on e_s, v residual vertical)
-        ct, sn = np.cos(model.theta[j]), np.sin(model.theta[j])
-        cloud = np.column_stack([
-            model.a[i] + self._fit.residual_u * ct,
-            model.b[i] + self._fit.residual_u * sn,
-            -(model.y[i] + self._fit.residual_v)])
-        cloud_colors = np.array(
-            [(*feature_color(int(model.feature_ids[fi])), 110)
-             for fi in i], float) / 255.0
-        self._gl_cloud.setData(pos=cloud, color=cloud_colors)
-
-        for item in self._gl_arcs:
-            self.view3d.removeItem(item)
-        self._gl_arcs.clear()
-        for row in np.flatnonzero(keep):
-            radius = float(np.hypot(model.a[row], model.b[row]))
-            phase = float(np.arctan2(model.b[row], model.a[row]))
-            arc_theta = np.linspace(0, 2 * np.pi, 90)
-            pts = np.column_stack([
-                radius * np.cos(phase + arc_theta),
-                radius * np.sin(phase + arc_theta),
-                np.full(arc_theta.size, -model.y[row])])
-            color = (*(np.array(feature_color(
-                int(model.feature_ids[row]))) / 255.0), 0.35)
-            item = gl.GLLinePlotItem(pos=pts, color=color, width=1,
-                                     antialias=True)
-            self.view3d.addItem(item)
-            self._gl_arcs.append(item)
-
-        # the rotation axis: x = y = 0 in the rotating frame BY DEFINITION;
-        # c(theta) drift and tilts live in the projection model, so the
-        # interesting part is drawn as the axis plus its detector-frame
-        # center curve is in the Residuals tab.
-        if pos.size:
-            z0, z1 = float(cloud[:, 2].min()) - 30, float(
-                cloud[:, 2].max()) + 30
-        else:
-            z0, z1 = -100, 100
-        self._gl_axis.setData(pos=np.array([[0, 0, z0], [0, 0, z1]]),
-                              color=(1, 1, 1, 0.9))
-
     # -------------------------------------------------------------- recon
 
     def _recon_maybe(self) -> None:
@@ -1585,7 +1537,7 @@ class TrackModelWindow(QMainWindow):
             self._recon_timer.start()
 
     def _request_recon(self) -> None:
-        if self._data is None or self._model is None or self._fit is None:
+        if self._stack.info() is None or self._model is None or self._fit is None:
             self.recon_status.setText("fit a model first")
             return
         if self._chain.view_origin is not None:
@@ -1593,52 +1545,22 @@ class TrackModelWindow(QMainWindow):
                 "recon of a moving-crop stack is not meaningful")
             return
         if self._recon_worker is None:
-            self._recon_worker = ReconWorker(self)
+            self._recon_worker = ReconWorker(self._stack, self)
             self._recon_worker.finished_slice.connect(self._show_slice)
             self._recon_worker.failed.connect(
                 lambda msg: self.recon_status.setText(f"recon failed: {msg}"))
-        data = self._data
-        n_rows = data.data.shape[1]
+        _, n_rows, width = self._stack.shape
         self.slice_row.setMaximum(n_rows - 1)
         row = int(self.slice_row.value())
-        model = self._model
-        c_of, alpha_of, _ = model.axis_curves()
-        c_ref = model.center_at_mean_theta()
-        sx = -self._chain.shift_from_parent(model.dx + (c_of - c_ref))
-        sy = -self._chain.shift_from_parent(model.dy)
-        rot_deg = -np.rad2deg(alpha_of)
-        # the slab must be tall enough that shifting AND derotating still
-        # leaves the middle row valid: rotation moves rows by up to
-        # |alpha| * width/2 at the image edges
-        width = data.data.shape[2]
-        margin = 4 + int(np.ceil(np.abs(alpha_of).max() * width / 2.0
-                                 + np.abs(sy).max()))
-        lo = max(0, row - margin)
-        hi = min(n_rows, row + margin + 1)
-        slab = data.data[:, lo:hi, :]
-        center = float(self._chain.from_parent(c_ref, 0.0)[0])
-        row_in_slab = row - lo
         extra_bin = int(self.recon_bin.currentText())
-        if extra_bin > 1:
-            # bin BEFORE warping: isotropic mean-pooling preserves the
-            # rotation angle, and shifts/center rescale by the pixel-center
-            # rule. The slice lands within half a binned pixel of the
-            # requested row, which is what a speed preview is for.
-            from tktomo.ptycho_align.core.preprocess import (  # noqa: PLC0415
-                bin_stack,
-            )
-            slab = bin_stack(np.asarray(slab, np.float32), extra_bin)
-            sy = sy / extra_bin
-            sx = sx / extra_bin
-            center = (center - (extra_bin - 1) / 2.0) / extra_bin
-            row_in_slab = min(row_in_slab // extra_bin, slab.shape[1] - 1)
+        req = plan_slice(self._model, self._chain, n_rows, width, row,
+                         extra_bin)
         self.recon_status.setText(
             f"reconstructing row {row} (bin {extra_bin})…")
         self._last_recon_info = {"extra_bin": extra_bin,
                                  "row_loaded": row,
-                                 "width": slab.shape[2]}
-        self._recon_worker.submit(slab, data.angles, sy, sx, rot_deg,
-                                  center, row_in_slab)
+                                 "width": width // extra_bin}
+        self._recon_worker.submit(req)
 
     def _show_slice(self, image) -> None:
         self.recon_status.setText("")
@@ -1647,10 +1569,14 @@ class TrackModelWindow(QMainWindow):
     # ------------------------------------------------------------ loading
 
     def _load(self, path: str | None) -> None:
-        result = load_stack_interactive(self, path)
+        if not path:
+            path = pick_stack_path(self, self._stack)
+            if not path:
+                return
+        result = open_stack_interactive(self, self._stack, path)
         if result is None:
             return
-        data, chain, source = result
+        _info, chain, source = result
         if len(self._labels) and QMessageBox.question(
                 self, "Discard labels?",
                 "Loading a new stack discards labels and model. Continue?"
@@ -1661,19 +1587,109 @@ class TrackModelWindow(QMainWindow):
         self._mask = None
         self._fit = None
         self._pins.clear()
-        self._show_data(data, chain, source)
+        self._adopt_stack(chain, source)
 
     def _show_data(self, data: ProjectionData, chain: CoordinateChain,
                    source: dict) -> None:
-        self._data, self._chain, self._source = data, chain, source
-        n = data.data.shape[0]
+        """Show an in-memory stack (the phantom, tests)."""
+        self._stack = LocalStackSource.from_projection_data(
+            data, chain, kind=source.get("kind"), path=source.get("path"))
+        self._adopt_stack(chain, source)
+
+    def _adopt_stack(self, chain: CoordinateChain, source: dict) -> None:
+        """The stack behind `self._stack` changed: resize the UI to it."""
+        info = self._stack.info()
+        if info is not None and info.rebin != chain.rebin:
+            # a source opened fresh serves the file's grid; say so in the chain
+            chain = chain.with_rebin(info.rebin)
+        self._chain, self._source = chain, {**source, "rebin": chain.rebin}
+        self._updating_ui = True
+        try:
+            idx = self.bin_combo.findData(chain.rebin)
+            if idx < 0:
+                self.bin_combo.addItem(str(chain.rebin), chain.rebin)
+                idx = self.bin_combo.count() - 1
+            self.bin_combo.setCurrentIndex(idx)
+        finally:
+            self._updating_ui = False
+        for worker in (self._recon_worker, self._autotrack_worker):
+            if worker is not None:
+                worker.set_source(self._stack)
+        self._sync_prefetch()
+        n, n_rows, _ = self._stack.shape
         self.slider.setMaximum(n - 1)
         self.view_box.setMaximum(n - 1)
-        self.slice_row.setMaximum(data.data.shape[1] - 1)
-        self.slice_row.setValue(data.data.shape[1] // 2)
+        self.slice_row.setMaximum(n_rows - 1)
+        self.slice_row.setValue(n_rows // 2)
         self._view = min(self._view, n - 1)
-        self.viewer.reset_levels(data.data[self._view])
+        self.viewer.reset_levels(self._stack.view(self._view))
         self._refresh_view()
+
+    def _bin_combo_changed(self, _index: int) -> None:
+        if self._updating_ui:
+            return
+        self._set_binning(int(self.bin_combo.currentData()))
+
+    def _set_binning(self, rebin: int) -> None:
+        """Re-serve the stack mean-pooled by `rebin`, keeping labels and model.
+
+        Labels live in raw px so nothing about them changes; the chain gets
+        the new factor and everything in loaded px (marker sizes, the recon
+        row) is rescaled to stay on the same physical spot.
+        """
+        if self._stack.info() is None:
+            return
+        old = self._chain.rebin
+        if int(rebin) == old:
+            return
+        stack = self._stack
+        info = run_source_job(
+            self, f"Binning projections by {rebin}…",
+            lambda progress, cancelled: stack.set_binning(
+                int(rebin), progress=progress, cancelled=cancelled),
+            error_title="Could not rebin")
+        if info is None or info.rebin == old:
+            self._adopt_stack(self._chain, self._source)   # combo back in step
+            return
+        ratio = old / info.rebin
+        self._feature_sizes = {fid: max(size * ratio, 0.5)
+                               for fid, size in self._feature_sizes.items()}
+        row_raw = float(self._chain.to_parent(0.0, self.slice_row.value())[1])
+        self._adopt_stack(self._chain.with_rebin(info.rebin), self._source)
+        row = int(round(float(self._chain.from_parent(0.0, row_raw)[1])))
+        self.slice_row.setValue(max(0, min(row, self.slice_row.maximum())))
+        self._sync_model_dims_only()
+        self._refresh_feature_table()
+        self._refresh_plots()
+        self._recon_maybe()
+
+    def _sync_prefetch(self) -> None:
+        """A prefetcher for a remote stack, and only while the stack is remote.
+
+        Reading ahead is worth a background thread when a frame is a second
+        away and pointless when the stack is in this process, so a local
+        source gets none. `_show_data` can swap a remote source for a local
+        one under us, hence the identity check rather than a flag.
+        """
+        if self._prefetch is not None and (self._prefetch.source is not self._stack
+                                           or not self._stack.is_remote):
+            self._prefetch.stop()
+            self._prefetch = None
+        if self._prefetch is None and self._stack.is_remote:
+            self._prefetch = ViewPrefetcher(self._stack)
+            self._prefetch.want(self._view, self.advance_box.value())
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        if self._prefetch is not None:
+            self._prefetch.stop()
+            self._prefetch = None
+        for worker in (self._recon_worker, self._autotrack_worker):
+            if isinstance(worker, QThread) and worker.isRunning():
+                if hasattr(worker, "cancel"):
+                    worker.cancel()
+                worker.wait(2000)
+        self._stack.close()
+        super().closeEvent(event)
 
     # ------------------------------------------------------------ session
 
@@ -1722,18 +1738,37 @@ class TrackModelWindow(QMainWindow):
             return
         source = state["source"]
         stack_path = source.get("path")
-        if stack_path and Path(str(stack_path)).exists():
-            result = load_stack_interactive(self, str(stack_path))
+        info = self._stack.info()
+        if (stack_path and self._stack.is_remote and info is not None
+                and info.path == str(stack_path)):
+            # already open on the server: keep it, restore the provenance
+            chain = CoordinateChain(
+                binning=int(source.get("binning", info.binning)),
+                crop=tuple(int(x) for x in source.get("crop", info.crop)),
+                view_origin=info.view_origin, rebin=info.rebin)
+            self._adopt_stack(chain, {**source,
+                                      "endpoint": self._stack.describe()})
+        elif stack_path and (self._stack.is_remote
+                             or Path(str(stack_path)).exists()):
+            result = open_stack_interactive(self, self._stack,
+                                            str(stack_path))
             if result is None:
                 return
-            data, chain, new_source = result
-            self._show_data(data, chain, new_source)
-        elif self._data is None:
+            _info, chain, new_source = result
+            self._adopt_stack(chain, new_source)
+        elif info is None:
+            where = source.get("endpoint")
+            hint = (f" It was labelled against {where}; start the app with "
+                    f"--connect {where} to reach it." if where else
+                    " Load the stack first, then the session.")
             QMessageBox.warning(
                 self, "Stack missing",
-                f"The session's stack ({stack_path}) is not readable; "
-                f"load the stack first, then the session.")
+                f"The session's stack ({stack_path}) is not readable "
+                f"here.{hint}")
             return
+        # the grid the session was labelled on, so its marker sizes and
+        # recon row (loaded px) mean what they meant
+        self._set_binning(int(source.get("rebin", 1)))
         self._labels = state["labels"]
         self._model = state["model"]
         self._mask = state["mask"]
@@ -1777,8 +1812,8 @@ class TrackModelWindow(QMainWindow):
         det_h = chain.crop[1] - chain.crop[0]
         det_w = chain.crop[3] - chain.crop[2]
         if det_h <= 0 or det_w <= 0:
-            det_h = self._data.data.shape[1] * chain.binning + chain.crop[0]
-            det_w = self._data.data.shape[2] * chain.binning + chain.crop[2]
+            det_h = self._stack.shape[1] * chain.scale + chain.crop[0]
+            det_w = self._stack.shape[2] * chain.scale + chain.crop[2]
         write_model_h5(path, self._fit, self._mask, self._labels, chain,
                        source=self._source, diagnostics=self._diagnostics,
                        det_shape=(int(det_h), int(det_w)))
@@ -1808,35 +1843,43 @@ class TrackModelWindow(QMainWindow):
             QMessageBox.information(self, "Exported", f"Wrote {path}")
 
     def _export_aligned(self) -> None:
-        if self._fit is None or self._data is None:
+        if self._fit is None or self._stack.info() is None:
             QMessageBox.information(self, "No fit", "Fit a model first.")
             return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export aligned stack", "aligned.h5", "HDF5 (*.h5)")
-        if not path:
+        if self._stack.is_remote:
+            # the warp runs where the pixels are and the result stays there:
+            # shipping the aligned stack back is the whole stack over the wire
+            path, ok = QInputDialog.getText(
+                self, "Export aligned stack",
+                f"Output path on {self._stack.describe()}:",
+                text="aligned.h5")
+            if not ok or not path:
+                return
+        else:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Export aligned stack", "aligned.h5", "HDF5 (*.h5)")
+            if not path:
+                return
+        transforms = aligned_view_transforms(self._model, self._chain)
+        metadata = aligned_metadata(self._stack.info().metadata, self._model,
+                                    self._chain)
+        req = AlignedExportRequest(
+            dx=np.array([t.dx for t in transforms], float),
+            dy=np.array([t.dy for t in transforms], float),
+            rot_deg=np.array([t.rotation for t in transforms], float),
+            metadata=metadata)
+        stack = self._stack
+        written = run_source_job(
+            self, "Warping projections…",
+            lambda progress, cancelled: stack.export_aligned(
+                req, path, progress=progress, cancelled=cancelled),
+            error_title="Export stopped")
+        if written is None:
             return
-        n = self._data.data.shape[0]
-        progress = QProgressDialog("Warping projections…", "Cancel", 0, n,
-                                   self)
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-
-        def report(done, total):
-            progress.setValue(done)
-            return not progress.wasCanceled()
-
-        try:
-            aligned = export_aligned_stack(self._data, self._model,
-                                           self._chain, progress=report)
-        except (RuntimeError, ValueError) as exc:
-            progress.close()
-            QMessageBox.warning(self, "Export stopped", str(exc))
-            return
-        progress.close()
-        save_projections(path, aligned)
         QMessageBox.information(
             self, "Exported",
-            f"Wrote {path}\nfixed center on this grid: "
-            f"{aligned.metadata['center_loaded_px']:.2f} px")
+            f"Wrote {written} on {stack.describe()}\nfixed center on this "
+            f"grid: {metadata['center_loaded_px']:.2f} px")
 
 
 def _fmt(value: float) -> str:
@@ -1848,10 +1891,26 @@ def main() -> int:
     parser.add_argument("path", nargs="?", help="projection stack (.h5)")
     parser.add_argument("--session", help="session file (.h5) to load; its "
                         "stack is loaded from the session's own provenance")
+    parser.add_argument("--connect", metavar="ADDRESS",
+                        help="use a stack served by tktomo-track-server at "
+                        "this ZeroMQ address (e.g. tcp://127.0.0.1:5611 "
+                        "through an SSH tunnel); PATH then names a file on "
+                        "that machine")
+    parser.add_argument("--exact-frames", action="store_true",
+                        help="with --connect, send frames as raw float32 "
+                        "instead of packing them to display precision. "
+                        "Roughly twice the wait per view, and only the "
+                        "displayed pixels differ (everything that computes "
+                        "runs on the server either way)")
     args = parser.parse_args()
 
     def build():
-        win = TrackModelWindow(args.path)
+        source = None
+        if args.connect:
+            from tktomo.tracking.remote import RemoteStackSource  # noqa: PLC0415
+            source = RemoteStackSource(args.connect,
+                                       quantise=not args.exact_frames)
+        win = TrackModelWindow(args.path, source=source)
         if args.session:
             win._load_session(args.session)
         return win
