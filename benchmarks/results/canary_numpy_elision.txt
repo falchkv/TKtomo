@@ -1,0 +1,16 @@
+host linux-x86_64 python 3.14.0 numpy 2.2.6
+(48, 28, 64) norm_no_mutate True reduction_correct True still_intact True
+(60, 34, 92) norm_no_mutate True reduction_correct True still_intact True
+(36, 33, 60) norm_no_mutate True reduction_correct True still_intact True
+(60, 52, 104) norm_no_mutate True reduction_correct True still_intact True
+(101, 98, 261) norm_no_mutate True reduction_correct True still_intact True
+odstrcil-agent repro mutated a: False
+CANARY CLEAN
+host linux-x86_64 python 3.11.15 numpy 1.26.4
+(48, 28, 64) norm_no_mutate True reduction_correct True still_intact True
+(60, 34, 92) norm_no_mutate True reduction_correct True still_intact True
+(36, 33, 60) norm_no_mutate True reduction_correct True still_intact True
+(60, 52, 104) norm_no_mutate True reduction_correct True still_intact True
+(101, 98, 261) norm_no_mutate True reduction_correct True still_intact True
+odstrcil-agent repro mutated a: False
+CANARY CLEAN
