@@ -28,7 +28,11 @@ and nothing to diverge.
 
 Digits 0 to 9 pick the active feature (the table picks any id), left click
 or Space places it in the current view and advances N views (configurable),
-Delete removes the nearest label in the view, arrows step views. Labels are
+Delete removes the nearest label in the view, arrows step views. With
+"Follow the prediction after a click" ticked, each placed label also pans
+the view so the model's predicted position of the active feature in the
+next view sits at the centre, at the current zoom. It acts only once the
+feature has more than four labels and a fit exists. Labels are
 stored in raw coordinates through the stack's provenance chain, so they
 survive reloading the same data at another binning or crop, including
 feature-crop stacks from `tktomo-feature-isolation`.

@@ -93,6 +93,10 @@ from tktomo.ui.tracking_widgets import (
 )
 
 # plot kinds selectable in the two residual panes; the first two are the
+#: labels the active feature needs before "follow the prediction"
+#: pans to the model's guess: fewer and the guess is not worth chasing
+FOLLOW_MIN_LABELS = 4
+
 # defaults, "labels per view" is the direct where-am-I-missing-data view
 PLOT_KINDS = [
     "dx shifts",
@@ -543,6 +547,15 @@ class TrackModelWindow(QMainWindow):
             "half-size circles, to judge where the next click belongs.")
         self.ghost_box.toggled.connect(lambda _c: self._refresh_view())
         feat_layout.addWidget(self.ghost_box)
+        self.follow_box = QCheckBox("Follow the prediction after a click")
+        self.follow_box.setToolTip(
+            f"After a placed label (click or Space) pan the view so the "
+            f"model's predicted position of the active feature in the view "
+            f"shown next sits at the centre, at the current zoom. Only acts "
+            f"once the active feature has more than {FOLLOW_MIN_LABELS} "
+            f"labels and a fit exists, so the prediction means something. "
+            f"Unchecked leaves the view where you put it.")
+        feat_layout.addWidget(self.follow_box)
         layout.addWidget(feat_box)
 
         auto_box = QGroupBox("Auto-track (manual labels are the anchors)")
@@ -904,8 +917,37 @@ class TrackModelWindow(QMainWindow):
             self._set_view(self._view + advance)
         else:
             self._refresh_view()
+        self._follow_prediction()
         self._refresh_plots()      # label coverage updates even without a fit
         self._request_fit()
+
+    def _predicted_position(self, fid: int, view: int
+                            ) -> tuple[float, float] | None:
+        """The fitted model's position of feature `fid` in `view`, on the
+        loaded grid, or None without a fit that knows the feature."""
+        if self._fit is None or self._model is None \
+                or self._model.theta.size != self._stack.angles.size:
+            return None
+        ids = list(self._model.feature_ids)
+        if fid not in ids:
+            return None
+        row = ids.index(fid)
+        u_pred, v_pred = self._model.predict()
+        u, v = self._chain.from_parent(u_pred[row, view], v_pred[row, view],
+                                       view=view)
+        return float(u), float(v)
+
+    def _follow_prediction(self) -> None:
+        """Recentre the view on the active feature's predicted position,
+        when the follow box is ticked and the feature has enough labels for
+        the prediction to be trusted (see FOLLOW_MIN_LABELS)."""
+        if not self.follow_box.isChecked():
+            return
+        if self._labels.counts().get(self._active, 0) <= FOLLOW_MIN_LABELS:
+            return
+        pos = self._predicted_position(self._active, self._view)
+        if pos is not None:
+            self.viewer.center_on(*pos)
 
     def _delete_near(self, u: float, v: float) -> None:
         if self._stack.info() is None:
@@ -1708,6 +1750,7 @@ class TrackModelWindow(QMainWindow):
             "feature_sizes": {str(k): float(size)
                               for k, size in self._feature_sizes.items()},
             "ghosts": self.ghost_box.isChecked(),
+            "follow_prediction": self.follow_box.isChecked(),
             "auto_reject": self.auto_reject.isChecked(),
             "auto_reject_k": self.auto_reject_k.value(),
             "auto_min_corr": self.auto_min_corr.value(),
@@ -1777,6 +1820,7 @@ class TrackModelWindow(QMainWindow):
         self._feature_sizes = {int(k): float(size) for k, size in
                                ui.get("feature_sizes", {}).items()}
         self.ghost_box.setChecked(bool(ui.get("ghosts", False)))
+        self.follow_box.setChecked(bool(ui.get("follow_prediction", False)))
         self.auto_reject.setChecked(bool(ui.get("auto_reject", True)))
         self.auto_reject_k.setValue(float(ui.get("auto_reject_k", 3.0)))
         self.auto_min_corr.setValue(float(ui.get("auto_min_corr", 0.20)))

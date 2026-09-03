@@ -23,7 +23,7 @@ from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import QRectF, Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -139,6 +139,15 @@ class MarkableStackView(StackDisplay):
     def _redisplay(self) -> None:
         if self._raw_image is not None:
             self.set_image(self._raw_image)
+
+    def center_on(self, u: float, v: float) -> None:
+        """Pan so loaded-frame point (u, v) sits at the view centre, at
+        the current zoom. Only the visible window moves, nothing drawn or
+        stored changes."""
+        view = self.image_view.getView()
+        rect = view.viewRect()
+        w, h = rect.width(), rect.height()
+        view.setRange(QRectF(u - w / 2, v - h / 2, w, h), padding=0)
 
     # -- pointer plumbing -------------------------------------------------
 

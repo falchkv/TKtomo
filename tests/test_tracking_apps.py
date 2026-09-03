@@ -364,6 +364,42 @@ def test_worst_outlier_button(tracker):
     assert tracker._view == 24
 
 
+def test_follow_prediction_recenters_after_a_click(tracker):
+    truth = truth_for(tracker)
+    label_from_truth(tracker, truth)
+    tracker._fit_now()
+    tracker.advance_box.setValue(3)
+    tracker._set_active(1)
+    tracker._set_view(0)
+    view_box = tracker.viewer.image_view.getView()
+    view_box.setRange(xRange=(0, 40), yRange=(0, 40), padding=0)
+    u_t, v_t = truth.predict()
+
+    # unticked: the view stays where it was
+    tracker._place(u_t[1, 0], v_t[1, 0])
+    assert tracker._view == 3
+    rect = view_box.viewRect()
+    assert abs(rect.center().x() - 20) < 1 and abs(rect.center().y() - 20) < 1
+
+    # ticked: the view is centred on the prediction in the NEW view, same zoom
+    tracker.follow_box.setChecked(True)
+    tracker._place(u_t[1, 3], v_t[1, 3])
+    assert tracker._view == 6
+    rect = view_box.viewRect()
+    u_pred, v_pred = tracker._predicted_position(1, 6)
+    assert abs(rect.center().x() - u_pred) < 1.0
+    assert abs(rect.center().y() - v_pred) < 1.0
+    assert abs(rect.height() - 40) < 1e-6     # zoom kept (width follows aspect)
+
+    # a feature with too few labels is left alone
+    tracker._set_active(9)
+    tracker._set_view(0)
+    view_box.setRange(xRange=(0, 40), yRange=(0, 40), padding=0)
+    tracker._place(5.0, 5.0)
+    rect = view_box.viewRect()
+    assert abs(rect.center().x() - 20) < 1 and abs(rect.center().y() - 20) < 1
+
+
 def test_ghost_markers_and_sizes(tracker):
     truth = truth_for(tracker)
     label_from_truth(tracker, truth)
