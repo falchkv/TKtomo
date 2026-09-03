@@ -57,10 +57,12 @@ DEFAULT_PORT = 5611
 ENV_PYTHON = "python=3.12"
 #: conda-forge packages for the node: what the server imports at start, what
 #: opening a stack needs, tomopy for the gridrec slice, sklearn + joblib for
-#: auto-complete. No Qt.
+#: auto-complete. No Qt. tomopy is pinned to 1.15 or newer: the solver
+#: otherwise pairs 1.14 with NumPy 2, and that tomopy converts its inputs
+#: with `np.array(x, copy=False)`, which NumPy 2 made an error.
 ENV_PACKAGES = (
     "numpy", "scipy", "h5py", "hdf5plugin", "scikit-image", "tifffile",
-    "pyzmq", "msgpack-python", "scikit-learn", "joblib", "tomopy",
+    "pyzmq", "msgpack-python", "scikit-learn", "joblib", "tomopy>=1.15",
     "pip", "setuptools",     # so the editable install needs no PyPI access
 )
 SYNC_EXCLUDES = (".git", ".idea", "tests", "docs", "*.blend", "meshes_*",
@@ -273,7 +275,8 @@ class Remote:
     def build_env(self, rebuild: bool = False) -> None:
         if rebuild:
             self.ssh(f"rm -rf {self.remote_dir}/env")
-        packages = " ".join((ENV_PYTHON,) + ENV_PACKAGES)
+        packages = " ".join(shlex.quote(p)
+                            for p in (ENV_PYTHON,) + ENV_PACKAGES)
         if not rebuild and self.env_exists():
             self.say(f"env exists at {self.host}:{self.remote_dir}/env: "
                      "checking its packages (--rebuild recreates it)")

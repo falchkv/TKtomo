@@ -12,6 +12,17 @@ import numpy as np
 from tktomo.recon.backend import register_backend
 
 
+def _float32(arr) -> np.ndarray:
+    """What tomopy wants, cast here rather than inside tomopy.
+
+    tomopy before 1.15 converts its inputs with ``np.array(x, copy=False)``,
+    which NumPy 2 turns into an error whenever a cast is needed (float64
+    angles are the usual case). Casting up front keeps every tomopy release
+    working and costs nothing when the array already is float32.
+    """
+    return np.ascontiguousarray(arr, dtype=np.float32)
+
+
 class TomoPyBackend:
     name = "tomopy"
 
@@ -37,7 +48,8 @@ class TomoPyBackend:
     ) -> np.ndarray:
         tomopy = self._tomopy()
         return tomopy.recon(
-            projections, angles, center=center, algorithm=algorithm, **kwargs
+            _float32(projections), _float32(angles), center=center,
+            algorithm=algorithm, **kwargs
         )
 
     def reproject(
@@ -49,7 +61,8 @@ class TomoPyBackend:
         **kwargs,
     ) -> np.ndarray:
         tomopy = self._tomopy()
-        return tomopy.project(volume, angles, center=center, pad=False, **kwargs)
+        return tomopy.project(_float32(volume), _float32(angles), center=center,
+                              pad=False, **kwargs)
 
 
 register_backend(TomoPyBackend())
