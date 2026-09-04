@@ -311,17 +311,31 @@ def test_prefetch_drops_a_stale_plan_when_the_view_moves():
         pf.stop()
 
 
-def test_prefetch_gives_up_after_failures_and_retries_only_when_moved():
-    """A dead server costs one fetch per view change, then nothing at all."""
+def test_prefetch_pauses_after_failures_and_recovers_when_the_link_returns():
+    """A dead server costs one fetch per view change, then nothing during a
+    cooldown; after it the next view change tries once more, and a server
+    that is back gets its read-ahead without a restart."""
     source = _SlowSource(fail=True)
-    pf = ViewPrefetcher(source, ahead=3, max_failures=3)
-    for round_no in range(1, 4):
-        pf.want(10 + round_no, step=1)
-        assert _settle(pf, lambda n=round_no: pf.failures >= n)
-        assert len(source.asked) == round_no        # one attempt, not a loop
-    assert _settle(pf, lambda: not pf.running)
-    assert pf.fetched == 0
-    pf.stop()                                       # idempotent after it gave up
+    pf = ViewPrefetcher(source, ahead=3, max_failures=3, retry_after=0.3)
+    try:
+        for round_no in range(1, 3):
+            pf.want(10 + round_no, step=1)
+            assert _settle(pf, lambda n=round_no: pf.failures >= n)
+            assert len(source.asked) == round_no    # one attempt, not a loop
+        pf.want(13, step=1)
+        assert _settle(pf, lambda: pf.paused)       # third failure: cooldown
+        assert len(source.asked) == 3 and pf.failures == 0
+        pf.want(14, step=1)                         # inside the cooldown
+        time.sleep(0.1)
+        assert len(source.asked) == 3               # not even one attempt
+        assert pf.running and pf.fetched == 0
+        assert _settle(pf, lambda: not pf.paused)
+        source.fail = False                         # the tunnel is back
+        pf.want(15, step=1)
+        assert _settle(pf, lambda: pf.fetched >= 3)
+        assert pf.failures == 0
+    finally:
+        pf.stop()
 
 
 def test_prefetch_fills_the_client_cache(served):

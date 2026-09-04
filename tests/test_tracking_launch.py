@@ -100,7 +100,9 @@ class _Scripted(Remote):
             returncode = None
 
             def poll(self_inner):
-                return 1 if self.fail_tunnel and cmd[0] == "ssh" else None
+                if cmd[0] == "ssh":
+                    return 1 if self.fail_tunnel else None
+                return 0                                # the window closes at once
 
             def wait(self_inner):
                 return 0
@@ -151,6 +153,49 @@ def test_start_runs_submit_wait_tunnel_app_cancel(no_sleep):
     assert remote.calls.index(spawns[0]) < remote.calls.index(spawns[1])
     assert any("scancel 424242" in c for c in remote.calls)
     assert remote.calls[-1].endswith("scancel 424242") or "terminate" in remote.calls[-2]
+
+
+class _Proc:
+    """A process whose poll() answers follow a script; the last answer sticks."""
+
+    def __init__(self, answers, pid=1):
+        self.answers, self.pid, self.returncode = list(answers), pid, None
+
+    def poll(self):
+        if len(self.answers) > 1:
+            self.returncode = self.answers.pop(0)
+        else:
+            self.returncode = self.answers[0]
+        return self.returncode
+
+
+def test_babysit_reopens_a_dropped_tunnel_and_records_its_pid(no_sleep,
+                                                               monkeypatch):
+    remote = _Scripted([])
+    launch._save_state({"job": "1", "tunnel_pid": 7})
+    reopened = []
+
+    def open_tunnel(node, timeout=60.0):
+        reopened.append(node)
+        if len(reopened) == 1:
+            raise launch.LaunchError("network still down")
+        return _Proc([None], pid=99)
+
+    monkeypatch.setattr(remote, "open_tunnel", open_tunnel)
+    app = _Proc([None, None, None, None, 0])         # closes on the fifth poll
+    tunnel = _Proc([None, 255])                      # alive once, then dead
+    rc, live = remote.babysit(app, tunnel, "max-wn1", poll=0.0, retry=0.0)
+    assert rc == 0 and live.pid == 99
+    assert reopened == ["max-wn1", "max-wn1"]       # one failed try, one good
+    assert launch._load_state()["tunnel_pid"] == 99
+    assert launch._load_state()["job"] == "1"       # the rest is kept
+
+
+def test_babysit_returns_when_the_window_closes_with_the_tunnel_alive(no_sleep):
+    remote = _Scripted([])
+    tunnel = _Proc([None], pid=5)
+    rc, live = remote.babysit(_Proc([None, 3]), tunnel, "max-wn1", poll=0.0)
+    assert rc == 3 and live is tunnel
 
 
 def test_start_cancels_the_job_when_the_tunnel_fails(no_sleep):

@@ -366,7 +366,10 @@ class Remote:
         if not port_free(self.port):
             raise LaunchError(f"local port {self.port} is in use (an old tunnel? "
                               "`tktomo-track-maxwell stop`, or pick --port)")
+        # keepalives so a link that silently died (a VPN drop) ends the ssh
+        # within about 90 s instead of hanging; `babysit` then reopens it
         cmd = ["ssh", "-N", "-o", "ExitOnForwardFailure=yes",
+               "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
                "-L", f"{self.port}:localhost:{self.port}"] + self.node_ssh_args(node)
         self.say(f"tunnel: {' '.join(cmd)}")
         proc = self.spawn(cmd, detach=True)
@@ -379,6 +382,35 @@ class Remote:
             time.sleep(0.5)
         proc.terminate()
         raise LaunchError(f"tunnel to {node} did not come up within {timeout:.0f} s")
+
+    def babysit(self, app: subprocess.Popen, tunnel: subprocess.Popen,
+                node: str, *, poll: float = 2.0,
+                retry: float = 20.0) -> tuple[int, subprocess.Popen]:
+        """Wait for the window to close, reopening the tunnel if it drops.
+
+        A VPN drop kills the ssh tunnel while the window and the job carry
+        on; without this the window's every call times out until the user
+        restarts everything. Returns (window exit code, the tunnel that is
+        up at that moment). A reopen that fails (the network is still down)
+        is retried every `retry` seconds for as long as the window runs.
+        """
+        while True:
+            rc = app.poll()
+            if rc is not None:
+                return rc, tunnel
+            if tunnel.poll() is not None:
+                self.say(f"tunnel to {node} dropped (ssh exited with "
+                         f"{tunnel.returncode}), reopening")
+                try:
+                    tunnel = self.open_tunnel(node, timeout=30.0)
+                except LaunchError as exc:
+                    self.say(f"could not reopen the tunnel: {exc}; retrying "
+                             f"in {retry:.0f} s")
+                    time.sleep(retry)
+                    continue
+                self.say(f"tunnel to {node} is back (pid {tunnel.pid})")
+                _save_state({**_load_state(), "tunnel_pid": tunnel.pid})
+            time.sleep(poll)
 
 
 # ---------------------------------------------------------------------------
@@ -460,7 +492,7 @@ def cmd_start(remote: Remote, args) -> int:
         if args.exact_frames:
             app.append("--exact-frames")
         remote.say("starting the track-model window")
-        rc = remote.spawn(app).wait()
+        rc, tunnel = remote.babysit(remote.spawn(app), tunnel, node)
         if rc != 0:
             remote.say(f"the window exited with {rc}")
         return EXIT_OK if rc == 0 else EXIT_ERROR

@@ -280,7 +280,13 @@ usually too small for the env.
 Why it looks like this: a compute node cannot ssh out, so the laptop
 tunnels *in* through the login node once SLURM has said which node the job
 got, and the same key that opened the login node is offered to the compute
-node. The server binds the node's loopback only.
+node. The server binds the node's loopback only. The launcher keeps
+watching the tunnel while the window runs: if the link drops (a VPN
+reconnect, say) the ssh keepalives end it within about 90 seconds and
+the launcher reopens it, retrying every 20 seconds until the network is
+back. The job and the window carry on meanwhile, so the first view change
+after that simply works again. The read-ahead prefetcher pauses for
+30 seconds after a run of failed fetches and resumes by itself.
 
 ### By hand, on any machine
 

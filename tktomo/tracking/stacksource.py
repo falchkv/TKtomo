@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -222,9 +223,13 @@ class ViewPrefetcher:
     prefetcher at nothing.
 
     **Failures stop it, quietly.** A dead server makes every fetch wait out
-    the client timeout, so one failure ends the round and a run of them ends
-    the thread. Retries then come from the user moving, not from a loop, and
-    the read they are waiting on is what reports the problem to them.
+    the client timeout, so one failure ends the round and a run of them
+    pauses the thread for `retry_after` seconds. Retries then come from the
+    user moving, not from a loop, and the read they are waiting on is what
+    reports the problem to them. The pause is what keeps a dead link from
+    costing a timeout on every view change (a fetch holds the client while
+    it waits), and its end is what lets the read-ahead come back by itself
+    once the tunnel is up again, which a VPN drop showed matters.
 
     Qt-free: it takes a `StackSource` and drives it on a daemon thread. The
     window owns one only when the source is remote (a local source's cache
@@ -233,10 +238,13 @@ class ViewPrefetcher:
 
     def __init__(self, source: "StackSource", *,
                  ahead: int = DEFAULT_PREFETCH_AHEAD,
-                 max_failures: int = 3) -> None:
+                 max_failures: int = 3,
+                 retry_after: float = 30.0) -> None:
         self._source = source
         self._ahead = int(ahead)
         self._max_failures = int(max_failures)
+        self._retry_after = float(retry_after)
+        self._paused_until = 0.0
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._target: int | None = None
@@ -285,10 +293,15 @@ class ViewPrefetcher:
         offsets.append(-stride * direction)      # one step back, for a reversal
         return [i for i in (target + o for o in offsets) if 0 <= i < info.n_views]
 
+    @property
+    def paused(self) -> bool:
+        """Sitting out a cooldown after a run of failures."""
+        return time.monotonic() < self._paused_until
+
     def _run(self) -> None:
         while not self._stopping:
             self._wake.clear()
-            for index in self._plan():
+            for index in ([] if self.paused else self._plan()):
                 # A new target means this plan is stale: drop it and rebuild.
                 if self._stopping or self._wake.is_set():
                     break
@@ -300,9 +313,13 @@ class ViewPrefetcher:
                     self.failures += 1
                     logger.debug("prefetch of view %d failed: %s", index, exc)
                     if self.failures >= self._max_failures:
-                        logger.info("prefetching stopped after %d failures "
-                                    "in a row", self.failures)
-                        return
+                        logger.info("prefetching paused for %.0f s after %d "
+                                    "failures in a row; the first view "
+                                    "change after that tries again",
+                                    self._retry_after, self.failures)
+                        self._paused_until = (time.monotonic()
+                                              + self._retry_after)
+                        self.failures = 0
                     break
                 else:
                     self.fetched += 1
