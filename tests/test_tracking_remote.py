@@ -53,6 +53,11 @@ def test_payloads_round_trip():
                        rot_deg=np.zeros(3), center=2.5, extra_bin=2)
     back = _roundtrip(req)
     assert back.row_in_slab == 3 and back.extra_bin == 2
+    assert back.dtheta is None
+    with_angles = SliceRequest(row=5, lo=2, hi=9, sy=np.ones(3),
+                               sx=np.zeros(3), rot_deg=np.zeros(3),
+                               center=2.5, dtheta=np.full(3, 0.01))
+    assert np.allclose(_roundtrip(with_angles).dtheta, 0.01)
 
     job = AutoTrackJob(fid=1, seeds=((0, 1.0, 2.0), (5, 3.0, 4.0)),
                        params=AutoTrackParams(patch=30, fb_min_corr=0.2),

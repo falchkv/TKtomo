@@ -87,6 +87,9 @@ def test_slogger_shifts_signs_and_center(tmp_path):
     assert attrs["center_reliable"]
     assert attrs["axis_tilt_rad"] == pytest.approx(0.0)
     assert attrs["stage"] == "track_model_app"
+    assert not attrs["rotations_in_shifts"]
+    with h5py.File(path, "r") as f:
+        assert np.allclose(f["rot_axis_rad"][()], 0.0)
 
 
 def make_fit_from_model(model):
@@ -217,3 +220,152 @@ def test_model_h5_round_trip(tmp_path):
     assert out["diagnostics"]["center_split_px"] == pytest.approx(0.4)
     with h5py.File(path, "r") as f:
         assert f["astra_parallel3d_vec"].shape == (16, 12)
+
+
+# ---------------------------------------------------------------------------
+# per-view rotations
+# ---------------------------------------------------------------------------
+
+def test_astra_vectors_exact_with_per_view_rotations():
+    truth = make_truth(degrees=(1, 1, 1), n_view=24, rot_rms_deg=2.0)
+    assert truth.has_rotations
+    det_shape = (341, 966)
+    vec = astra_parallel3d_vectors(truth, det_shape)
+    u_model, v_model = truth.predict()
+    h, w = det_shape
+    for j in range(truth.theta.size):
+        ray, d = vec[j, 0:3], vec[j, 3:6]
+        u_vec, v_vec = vec[j, 6:9], vec[j, 9:12]
+        basis = np.column_stack([u_vec, v_vec, ray])
+        for f in range(truth.feature_ids.size):
+            point = np.array([truth.a[f], truth.b[f], truth.y[f]])
+            p, q, _ = np.linalg.solve(basis, point - d)
+            assert p + (w - 1) / 2.0 == pytest.approx(u_model[f, j], abs=1e-9)
+            assert q + (h - 1) / 2.0 == pytest.approx(v_model[f, j], abs=1e-9)
+
+
+def test_model_h5_round_trip_rotations_and_version_2(tmp_path):
+    truth = make_truth(degrees=(1, 1, 0), n_feat=5, n_view=16,
+                       rot_rms_deg=1.0)
+    fit, u, v, valid = make_fit(truth)
+    mask = FreeMask.all_free(truth)
+    mask.rot_beam = True
+    labels = LabelStore()
+    i, j = np.nonzero(valid)
+    for k in range(i.size):
+        labels.set(int(truth.feature_ids[i[k]]), int(j[k]),
+                   u[i[k], j[k]], v[i[k], j[k]])
+    path = tmp_path / "model.h5"
+    write_model_h5(path, fit, mask, labels, CoordinateChain())
+    out = read_model_h5(path)
+    for name in ("rot_horiz", "rot_beam", "rot_axis"):
+        assert np.allclose(getattr(out["model"], name), getattr(truth, name))
+    assert out["mask"].rot_beam and not out["mask"].rot_axis
+
+    # a version-2 file has no rotations: they load as zero and fixed
+    with h5py.File(path, "a") as f:
+        for name in ("rot_horiz", "rot_beam", "rot_axis"):
+            del f[name]
+            del f.attrs[f"free_{name}"]
+        f.attrs["model_version"] = 2
+    out = read_model_h5(path)
+    assert not out["model"].has_rotations
+    assert not out["mask"].any_rotation
+    assert np.allclose(out["model"].dx, truth.dx)
+
+
+def test_session_round_trip_rotations_and_version_2(tmp_path):
+    from tktomo.tracking import sessionio
+
+    truth = make_truth(degrees=(1, 1, 0), n_feat=5, n_view=16,
+                       rot_rms_deg=1.0)
+    mask = FreeMask.all_free(truth)
+    mask.rot_axis = True
+    path = tmp_path / "session.h5"
+    sessionio.save_session(path, labels=LabelStore(), model=truth, mask=mask,
+                           source={"kind": "test"}, ui_state={})
+    state = sessionio.load_session(path)
+    assert np.allclose(state["model"].rot_axis, truth.rot_axis)
+    assert state["mask"].rot_axis and not state["mask"].rot_beam
+    with h5py.File(path, "a") as f:
+        for name in ("rot_horiz", "rot_beam", "rot_axis"):
+            del f[name]
+            del f.attrs[f"free_{name}"]
+        f.attrs["session_version"] = 2
+    state = sessionio.load_session(path)
+    assert not state["model"].has_rotations
+    assert not state["mask"].any_rotation
+
+
+def test_aligned_transforms_apply_rot_beam_about_the_axis_column():
+    """A per-view rotation about the beam is undone as a per-view image
+    rotation. The model rotates about the axis column at the top row and
+    the image transform about the image centre, so without the
+    compensation the aligned features would wander by the angle times
+    the distance between those points (about a pixel here)."""
+    theta = np.linspace(0, np.pi, 12)
+    model = AxisModel.blank(theta, np.arange(4), (1, 0, 0))
+    rng = np.random.default_rng(2)
+    model.a = np.array([60.0, -40.0, 10.0, 90.0])
+    model.b = np.array([-30.0, 70.0, -80.0, 5.0])
+    model.y = np.array([40.0, 60.0, 80.0, 100.0])
+    model.c_coef = np.array([150.0, 6.0])
+    model.alpha_coef = np.array([-0.01])
+    model.dx = 2.0 * rng.standard_normal(12)
+    model.dy = 1.5 * rng.standard_normal(12)
+    model.rot_beam = np.deg2rad(0.8) * np.sin(np.linspace(0, 5, 12))
+
+    chain = CoordinateChain(binning=1)
+    image_shape = (161, 241)
+    with pytest.raises(ValueError, match="det_shape_loaded"):
+        aligned_view_transforms(model, chain)
+    transforms = aligned_view_transforms(model, chain,
+                                         det_shape_loaded=image_shape)
+    assert not np.allclose([t.rotation for t in transforms],
+                           transforms[0].rotation)
+    u_model, v_model = model.predict()
+    aligned_u = np.empty_like(u_model)
+    aligned_v = np.empty_like(v_model)
+    for j, t in enumerate(transforms):
+        pts = np.column_stack([u_model[:, j], v_model[:, j]])
+        out = forward_points(pts, t, image_shape)
+        aligned_u[:, j], aligned_v[:, j] = out[:, 0], out[:, 1]
+    ct, sn = np.cos(theta), np.sin(theta)
+    s = model.a[:, None] * ct + model.b[:, None] * sn
+    du = aligned_u - s
+    assert np.max(np.std(du, axis=1)) < 0.05          # sinusoid + constant
+    assert np.max(np.std(aligned_v, axis=1)) < 0.05   # flat height
+
+    # the same without the compensation: measurably worse
+    from tktomo.align.transform import Transform
+    c_of, _, _ = model.axis_curves()
+    naive = [Transform(dx=-(model.dx[j] + c_of[j] - model.c_coef[0]),
+                       dy=-model.dy[j], rotation=t.rotation)
+             for j, t in enumerate(transforms)]
+    for j, t in enumerate(naive):
+        pts = np.column_stack([u_model[:, j], v_model[:, j]])
+        out = forward_points(pts, t, image_shape)
+        aligned_u[:, j], aligned_v[:, j] = out[:, 0], out[:, 1]
+    assert np.max(np.std(aligned_v, axis=1)) > 0.3
+
+
+def test_plan_slice_carries_the_rotations():
+    from tktomo.tracking.recon import plan_slice
+
+    theta = np.linspace(0, np.pi, 10)
+    model = AxisModel.blank(theta, np.arange(3))
+    model.c_coef[0] = 60.0
+    model.alpha_coef[0] = -0.01
+    chain = CoordinateChain()
+    plain = plan_slice(model, chain, n_rows=200, width=121, row=100)
+    assert plain.dtheta is None
+    model.rot_beam = np.deg2rad(0.5) * np.sin(np.linspace(0, 4, 10))
+    model.rot_axis = np.deg2rad(0.3) * np.cos(np.linspace(0, 4, 10))
+    req = plan_slice(model, chain, n_rows=200, width=121, row=100)
+    assert np.allclose(req.rot_deg,
+                       -np.rad2deg(model.alpha_coef[0] + model.rot_beam))
+    assert np.allclose(req.dtheta, model.rot_axis)
+    assert req.hi - req.lo >= plain.hi - plain.lo
+    moved = model.rot_beam != 0.0
+    assert not np.allclose(req.sx[moved], plain.sx[moved])
+    assert req.row_in_slab == 100 - req.lo

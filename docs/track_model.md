@@ -24,6 +24,26 @@ linear IRLS solves (Huber weights), no nonlinear optimizer: every view is
 tied to every other through shared features, so there is nothing to chain
 and nothing to diverge.
 
+Sometimes the whole object tilts at a view, which no smooth tilt and no
+shift can express. Three optional per-view rotations describe that: the
+beam frame (across-beam horizontal, beam, rotation axis) with the
+detector, rotated relative to the object by the small vector
+(rot horiz, rot beam, rot axis) in its own axes. The feature's
+coordinates (s, t, y) become p' = R(-w) p, then the equations above use
+s', t', y'. To first order
+
+    s' = s + rot_axis t - rot_beam y
+    t' = t - rot_axis s + rot_horiz y
+    y' = y - rot_horiz t + rot_beam s
+
+Rot axis is an increment of the projection angle (theta + rot axis, added
+to the nominal angle, not replacing it), rot beam an in-plane rotation
+of the image about the axis column, rot horiz an out-of-plane tilt. With
+a rotation free the fit becomes a joint Gauss-Newton on every free
+parameter (three passes), each angle under a Gaussian prior whose rms
+you set, weighed against the label noise. Without them the fit is bit
+for bit the two-stage one.
+
 ## Labeling
 
 Digits 0 to 9 pick the active feature (the table picks any id), left click
@@ -197,6 +217,25 @@ residuals WITHOUT fitting, so the response to "what if the center were
 here" is immediate; the next fit overwrites free values and respects fixed
 ones.
 
+The three per-view rotations ("Rot horiz", "Rot beam", "Rot axis") work
+the same way: a free box, a Zero button, and a prior rms in degrees
+each. Unchecked means frozen at the current values, which are zero until
+a fit or a session load sets them, so read the state line under the
+rows. The prior keeps an angle small where few labels constrain it: a
+view needs three or more labels at different positions for the angle to
+be measured at all (warning W7 counts the thin views), and the "label
+noise" box in the Robust row sets how strongly the priors pull (the fit
+minimises the squared residuals plus noise squared times the squared
+angles over their rms). One degree leaves a real degree-scale tilt alone
+and damps the noise-driven ones. Above about ten degrees the prior stops
+doing its job and the angles drift into directions the labels cannot
+tell from feature heights and tilts, so the box stops there. Rot beam
+shares its lever with dy and y, so free dx and dy with it. A constant
+rot axis over all views is the same as rotating every feature's (a, b),
+a constant rot beam the same as alpha, a constant rot horiz the same as
+beta: the prior picks the representative with the angles at zero mean,
+so the polynomial coefficients keep their meaning.
+
 Two consequences of the geometry to keep in mind (the app warns about
 both):
 
@@ -211,21 +250,23 @@ both):
   want the fixed value to mean something.
 
 `Run diagnostics` fits disjoint halves of the features separately and
-reports the disagreement (center, tilts, shift curves) plus held-out
-residuals. The half-split is the number to trust; the parametric sigma is
-shown but loses every argument with it.
+reports the disagreement (center, tilts, shift curves, the three rotation
+curves in degrees) plus held-out residuals. The half-split is the number
+to trust; the parametric sigma is shown but loses every argument with it.
 
 ## Plots and views without labels
 
 The bottom panel holds one plot pane with a dropdown selecting what it
-shows (default: labels per view). Available: dx/dy shifts,
-labels per view, residual u/v colored by feature, per-view MAD spread,
-axis center c(theta), tilts alpha/beta, residual histogram. Clicking in
+shows (default: labels per view). Available: dx/dy shifts, the three
+per-view rotations in degrees, labels per view, residual u/v colored by
+feature, per-view MAD spread, axis center c(theta), tilts alpha/beta,
+residual histogram. Clicking in
 any angle-axis plot jumps to the nearest frame, so a gap or a bad point
 is one click from being looked at and labeled.
 
-`dx`/`dy` are measured only where labels exist; unlabeled views are
-filled by interpolation over angle. In the shift plots, dots are labeled
+`dx`/`dy` and the rotations are measured only where labels exist;
+unlabeled views are filled by interpolation over angle. In the shift
+and rotation plots, dots are labeled
 views (orange when only ONE label carries the view, so its shift is that
 label verbatim), the dashed curve is the interpolation, and red base
 ticks mark frames with NO labels at all. The "labels per view" plot
@@ -339,16 +380,20 @@ of frames.
 ## Exports
 
 - **Model + astra vectors**: the full fit in one HDF5 (coefficients,
-  shifts, feature positions, labels, masks, provenance), plus a
-  `(n_views, 12)` `parallel3d_vec` dataset whose ASTRA forward projection
-  reproduces the fitted model exactly, tilts included, for a
-  geometry-aware GPU reconstruction.
+  shifts, rotations, feature positions, labels, masks, provenance), plus
+  a `(n_views, 12)` `parallel3d_vec` dataset whose ASTRA forward
+  projection reproduces the fitted model exactly, tilts and per-view
+  rotations included, for a geometry-aware GPU reconstruction.
 - **slogger shifts.h5**: `sy`/`sx` and center/tilt attrs in the pipeline's
   convention (`sx = -dx/b`, `center = (c_raw - u0 - (b-1)/2)/b`), directly
-  consumable by the graphite-ball pipeline's recon stage.
+  consumable by the graphite-ball pipeline's recon stage. The per-view
+  rotations are written as `rot_*_rad` datasets for provenance only:
+  `sx`/`sy` do not contain them, and an attribute says so.
 - **Aligned projection stack**: undoes `dx`/`dy`, folds the `c(theta)`
-  drift into per-view shifts and derotates the constant in-plane tilt, one
-  affine resample per view. `beta` and any angle-dependence of `alpha`
+  drift into per-view shifts and derotates the constant in-plane tilt
+  plus the per-view rot beam (about the axis column, with the shift that
+  makes an image-centre rotation act there), one affine resample per
+  view. `beta`, any angle-dependence of `alpha`, rot axis and rot horiz
   cannot be expressed as 2D image transforms; they stay in the metadata.
 - **Session**: labels, model, masks and UI state in a small HDF5 next to
   the data; the stack itself is re-read from its source on load.
@@ -359,8 +404,11 @@ The Recon slice tab (top panel, next to the projection view)
 reconstructs one detector row with tomopy gridrec at the
 fitted center, after applying each view's full 2D correction: the dx/dy
 shifts, the c(theta) drift, and derotation by the in-plane tilt
-alpha(theta), so the slice responds to the tilt parameters. Only beta
-stays out (it needs 3D geometry, in 2D nothing can honor it). A bin
+alpha(theta) plus the per-view rot beam, so the slice responds to the
+tilt parameters. Rot axis goes to gridrec as a per-view angle increment.
+Only beta and rot horiz stay out (they need 3D geometry, in 2D nothing
+can honor them). On a remote stack the server must be at least as new as
+the window for the angle increment to cross the link. A bin
 selector mean-pools the slab before reconstruction (shifts, center and
 row rescaled accordingly); cost falls roughly as bin cubed, so bin 2 or 4
 makes live evaluation fluid and bin 1 is for the final look. Off by default; the

@@ -674,6 +674,103 @@ def test_recon_binning_rescales_geometry(tracker):
     assert binned["row_in_slab"] <= full["row_in_slab"] // 2 + 1
 
 
+def test_rotation_rows_defaults_state_and_fit(tracker):
+    """Three per-view rotations next to dx and dy: unchecked and at zero by
+    default, a prior sigma each, Zero buttons, the state line in degrees,
+    the mask following the boxes, and the summary reporting the rms."""
+    for check in tracker.free_rot.values():
+        assert not check.isChecked()
+    for spin in tracker.rot_sigma.values():
+        assert spin.value() == 1.0 and spin.maximum() == 10.0
+    assert tracker.noise_px.value() == 1.0
+    truth = truth_for(tracker)
+    label_from_truth(tracker, truth)
+    tracker._fit_now()
+    assert "rot axis: fixed at zero" in tracker.shift_state_label.text()
+    assert "rot rms" not in tracker.summary_label.text()
+    assert not tracker._mask.any_rotation
+
+    tracker._model.rot_axis[:] = np.deg2rad(0.5)
+    tracker._evaluate()
+    assert "rot axis: FROZEN at rms 0.50 deg" in tracker.shift_state_label.text()
+    tracker._zero_shift("rot_axis")
+    assert "rot axis: fixed at zero" in tracker.shift_state_label.text()
+
+    tracker.free_rot["rot_axis"].setChecked(True)
+    tracker.rot_sigma["rot_axis"].setValue(0.5)
+    tracker.noise_px.setValue(0.7)
+    tracker._fit_now()
+    assert tracker._mask.rot_axis and not tracker._mask.rot_beam
+    assert "rot axis: free, fitted rms" in tracker.shift_state_label.text()
+    assert "rot rms h/b/a" in tracker.summary_label.text()
+    kw = tracker._solve_kwargs()
+    assert kw["noise_px"] == pytest.approx(0.7)
+    assert kw["rot_sigma"][2] == pytest.approx(np.deg2rad(0.5))
+    state = tracker._ui_state()
+    assert state["rot_sigma_deg"]["rot_axis"] == pytest.approx(0.5)
+    assert state["noise_px"] == pytest.approx(0.7)
+    # the truth has no rotations: the fitted ones stay small
+    assert float(np.rad2deg(np.abs(tracker._model.rot_axis).max())) < 0.2
+
+
+def test_session_restores_free_flags_and_priors(tracker, tmp_path,
+                                                monkeypatch):
+    from PySide6.QtWidgets import QFileDialog, QMessageBox
+
+    win = tracker
+    label_from_truth(win, truth_for(win))
+    win.free_dx.setChecked(True)
+    win.free_rot["rot_beam"].setChecked(True)
+    win.rot_sigma["rot_beam"].setValue(2.5)
+    win.noise_px.setValue(0.8)
+    win._fit_now()
+    rot_beam_saved = win._model.rot_beam.copy()
+    path = str(tmp_path / "session.h5")
+    monkeypatch.setattr(QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (path, "")))
+    monkeypatch.setattr(QMessageBox, "information",
+                        staticmethod(lambda *a, **k: None))
+    win._save_session()
+    win.free_dx.setChecked(False)
+    win.free_rot["rot_beam"].setChecked(False)
+    win.rot_sigma["rot_beam"].setValue(1.0)
+    win.noise_px.setValue(1.0)
+    win._load_session(path)
+    assert win.free_dx.isChecked()
+    assert win.free_rot["rot_beam"].isChecked()
+    assert not win.free_rot["rot_axis"].isChecked()
+    assert win.rot_sigma["rot_beam"].value() == pytest.approx(2.5)
+    assert win.noise_px.value() == pytest.approx(0.8)
+    assert np.allclose(win._model.rot_beam, rot_beam_saved)
+
+
+def test_rotation_fit_ignores_checkbox_history_when_free(qtbot):
+    results = []
+    for tick_during_labeling in (True, False):
+        win = TrackModelWindow()
+        qtbot.addWidget(win)
+        win.auto_fit.setChecked(False)
+        win.advance_box.setValue(0)
+        win.free_dx.setChecked(True)
+        win.free_dy.setChecked(True)
+        win.free_rot["rot_axis"].setChecked(tick_during_labeling)
+        truth = truth_for(win)
+        u_t, v_t = truth.predict()
+        for f in range(4):
+            win._set_active(f)
+            for view in range(0, 60, 4):
+                win._set_view(view)
+                win._place(u_t[f, view], v_t[f, view])
+                win._fit_now()
+        win.free_rot["rot_axis"].setChecked(True)
+        win._fit_now()
+        results.append(win._fit.model)
+    a, b = results
+    assert np.allclose(a.c_coef, b.c_coef, atol=1e-4)
+    assert np.allclose(a.dx, b.dx, atol=1e-4)
+    assert np.allclose(a.rot_axis, b.rot_axis, atol=1e-5)
+
+
 def test_tracker_file_menu_holds_io_actions(tracker):
     """Load/save/export live in the File menu, not on the control panel."""
     from PySide6.QtWidgets import QPushButton

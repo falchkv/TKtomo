@@ -63,6 +63,41 @@ Views without labels get no dx/dy columns; after the solve they are filled
 by PCHIP interpolation over angle and flagged, so plots and exports can
 distinguish measured from interpolated.
 
+Per-view rotations (rot_horiz, rot_beam, rot_axis, rad, `AxisModel`):
+the beam frame rotated relative to the object by w in its own axes,
+p' = R(-w) p with p = (s, t, y) and R the Rodrigues rotation
+(`rotation_matrices`, exact identity at w = 0 so the plain fit stays bit
+for bit). rot_axis alone is theta + rot_axis exactly. `AxisModel.project`
+is the one forward model (predict, the window's probe, the diagnostics).
+With a rotation free `solve_model` runs a joint Gauss-Newton on all free
+parameters (`_joint_pass`, u and v residuals stacked, Huber scales per
+stage, three passes): columns are increments, the derivative of p' with
+respect to a rotation increment dw is p' x dw, and each rotation carries
+prior rows which `_masked_irls` keeps out of the Huber scale and out of
+the returned residual (`n_data`). The prior is whitened: the block's
+unknown is the increment in units of sigma/noise_px, the prior row is an
+identity row with target minus the current angle in those units, and the
+data columns carry the factor. With the raw angle as unknown a tight
+sigma made the prior rows enormous, LSQR stopped short, residuals that
+should be exactly zero were not, and the Huber scale went wrong. That
+scale (`_huber_weights`) is estimated from the residuals a free
+parameter did not absorb exactly: with staggered labels the absorbed
+zeros can be the majority, the p90 floor then sits at zero and the fit
+turns into an L1 problem driven by numerical dust. Gauge with
+rotations: a constant rot_axis
+is degenerate with rotating every (a, b), a constant rot_beam with
+alpha_0, a constant rot_horiz with beta_0, and a per-view rot_beam or
+rot_horiz with dy_j when a view's labels share s or t. The ridge prior
+resolves all of them by minimum norm, so there is no new regauge, and
+the horizontal regauge uses the rotated cos/sin profiles. Solving the
+rotations inside the two stages instead (rot_beam in v only) was
+measured to let the stages trade error back and forth as the prior
+loosened, hence the joint solve. Beyond a prior rms of about ten degrees
+the angles drift into near-degenerate directions with the feature
+heights and tilts, which is why the window caps sigma there. The mask
+defaults the rotations to fixed, so `FreeMask.all_free` and a missing
+mask still give the plain fit.
+
 ## 4. Conventions pinned by tests
 
 - slogger shifts: `sx = -dx_raw/b`, `sy = -dy_raw/b`,
@@ -71,11 +106,20 @@ distinguish measured from interpolated.
 - ASTRA `parallel3d_vec`: detector axes are the DUAL basis of the model
   read-out functionals (`m1 = e_s`, `m2 = alpha e_s + beta e_t + e_z`),
   which reproduces the model exactly rather than to first order in the
-  tilts. Verified to machine precision without astra installed.
+  tilts. With per-view rotations the beam basis is rotated first,
+  e_k' = sum_l Rm[k, l] e_l with Rm = R(-w), and the same closed forms
+  hold in the primed basis. Verified to machine precision without astra
+  installed, rotations included.
 - Aligned stack: `Transform(dx=-(dx + c(th) - c_ref), dy=-dy,
-  rotation=-deg(alpha_0))`; `apply_transform` rotates the translation with
-  the content, which is exactly shift-then-derotate (pre-rotating the
-  shift applies the rotation twice; a test guards this).
+  rotation=-deg(alpha_0 + rot_beam_j))`. `apply_transform` rotates the
+  translation with the content, which is exactly shift-then-derotate
+  (pre-rotating the shift applies the rotation twice, a test guards
+  this). The model rotates about (c, 0) in raw px and `Transform` about
+  the image centre. For the per-view part of the angle that difference is
+  compensated by `rotation_centre_shift` (a test guards this too), the
+  constant part for alpha_0 stays the harmless constant offset it was.
+  `plan_slice` does the same about the slab centre and passes rot_axis to
+  gridrec as `SliceRequest.dtheta`.
 - Feature-crop coordinate round trip: a label on the crop equals the same
   pixel labeled on the source stack, in raw coordinates.
 

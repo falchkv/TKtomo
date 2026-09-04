@@ -106,6 +106,9 @@ FOLLOW_MIN_LABELS = 4
 PLOT_KINDS = [
     "dx shifts",
     "dy shifts",
+    "rot horiz",
+    "rot beam",
+    "rot axis",
     "labels per view",
     "residual u",
     "residual v",
@@ -767,16 +770,86 @@ class TrackModelWindow(QMainWindow):
             shift_holder = QWidget()
             shift_holder.setLayout(shift_row)
             self._model_form.addRow(label, shift_holder)
+        # Per-view rotations: the whole object tilting at a view. Same
+        # free/frozen mechanism as the shifts, plus a Gaussian prior rms
+        # each, because with few labels per view they are only weakly
+        # determined and the prior is what keeps them from wandering.
+        self.free_rot: dict[str, QCheckBox] = {}
+        self.rot_sigma: dict[str, QDoubleSpinBox] = {}
+        rot_rows = (
+            ("rot_horiz", "Rot horiz:", "rot horiz free",
+             "Rotation of the whole object about the HORIZONTAL axis "
+             "across the beam at that view (an out-of-plane tilt): the "
+             "point's height picks up its depth along the beam, v changes "
+             "by minus the angle times t. Not expressible in 2D, so the "
+             "recon slice and the aligned export leave it out; the ASTRA "
+             "vectors carry it exactly."),
+            ("rot_beam", "Rot beam:", "rot beam free",
+             "Rotation of the whole object about the BEAM at that view: an "
+             "in-plane rotation of the image about the axis column at the "
+             "top row, v changes by the angle times s and u by minus the "
+             "angle times y. The recon slice and the aligned export undo "
+             "it. It shares its lever with dy and y, so free dx and dy "
+             "with it and label three or more features in the same views."),
+            ("rot_axis", "Rot axis:", "rot axis free",
+             "Rotation of the whole object about the ROTATION AXIS at that "
+             "view: an increment of the projection angle, added to the "
+             "nominal one (theta + rot axis), u changes by the angle times "
+             "t. The recon slice uses the corrected angles."),
+        )
+        common = (
+            "\nChecked: fitted for every labeled view (unlabeled views "
+            "are interpolated) under a Gaussian prior with the rms next "
+            "to it.\nUnchecked: frozen at the current values, which are "
+            "zero until a fit or a load sets them, not necessarily zero "
+            "now.\nThe prior rms keeps the angle small where few labels "
+            "constrain it; it is weighed against the label noise set in "
+            "the Robust row. Above about 10 deg the prior stops doing its "
+            "job and the angles drift into directions the labels cannot "
+            "tell from feature heights and tilts, hence the cap.")
+        for attr, label, text, tip in rot_rows:
+            check = QCheckBox(text)
+            check.setChecked(False)
+            check.setToolTip(tip + common)
+            check.toggled.connect(lambda _c: self._request_fit())
+            sigma = QDoubleSpinBox()
+            sigma.setRange(0.01, 10.0)
+            sigma.setDecimals(2)
+            sigma.setSingleStep(0.1)
+            sigma.setValue(1.0)
+            sigma.setSuffix(" deg rms")
+            sigma.setToolTip(
+                "Rms of the Gaussian prior on this per-view angle. Smaller "
+                "pulls the angles toward zero harder; 1 deg leaves a real "
+                "degree-scale tilt alone and damps the noise-driven ones.")
+            sigma.valueChanged.connect(lambda _v: self._request_fit())
+            zero = QPushButton("Zero")
+            zero.clicked.connect(lambda _c, a=attr: self._zero_shift(a))
+            zero.setToolTip(
+                "Set this per-view angle to zero in every view. Combine "
+                "with the box unchecked to keep it there through the next "
+                "fit.")
+            row = QHBoxLayout()
+            row.addWidget(check)
+            row.addWidget(sigma)
+            row.addWidget(zero)
+            row.addStretch(1)
+            holder = QWidget()
+            holder.setLayout(row)
+            self._model_form.addRow(label, holder)
+            self.free_rot[attr] = check
+            self.rot_sigma[attr] = sigma
         # Frozen shifts are invisible state that changes what a fit means;
         # this line keeps them visible so "why does my fit depend on
         # earlier clicking" has an on-screen answer.
         self.shift_state_label = QLabel("dx: zero   dy: zero")
+        self.shift_state_label.setWordWrap(True)
         self.shift_state_label.setToolTip(
-            "Current content of the per-view shifts. 'free' is refitted "
-            "from the labels every fit (history cannot matter); 'FROZEN' "
-            "is held at the shown rms, which is whatever the last free "
-            "fit left, so the fit DOES depend on that history until you "
-            "press Zero.")
+            "Current content of the per-view shifts and rotations. 'free' "
+            "is refitted from the labels every fit (history cannot "
+            "matter); 'FROZEN' is held at the shown rms, which is whatever "
+            "the last free fit left, so the fit DOES depend on that "
+            "history until you press Zero.")
         self._model_form.addRow("", self.shift_state_label)
         self.huber = QDoubleSpinBox()
         self.huber.setRange(0.5, 20.0)
@@ -784,17 +857,33 @@ class TrackModelWindow(QMainWindow):
         self.iters = QSpinBox()
         self.iters.setRange(1, 10)
         self.iters.setValue(4)
+        self.noise_px = QDoubleSpinBox()
+        self.noise_px.setRange(0.05, 20.0)
+        self.noise_px.setDecimals(2)
+        self.noise_px.setSingleStep(0.1)
+        self.noise_px.setValue(1.0)
+        self.noise_px.setSuffix(" px")
+        self.noise_px.setToolTip(
+            "Assumed label noise in raw px. It only matters with a free "
+            "rotation: it sets how strongly the rotation priors pull "
+            "against the labels (the fit minimises the squared residuals "
+            "plus noise squared times the squared angles over their prior "
+            "rms). Twice the noise is four times the prior's pull.")
+        self.noise_px.valueChanged.connect(lambda _v: self._request_fit())
         robust_row = QHBoxLayout()
         robust_row.addWidget(QLabel("huber k"))
         robust_row.addWidget(self.huber)
         robust_row.addWidget(QLabel("iters"))
         robust_row.addWidget(self.iters)
+        robust_row.addWidget(QLabel("label noise"))
+        robust_row.addWidget(self.noise_px)
         robust_row.addStretch(1)
         robust_holder = QWidget()
         robust_holder.setLayout(robust_row)
         robust_holder.setToolTip(
-            "Huber threshold k in units of the residual scale, and the "
-            "number of reweighting (IRLS) passes per fit.")
+            "Huber threshold k in units of the residual scale, the number "
+            "of reweighting (IRLS) passes per fit, and the label noise the "
+            "rotation priors are weighed against.")
         self._model_form.addRow("Robust:", robust_holder)
         layout.addWidget(model_box)
 
@@ -908,6 +997,8 @@ class TrackModelWindow(QMainWindow):
             model.beta_coef[:] = np.resize(old.beta_coef,
                                            model.beta_coef.shape)
             model.dx, model.dy = old.dx.copy(), old.dy.copy()
+            for attr in ("rot_horiz", "rot_beam", "rot_axis"):
+                setattr(model, attr, getattr(old, attr).copy())
             lookup = {int(f): k for k, f in enumerate(old.feature_ids)}
             for row, fid in enumerate(ids):
                 if fid in lookup:
@@ -919,6 +1010,8 @@ class TrackModelWindow(QMainWindow):
         mask = FreeMask.all_free(model)
         mask.dx = self.free_dx.isChecked()
         mask.dy = self.free_dy.isChecked()
+        for attr, check in self.free_rot.items():
+            setattr(mask, attr, check.isChecked())
         for group in ("c", "alpha", "beta"):
             flags = getattr(mask, group)
             for k, (check, _spin) in enumerate(self._coef_rows[group]):
@@ -1289,6 +1382,18 @@ class TrackModelWindow(QMainWindow):
         if self.auto_fit.isChecked():
             self._fit_timer.start()
 
+    def _solve_kwargs(self) -> dict:
+        """What every solve (fit, refit, diagnostics) gets from the panel."""
+        return {
+            "iters": self.iters.value(),
+            "huber": self.huber.value(),
+            "feature_weight": self._feature_weights(),
+            "rot_sigma": tuple(np.deg2rad(self.rot_sigma[a].value())
+                               for a in ("rot_horiz", "rot_beam",
+                                         "rot_axis")),
+            "noise_px": float(self.noise_px.value()),
+        }
+
     def _fit_now(self) -> None:
         if self._stack.info() is None or len(self._labels) == 0:
             return
@@ -1299,17 +1404,13 @@ class TrackModelWindow(QMainWindow):
             return
         try:
             self._fit = solve_model(u, v, valid, self._model, self._mask,
-                                    iters=self.iters.value(),
-                                    huber=self.huber.value(),
-                                    feature_weight=self._feature_weights())
+                                    **self._solve_kwargs())
             n_rej = self._reject_auto_outliers(ids)
             if n_rej:
                 u, v, valid, ids = self._labels.to_arrays(
                     self._stack.angles.size, self._model.feature_ids)
                 self._fit = solve_model(u, v, valid, self._fit.model,
-                                        self._mask, iters=self.iters.value(),
-                                        huber=self.huber.value(),
-                                        feature_weight=self._feature_weights())
+                                        self._mask, **self._solve_kwargs())
         except ValueError as exc:
             self.summary_label.setText(f"fit failed: {exc}")
             return
@@ -1365,7 +1466,8 @@ class TrackModelWindow(QMainWindow):
             f"({fit.residual_u.size} labels, "
             f"{int(fit.observed_views.sum())} views) | "
             f"center c(θ̄) = {fit.model.center_at_mean_theta():.2f} raw px | "
-            f"α₀ = {fit.model.alpha_coef[0]:+.5f} rad")
+            f"α₀ = {fit.model.alpha_coef[0]:+.5f} rad"
+            + self._rotation_summary(fit.model))
         warn_lines = list(fit.warnings)
         if self._diagnostics is not None:
             warn_lines += [w for w in self._diagnostics["warnings"]
@@ -1375,20 +1477,31 @@ class TrackModelWindow(QMainWindow):
         if self.live_recon.isChecked():
             self._recon_timer.start()
 
+    def _rotation_summary(self, model) -> str:
+        """' | rot rms h/b/a = ... deg' when any rotation is free, else ''."""
+        if not any(c.isChecked() for c in self.free_rot.values()):
+            return ""
+        rms = [float(np.rad2deg(np.sqrt(np.mean(getattr(model, a) ** 2))))
+               for a in ("rot_horiz", "rot_beam", "rot_axis")]
+        return f" | rot rms h/b/a = {rms[0]:.2f}/{rms[1]:.2f}/{rms[2]:.2f} deg"
+
     def _update_shift_state_label(self) -> None:
         if self._model is None:
             return
         parts = []
-        for name, values, free in (
-                ("dx", self._model.dx, self.free_dx.isChecked()),
-                ("dy", self._model.dy, self.free_dy.isChecked())):
-            rms = float(np.sqrt(np.mean(values ** 2)))
+        entries = [("dx", self._model.dx, self.free_dx.isChecked(), 1.0, "px"),
+                   ("dy", self._model.dy, self.free_dy.isChecked(), 1.0, "px")]
+        for attr, check in self.free_rot.items():
+            entries.append((attr.replace("_", " "), getattr(self._model, attr),
+                            check.isChecked(), float(np.rad2deg(1.0)), "deg"))
+        for name, values, free, scale, unit in entries:
+            rms = float(np.sqrt(np.mean(values ** 2))) * scale
             if free:
-                state = f"free, fitted rms {rms:.2f} px"
+                state = f"free, fitted rms {rms:.2f} {unit}"
             elif rms == 0.0:
                 state = "fixed at zero"
             else:
-                state = f"FROZEN at rms {rms:.2f} px"
+                state = f"FROZEN at rms {rms:.2f} {unit}"
             parts.append(f"{name}: {state}")
         self.shift_state_label.setText("   ".join(parts))
 
@@ -1400,7 +1513,7 @@ class TrackModelWindow(QMainWindow):
             self._stack.angles.size, self._model.feature_ids)
         self._diagnostics = run_diagnostics(u, v, valid, self._model,
                                             self._mask, self._fit,
-                                            self._feature_weights())
+                                            **self._solve_kwargs())
         d = self._diagnostics
         chain = self._chain
         center_grid = chain.parent_to_grid(d["center_estimate_raw_px"],
@@ -1420,7 +1533,11 @@ class TrackModelWindow(QMainWindow):
             f"shift split rms: dx {d['shift_split']['dx_rms']:.3f}, "
             f"dy {d['shift_split']['dy_rms']:.3f} px "
             f"(detrended {d['shift_split']['dx_detrended_rms']:.3f} / "
-            f"{d['shift_split']['dy_detrended_rms']:.3f})")
+            f"{d['shift_split']['dy_detrended_rms']:.3f})\n"
+            f"rotation split rms: horiz "
+            f"{d['shift_split']['rot_horiz_rms_deg']:.3f}, beam "
+            f"{d['shift_split']['rot_beam_rms_deg']:.3f}, axis "
+            f"{d['shift_split']['rot_axis_rms_deg']:.3f} deg")
         self._after_evaluate()
 
     # ------------------------------------------------------------ display
@@ -1482,12 +1599,13 @@ class TrackModelWindow(QMainWindow):
             if row is not None and self._chain.view_origin is None:
                 # The trajectory overlay is the model track WITHOUT any
                 # per-view shift: the feature's path in the ideal aligned
-                # frame. The per-view dx/dy are alignment errors of
-                # individual views; including them made the curve zigzag,
-                # and anchoring with the current view's shift made the
-                # whole curve jump with that one view's noise. Drawn this
-                # way the curve is stable, and the gap between a marker
-                # and the curve IS that view's misalignment.
+                # frame. The per-view dx/dy, and the per-view rotations
+                # just the same, are alignment errors of individual views;
+                # including them made the curve zigzag, and anchoring with
+                # the current view's shift made the whole curve jump with
+                # that one view's noise. Drawn this way the curve is
+                # stable, and the gap between a marker and the curve IS
+                # that view's misalignment.
                 m = self._model
                 ct, sn = np.cos(m.theta), np.sin(m.theta)
                 s_row = m.a[row] * ct + m.b[row] * sn
@@ -1505,15 +1623,9 @@ class TrackModelWindow(QMainWindow):
         # projected into THIS view through the model
         if self._probe is not None and self._model is not None:
             a, b, y = self._probe
-            theta_v = float(self._stack.angles[view])
-            ct, sn = np.cos(theta_v), np.sin(theta_v)
-            s = a * ct + b * sn
-            t = -a * sn + b * ct
-            c_of, alpha_of, beta_of = self._model.axis_curves()
-            u_raw = s + c_of[view] + self._model.dx[view]
-            v_raw = (y + alpha_of[view] * s + beta_of[view] * t
-                     + self._model.dy[view])
-            u, v = self._chain.from_parent(u_raw, v_raw, view=view)
+            u_raw, v_raw = self._model.project(a, b, y, views=[view])
+            u, v = self._chain.from_parent(float(u_raw[0, 0]),
+                                           float(v_raw[0, 0]), view=view)
             self.viewer.show_probe((float(u), float(v)))
         else:
             self.viewer.show_probe(None)
@@ -1611,14 +1723,14 @@ class TrackModelWindow(QMainWindow):
         return self._labels.counts_per_view(self._stack.angles.size)
 
     def _render_shift_plot(self, plot, values, observed, color,
-                           name: str) -> None:
+                           name: str, unit: str = "raw px") -> None:
         """Dashed model curve, dots on labeled views, and the missing
         frames made explicit: orange dots where ONE label carries the view
         (its shift is that label, warning W4) and red base ticks where NO
         label exists (the shift is pure interpolation)."""
         deg = np.rad2deg(self._stack.angles)
         counts = self._label_counts_per_view()
-        plot.setLabel("left", f"{name} [raw px]")
+        plot.setLabel("left", f"{name} [{unit}]")
         plot.setLabel("bottom", "angle [deg]")
         plot.plot(deg, values, pen=pg.mkPen(*color, 90, width=1,
                                             style=Qt.PenStyle.DashLine))
@@ -1669,6 +1781,13 @@ class TrackModelWindow(QMainWindow):
         elif kind == "dy shifts":
             self._render_shift_plot(plot, model.dy, fit.observed_views,
                                     (0, 200, 255), "dy")
+        elif kind in ("rot horiz", "rot beam", "rot axis"):
+            attr = kind.replace(" ", "_")
+            color = {"rot horiz": (255, 120, 200), "rot beam": (120, 255, 120),
+                     "rot axis": (200, 160, 255)}[kind]
+            self._render_shift_plot(plot, np.rad2deg(getattr(model, attr)),
+                                    fit.observed_views, color, kind,
+                                    unit="deg")
         elif kind in ("residual u", "residual v"):
             res = fit.residual_u if kind == "residual u" else fit.residual_v
             plot.setLabel("left", f"{kind} [raw px]")
@@ -1893,6 +2012,9 @@ class TrackModelWindow(QMainWindow):
                         self.deg_b.value()],
             "huber": self.huber.value(),
             "iters": self.iters.value(),
+            "noise_px": self.noise_px.value(),
+            "rot_sigma_deg": {a: self.rot_sigma[a].value()
+                              for a in self.rot_sigma},
             "auto_fit": self.auto_fit.isChecked(),
             "slice_row": self.slice_row.value(),
             "pins": sorted(self._pins),
@@ -1967,6 +2089,17 @@ class TrackModelWindow(QMainWindow):
         self._model = state["model"]
         self._mask = state["mask"]
         ui = state["ui"]
+        if self._mask is not None:
+            # the saved mask is what the user had, restore it into the
+            # boxes silently (a toggle would trigger a refit of the
+            # freshly loaded model)
+            for check, value in [(self.free_dx, self._mask.dx),
+                                 (self.free_dy, self._mask.dy)] + [
+                    (self.free_rot[a], getattr(self._mask, a))
+                    for a in self.free_rot]:
+                check.blockSignals(True)
+                check.setChecked(bool(value))
+                check.blockSignals(False)
         self._pins = set(ui.get("pins", []))
         self._feature_sizes = {int(k): float(size) for k, size in
                                ui.get("feature_sizes", {}).items()}
@@ -1986,6 +2119,9 @@ class TrackModelWindow(QMainWindow):
         self.deg_b.setValue(int(degrees[2]))
         self.huber.setValue(float(ui.get("huber", 3.0)))
         self.iters.setValue(int(ui.get("iters", 4)))
+        self.noise_px.setValue(float(ui.get("noise_px", 1.0)))
+        for attr, spin in self.rot_sigma.items():
+            spin.setValue(float(ui.get("rot_sigma_deg", {}).get(attr, 1.0)))
         self.auto_fit.setChecked(bool(ui.get("auto_fit", True)))
         # live recon stays OFF on load regardless of what was saved
         self.live_recon.setChecked(False)
@@ -2057,7 +2193,9 @@ class TrackModelWindow(QMainWindow):
                 self, "Export aligned stack", "aligned.h5", "HDF5 (*.h5)")
             if not path:
                 return
-        transforms = aligned_view_transforms(self._model, self._chain)
+        transforms = aligned_view_transforms(
+            self._model, self._chain,
+            det_shape_loaded=tuple(self._stack.shape[1:]))
         metadata = aligned_metadata(self._stack.info().metadata, self._model,
                                     self._chain)
         req = AlignedExportRequest(

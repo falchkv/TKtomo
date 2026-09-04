@@ -18,8 +18,11 @@ from tktomo.tracking.labels import LabelStore
 from tktomo.tracking.model import AxisModel, FreeMask
 
 # version 2: label_table gained provenance columns (kind, quality);
-# version-1 files are still readable (LabelStore.from_table accepts both)
-SESSION_VERSION = 2
+# version-1 files are still readable (LabelStore.from_table accepts both).
+# version 3: per-view rotations (rot_horiz, rot_beam, rot_axis) and their
+# free flags; older files load with the rotations at zero and fixed.
+SESSION_VERSION = 3
+ROTATIONS = ("rot_horiz", "rot_beam", "rot_axis")
 
 
 def save_session(path: str | Path, *, labels: LabelStore,
@@ -36,13 +39,15 @@ def save_session(path: str | Path, *, labels: LabelStore,
             f.attrs["has_model"] = True
             f.attrs["free_dx"] = bool(mask.dx)
             f.attrs["free_dy"] = bool(mask.dy)
+            for name in ROTATIONS:
+                f.attrs[f"free_{name}"] = bool(getattr(mask, name))
             f.attrs["model"] = json.dumps({
                 "theta_ref": model.theta_ref,
                 "theta_scale": model.theta_scale,
             })
             f.create_dataset("theta_rad", data=model.theta)
             for name in ("c_coef", "alpha_coef", "beta_coef", "dx", "dy",
-                         "a", "b", "y"):
+                         "a", "b", "y", *ROTATIONS):
                 f.create_dataset(name, data=getattr(model, name))
             f.create_dataset("feature_id", data=model.feature_ids)
             f.create_dataset("free_c", data=mask.c)
@@ -59,9 +64,9 @@ def load_session(path: str | Path) -> dict:
 
     with h5py.File(path, "r") as f:
         version = int(f.attrs.get("session_version", -1))
-        if version not in (1, SESSION_VERSION):
+        if version not in (1, 2, SESSION_VERSION):
             raise ValueError(
-                f"session_version {version} is not 1 or {SESSION_VERSION}")
+                f"session_version {version} is not 1, 2 or {SESSION_VERSION}")
         out = {
             "labels": LabelStore.from_table(f["label_table"][()]),
             "source": json.loads(f.attrs["source"]),
@@ -71,8 +76,9 @@ def load_session(path: str | Path) -> dict:
         }
         if f.attrs.get("has_model"):
             info = json.loads(f.attrs["model"])
+            theta = f["theta_rad"][()]
             out["model"] = AxisModel(
-                theta=f["theta_rad"][()],
+                theta=theta,
                 c_coef=f["c_coef"][()], alpha_coef=f["alpha_coef"][()],
                 beta_coef=f["beta_coef"][()],
                 dx=f["dx"][()], dy=f["dy"][()],
@@ -80,6 +86,8 @@ def load_session(path: str | Path) -> dict:
                 a=f["a"][()], b=f["b"][()], y=f["y"][()],
                 theta_ref=float(info["theta_ref"]),
                 theta_scale=float(info["theta_scale"]),
+                **{name: (f[name][()] if name in f else np.zeros(theta.size))
+                   for name in ROTATIONS},
             )
             out["mask"] = FreeMask(
                 dx=bool(f.attrs["free_dx"]), dy=bool(f.attrs["free_dy"]),
@@ -87,5 +95,7 @@ def load_session(path: str | Path) -> dict:
                 alpha=f["free_alpha"][()].astype(bool),
                 beta=f["free_beta"][()].astype(bool),
                 features=f["free_features"][()].astype(bool),
+                **{name: bool(f.attrs.get(f"free_{name}", False))
+                   for name in ROTATIONS},
             )
     return out

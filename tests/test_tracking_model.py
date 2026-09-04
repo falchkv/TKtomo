@@ -31,7 +31,7 @@ from tktomo.tracking.model import (
 
 
 def make_truth(n_feat=12, n_view=60, degrees=(1, 1, 0), seed=1,
-               span_deg=180.0):
+               span_deg=180.0, rot_rms_deg=0.0):
     rng = np.random.default_rng(seed)
     theta = np.linspace(0.0, np.deg2rad(span_deg), n_view)
     model = AxisModel.blank(theta, np.arange(n_feat), degrees)
@@ -47,6 +47,12 @@ def make_truth(n_feat=12, n_view=60, degrees=(1, 1, 0), seed=1,
     tt = np.linspace(0, 6 * np.pi, n_view)
     model.dx = 1.5 * np.sin(tt) + 0.5 * rng.standard_normal(n_view)
     model.dy = 1.0 * np.cos(1.7 * tt) + 0.4 * rng.standard_normal(n_view)
+    if rot_rms_deg:
+        # zero-mean per-view rotations: the prior's minimum-norm gauge
+        # choice then coincides with the truth
+        for name in ("rot_horiz", "rot_beam", "rot_axis"):
+            r = np.deg2rad(rot_rms_deg) * rng.standard_normal(n_view)
+            setattr(model, name, r - r.mean())
     canonical(model)
     return model
 
@@ -67,7 +73,8 @@ def canonical(model):
     return model
 
 
-def sample_labels(model, frac=0.6, noise=0.05, seed=2, min_obs=8):
+def sample_labels(model, frac=0.6, noise=0.05, seed=2, min_obs=8,
+                  min_per_view=0):
     rng = np.random.default_rng(seed)
     u, v = model.predict()
     n_feat, n_view = u.shape
@@ -75,6 +82,9 @@ def sample_labels(model, frac=0.6, noise=0.05, seed=2, min_obs=8):
     for f in range(n_feat):
         while valid[f].sum() < min_obs:
             valid[f, rng.integers(n_view)] = True
+    for j in range(n_view):
+        while valid[:, j].sum() < min_per_view:
+            valid[rng.integers(n_feat), j] = True
     u = u + noise * rng.standard_normal(u.shape)
     v = v + noise * rng.standard_normal(v.shape)
     return u, v, valid
@@ -398,3 +408,166 @@ def test_shift_scaling():
     chain = CoordinateChain(binning=4, crop=(0, 0, 100, 0))
     assert chain.shift_to_parent(2.5) == pytest.approx(10.0)
     assert chain.shift_from_parent(10.0) == pytest.approx(2.5)
+
+
+# ---------------------------------------------------------------------------
+# per-view rotations
+# ---------------------------------------------------------------------------
+
+def _rot_mask(model, **flags):
+    mask = FreeMask.all_free(model)
+    for name, value in flags.items():
+        setattr(mask, name, value)
+    return mask
+
+
+def test_rotation_matrices_identity_and_small_angle():
+    from tktomo.tracking.model import rotation_matrices
+
+    r = rotation_matrices(np.zeros((3, 3)))
+    assert np.array_equal(r, np.tile(np.eye(3), (3, 1, 1)))
+    w = np.array([[1e-3, -2e-3, 0.5e-3]])
+    r = rotation_matrices(w)[0]
+    skew = np.array([[0, -w[0, 2], w[0, 1]], [w[0, 2], 0, -w[0, 0]],
+                     [-w[0, 1], w[0, 0], 0]])
+    assert np.allclose(r, np.eye(3) + skew, atol=3e-6)
+    assert np.allclose(r @ r.T, np.eye(3), atol=1e-12)
+    big = rotation_matrices(np.array([[0.0, 0.0, np.pi / 2]]))[0]
+    assert np.allclose(big @ np.array([1.0, 0, 0]), [0, 1.0, 0])
+
+
+def test_project_is_the_plain_formula_without_rotations():
+    truth = make_truth()
+    ct, sn = np.cos(truth.theta), np.sin(truth.theta)
+    s = truth.a[:, None] * ct + truth.b[:, None] * sn
+    t = -truth.a[:, None] * sn + truth.b[:, None] * ct
+    c_of, alpha_of, beta_of = truth.axis_curves()
+    u_old = s + c_of[None, :] + truth.dx[None, :]
+    v_old = truth.y[:, None] + alpha_of[None, :] * s + beta_of[None, :] * t \
+        + truth.dy[None, :]
+    u, v = truth.predict()
+    assert np.array_equal(u, u_old) and np.array_equal(v, v_old)
+    # a view subset gives the same numbers
+    u_sub, v_sub = truth.project(truth.a, truth.b, truth.y, views=[3, 17])
+    assert np.array_equal(u_sub, u[:, [3, 17]])
+    assert np.array_equal(v_sub, v[:, [3, 17]])
+
+
+def test_rot_axis_is_an_added_projection_angle():
+    truth = make_truth(degrees=(0, 0, 0))
+    truth.alpha_coef[:] = 0.0
+    truth.beta_coef[:] = 0.0
+    truth.rot_axis = np.deg2rad(3.0) * np.sin(np.linspace(0, 4, truth.theta.size))
+    u, v = truth.predict()
+    th = truth.theta + truth.rot_axis
+    s = truth.a[:, None] * np.cos(th) + truth.b[:, None] * np.sin(th)
+    assert np.allclose(u, s + truth.c_coef[0] + truth.dx[None, :], atol=1e-10)
+    assert np.allclose(v, truth.y[:, None] + truth.dy[None, :], atol=1e-10)
+    # and the first-order forms of the other two
+    truth.rot_axis[:] = 0.0
+    truth.rot_beam = np.full(truth.theta.size, 1e-4)
+    truth.rot_horiz = np.full(truth.theta.size, -2e-4)
+    u2, v2 = truth.predict()
+    s0, t0 = truth.st()
+    du = -1e-4 * truth.y[:, None]
+    dv = 2e-4 * t0 + 1e-4 * s0
+    assert np.allclose(u2 - (s0 + truth.c_coef[0] + truth.dx), du, atol=1e-5)
+    assert np.allclose(v2 - (truth.y[:, None] + truth.dy), dv, atol=1e-5)
+
+
+def test_rotations_recovered_with_priors():
+    truth = make_truth(rot_rms_deg=0.5, n_feat=14)
+    u, v, valid = sample_labels(truth, noise=0.05, min_per_view=4)
+    model = AxisModel.blank(truth.theta, truth.feature_ids, truth.degrees)
+    mask = _rot_mask(model, rot_horiz=True, rot_beam=True, rot_axis=True)
+    fit = solve_model(u, v, valid, model, mask,
+                      rot_sigma=(np.deg2rad(1.0),) * 3, noise_px=0.05)
+    m = fit.model
+    obs = fit.observed_views
+    for name in ("rot_horiz", "rot_beam", "rot_axis"):
+        err = np.rad2deg(getattr(m, name)[obs] - getattr(truth, name)[obs])
+        assert float(np.sqrt(np.mean(err ** 2))) < 0.1, name
+    assert fit.rms_u < 0.15 and fit.rms_v < 0.15
+    assert np.allclose(m.c_coef, truth.c_coef, atol=0.5)
+    assert np.allclose(m.a, truth.a, atol=0.5)
+    assert np.allclose(m.b, truth.b, atol=0.5)
+    assert np.allclose(m.y, truth.y, atol=0.5)
+    assert not any(w.startswith("W7") for w in fit.warnings)
+
+
+def test_rotations_fixed_reproduce_the_plain_fit():
+    truth = make_truth()
+    u, v, valid = sample_labels(truth)
+    model = AxisModel.blank(truth.theta, truth.feature_ids, truth.degrees)
+    plain = solve_model(u, v, valid, model)
+    three = solve_model(u, v, valid, model, passes=3)
+    assert np.allclose(plain.model.c_coef, three.model.c_coef, atol=1e-8)
+    assert np.allclose(plain.model.dx, three.model.dx, atol=1e-8)
+    assert np.allclose(plain.model.dy, three.model.dy, atol=1e-8)
+    assert np.allclose(plain.model.y, three.model.y, atol=1e-8)
+    assert not plain.model.has_rotations
+
+
+def test_rotation_prior_strength():
+    truth = make_truth(rot_rms_deg=0.5, n_feat=14)
+    u, v, valid = sample_labels(truth, noise=0.05, min_per_view=4)
+    model = AxisModel.blank(truth.theta, truth.feature_ids, truth.degrees)
+    mask = _rot_mask(model, rot_horiz=True, rot_beam=True, rot_axis=True)
+    tight = solve_model(u, v, valid, model, mask,
+                        rot_sigma=(np.deg2rad(1e-5),) * 3)
+    assert float(np.abs(tight.model.rotations).max()) < 1e-6
+    frozen = solve_model(u, v, valid, model, FreeMask.all_free(model))
+    assert np.allclose(tight.model.c_coef, frozen.model.c_coef, atol=1e-3)
+    # from 1 to 10 deg the data rule and the prior only settles the gauge:
+    # same angles, same predictions. (Measured: beyond about 10 deg the
+    # per-view angles drift into near-degenerate directions with the
+    # feature heights and the tilts, which is why the window caps sigma.)
+    fits = [solve_model(u, v, valid, model, mask,
+                        rot_sigma=(np.deg2rad(sig),) * 3, noise_px=0.05)
+            for sig in (1.0, 10.0)]
+    i, j = np.nonzero(valid)
+    ua, va = fits[0].model.predict()
+    ub, vb = fits[1].model.predict()
+    assert np.allclose(ua[i, j], ub[i, j], atol=0.05)
+    assert np.allclose(va[i, j], vb[i, j], atol=0.05)
+    for name in ("rot_horiz", "rot_beam", "rot_axis"):
+        d = np.rad2deg(getattr(fits[0].model, name)
+                       - getattr(fits[1].model, name))
+        assert float(np.abs(d).max()) < 0.1
+    with pytest.raises(ValueError, match="rot_sigma"):
+        solve_model(u, v, valid, model, mask, rot_sigma=(0.0, 1.0, 1.0))
+
+
+def test_w7_warns_when_views_are_thin():
+    truth = make_truth(n_feat=6)
+    u, v, valid = sample_labels(truth, frac=0.25, min_obs=4)
+    model = AxisModel.blank(truth.theta, truth.feature_ids, truth.degrees)
+    fit = solve_model(u, v, valid, model, _rot_mask(model, rot_axis=True))
+    assert any(w.startswith("W7") for w in fit.warnings)
+    fit = solve_model(u, v, valid, model, FreeMask.all_free(model))
+    assert not any(w.startswith("W7") for w in fit.warnings)
+
+
+def test_prior_rows_do_not_enter_the_huber_scale():
+    from tktomo.tracking.model import _masked_irls
+
+    rng = np.random.default_rng(0)
+    n = 40
+    x_true = np.array([2.0, 0.5])
+    a = rng.standard_normal((n, 2))
+    target = a @ x_true + 0.01 * rng.standard_normal(n)
+    rows = np.repeat(np.arange(n), 2)
+    cols = np.tile([0, 1], n)
+    vals = a.ravel()
+    # one prior row on column 1 with a huge residual: it must not distort
+    # the data weights, and the data residual must not include it
+    rows_p = np.concatenate([rows, [n]])
+    cols_p = np.concatenate([cols, [1]])
+    vals_p = np.concatenate([vals, [50.0]])
+    target_p = np.concatenate([target, [50.0 * 3.0]])   # prior mean 3.0
+    x, r, w = _masked_irls(rows_p, cols_p, vals_p, target_p, 2,
+                           np.zeros(2), np.ones(2, bool), iters=4,
+                           huber=3.0, damp=0.0, n_data=n)
+    assert r.size == n and w.size == n
+    assert float(np.median(w)) == 1.0
+    assert 0.5 < x[1] < 3.0                # pulled toward the prior mean

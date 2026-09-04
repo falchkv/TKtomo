@@ -42,6 +42,11 @@ class SliceRequest:
     rot_deg: np.ndarray     # (n,) per-view derotation, degrees
     center: float           # rotation axis, loaded px
     extra_bin: int = 1
+    #: (n,) per-view increment of the projection angle, rad (the model's
+    #: rot_axis), added to the stack's angles before gridrec. Appended
+    #: with a default so an older window still talks to a newer server;
+    #: the reverse needs the server to be at least as new as the window.
+    dtheta: np.ndarray | None = None
 
     @property
     def row_in_slab(self) -> int:
@@ -53,30 +58,50 @@ def plan_slice(model: AxisModel, chain: CoordinateChain, n_rows: int,
     """Turn the fitted model into the per-view corrections for one row.
 
     Full per-view 2D correction, same semantics as the aligned-stack
-    export: shift AND derotation by the in-plane tilt alpha(theta), so the
-    slice responds to the tilt parameters. (The rotation is about the slab
-    center; versus the full-image center that is one constant vertical
-    offset, identical for every view.) beta needs 3D geometry and stays
-    out, as everywhere in 2D.
+    export: shift AND derotation by the in-plane tilt alpha(theta) plus the
+    per-view rotation about the beam, so the slice responds to the tilt
+    parameters. (The rotation is about the slab center; versus the axis
+    column that is one constant offset for alpha, and the per-view part
+    for rot_beam is compensated, as in the aligned export.) The per-view
+    rotation about the axis goes to gridrec as an angle increment
+    (`dtheta`). beta and rot_horiz need 3D geometry and stay out, as
+    everywhere in 2D.
     """
+    from tktomo.tracking.export import rotation_centre_shift  # noqa: PLC0415
+
     c_of, alpha_of, _ = model.axis_curves()
     c_ref = model.center_at_mean_theta()
+    alpha0 = float(model.alpha_coef[0])
+    phi = alpha_of + model.rot_beam
     sx = -chain.shift_from_parent(model.dx + (c_of - c_ref))
     sy = -chain.shift_from_parent(model.dy)
-    rot_deg = -np.rad2deg(alpha_of)
+    rot_deg = -np.rad2deg(phi)
     # the slab must be tall enough that shifting AND derotating still
     # leaves the middle row valid: rotation moves rows by up to
-    # |alpha| * width/2 at the image edges
-    margin = 4 + int(np.ceil(np.abs(alpha_of).max() * width / 2.0
+    # |phi| * width/2 at the image edges
+    margin = 4 + int(np.ceil(np.abs(phi).max() * width / 2.0
                              + np.abs(sy).max()))
     row = int(np.clip(row, 0, n_rows - 1))
     lo = max(0, row - margin)
     hi = min(n_rows, row + margin + 1)
+    if np.any(model.rot_beam != 0.0):
+        centre = ((width - 1) / 2.0, (lo + hi - 1) / 2.0)
+        for j in range(model.theta.size):
+            eu, ev = rotation_centre_shift(alpha0, float(model.rot_beam[j]),
+                                           float(c_of[j]), chain,
+                                           (hi - lo, width), centre)
+            sx[j] += chain.shift_from_parent(eu)
+            sy[j] += chain.shift_from_parent(ev)
+        extra = int(np.ceil(np.abs(sy).max())) + 1
+        lo = max(0, row - margin - extra)
+        hi = min(n_rows, row + margin + extra + 1)
     center = float(chain.from_parent(c_ref, 0.0)[0])
+    dtheta = (model.rot_axis.copy() if np.any(model.rot_axis != 0.0)
+              else None)
     return SliceRequest(row=row, lo=lo, hi=hi,
                         sy=np.asarray(sy, float), sx=np.asarray(sx, float),
                         rot_deg=np.asarray(rot_deg, float), center=center,
-                        extra_bin=int(extra_bin))
+                        extra_bin=int(extra_bin), dtheta=dtheta)
 
 
 def reconstruct_slice(slab: np.ndarray, theta: np.ndarray,
@@ -96,6 +121,8 @@ def reconstruct_slice(slab: np.ndarray, theta: np.ndarray,
 
     slab = np.array(slab, np.float32)
     theta = np.asarray(theta, float)
+    if req.dtheta is not None:
+        theta = theta + np.asarray(req.dtheta, float)
     sy, sx = np.asarray(req.sy, float), np.asarray(req.sx, float)
     rot_deg = np.asarray(req.rot_deg, float)
     center = float(req.center)
