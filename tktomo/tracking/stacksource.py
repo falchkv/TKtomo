@@ -531,7 +531,8 @@ class LocalStackSource:
             if progress is not None:
                 progress(1.0, "done")
         self._epoch += 1
-        self._hp_cache.clear()
+        # the high-pass cache is keyed on the base stack and the track
+        # grid, not on the served grid, so it survives a display rebin
         self._data = data
         self._rebin = rebin
         self._info = StackInfo(**{**self._info.__dict__,
@@ -586,14 +587,67 @@ class LocalStackSource:
 
     def autotrack(self, jobs, *, hp_sigma: float, progress=None,
                   cancelled=None) -> list:
+        """Complete the jobs on the base stack, each on its `track_bin`.
+
+        The high-passed copy of the track grid is what costs memory (the
+        pooled frames are never materialised): n * ny/b * nx/b float32.
+        When that does not fit in 60 percent of what is free, the bin is
+        stepped up and every result says so, with the numbers.
+        """
+        from dataclasses import replace  # noqa: PLC0415
+
+        from tktomo.ptycho_align.core.telemetry import (  # noqa: PLC0415
+            available_ram_bytes,
+        )
         from tktomo.tracking.autotrack import run_autotrack  # noqa: PLC0415
 
         self._require()
-        return run_autotrack(self._data.data, self._data.angles, list(jobs),
-                             hp_sigma=hp_sigma,
-                             matcher=self._learned_matcher(),
-                             cache=self._hp_cache, progress=progress,
-                             cancelled=cancelled)
+        base = self._base.data
+        n, ny, nx = base.shape
+        free = available_ram_bytes()
+        notes = []
+        jobs = list(jobs)
+        for i, job in enumerate(jobs):
+            b = int(job.track_bin) or self._rebin
+            need = _highpass_bytes(base.shape, b)
+            if free is not None and need > 0.6 * free:
+                chosen = b
+                while chosen < 8 and _highpass_bytes(base.shape, chosen) \
+                        > 0.6 * free:
+                    chosen *= 2
+                note = (f"feature {job.fid} tracked at bin {chosen} instead "
+                        f"of bin {b}: the high-passed copy at bin {b} needs "
+                        f"{need / 1e9:.1f} GB and {free / 1e9:.1f} GB are "
+                        f"free. Close other stacks, or run the stack server "
+                        f"on a node with more memory, to track at bin {b}.")
+                logger.warning(note)
+                notes.append((i, note))
+                jobs[i] = replace(job, track_bin=chosen)
+        logger.info("autotrack: %d job(s) on %dx%dx%d, served bin %d, "
+                    "track bins %s, hp sigma %.1f", len(jobs), n, ny, nx,
+                    self._rebin,
+                    sorted({int(j.track_bin) or self._rebin for j in jobs}),
+                    hp_sigma)
+        out = run_autotrack(base, self._base.angles, jobs,
+                            served_bin=self._rebin, hp_sigma=hp_sigma,
+                            matcher=self._learned_matcher(),
+                            cache=self._hp_cache, progress=progress,
+                            cancelled=cancelled)
+        for i, note in notes:
+            if i < len(out) and out[i] is not None:
+                out[i][1].warnings.insert(0, note)
+        for fid, res in out:
+            st = res.stats
+            logger.info("autotrack feature %s: %d labels of %d views at bin "
+                        "%s (patch %s px, radius %.1f px), %d none, %d low p, "
+                        "%d fb, %d stopped, %d seed(s) refused", fid,
+                        st.get("n_accepted", 0), st.get("n_unlabelled", 0),
+                        st.get("track_bin"), st.get("patch_track_px"),
+                        st.get("search_radius_track_px", float("nan")),
+                        st.get("n_none", 0), st.get("n_low_p", 0),
+                        st.get("n_fb_miss", 0) + st.get("n_fb_corr", 0),
+                        st.get("n_stopped", 0), st.get("n_seeds_refused", 0))
+        return out
 
     def export_aligned(self, req: AlignedExportRequest, out_path: str, *,
                        progress=None, cancelled=None) -> str:
@@ -622,3 +676,10 @@ class LocalStackSource:
         self._rebin = 1
         self._info = None
         self._hp_cache.clear()
+
+
+def _highpass_bytes(shape, track_bin: int) -> int:
+    """Memory of the high-passed float32 copy of a stack on the track grid."""
+    n, ny, nx = (int(x) for x in shape[:3])
+    b = int(track_bin)
+    return n * (ny // b) * (nx // b) * 4

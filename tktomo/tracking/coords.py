@@ -155,3 +155,17 @@ class CoordinateChain:
             "has_view_origin": self.view_origin is not None,
             "rebin": int(self.rebin),
         }
+
+
+def regrid_uv(u, v, src_bin: int, dst_bin: int):
+    """(u, v) on a grid mean-pooled by `src_bin` expressed on the grid
+    mean-pooled by `dst_bin`, both pools of the same parent frame.
+
+    Goes through `CoordinateChain` so the pixel-centre rule has one home:
+    pixel 0 of a bin 4 grid is centred on pixel 1.5 of the parent.
+    """
+    src, dst = int(src_bin), int(dst_bin)
+    if src == dst:
+        return np.asarray(u, float), np.asarray(v, float)
+    parent = CoordinateChain(rebin=src).to_parent(u, v)
+    return CoordinateChain(rebin=dst).from_parent(*parent)

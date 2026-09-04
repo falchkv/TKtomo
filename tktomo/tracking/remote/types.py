@@ -7,6 +7,12 @@ it here; the codec refuses to guess.
 `FramePacket` is the exception to "plain dataclass of numbers and arrays": it
 carries a frame already packed down to display precision, because the link
 this exists for is slow. See its docstring.
+
+Fields added to a wire dataclass get a default and go at the end. The codec
+rebuilds a payload with `cls(**fields)`, so an old sender is understood by a
+new receiver, while a new sender to an old server fails loudly on the unknown
+field. Both ends ship from the same checkout (`tktomo-track-maxwell` syncs the
+source it installs on the node), which is why that is acceptable.
 """
 
 from __future__ import annotations

@@ -37,9 +37,14 @@ from pathlib import Path
 
 import numpy as np
 
-from tktomo.tracking.autotrack import coherence, match_patch, structure_tensor
+from tktomo.tracking.autotrack import (
+    TRACK_PATCH,
+    coherence,
+    match_patch,
+    structure_tensor,
+)
 
-P = 40            # patch_size(10): the classifier was trained at this size
+P = TRACK_PATCH   # the classifier was trained at this size, on the track grid
 K = 5             # anchors per target
 TAU = 10.0        # views: angular weighting scale of the fused NCC map
 DEFAULT_MODEL = Path(__file__).with_name("data") / "confidence_gboost.joblib"

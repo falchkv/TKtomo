@@ -40,11 +40,12 @@ feature-crop stacks from `tktomo-feature-isolation`.
 The **bin** box next to the view slider mean-pools the projections by 1,
 2, 4 or 8 at any time, without reloading. It applies where the pixels are
 (on the server for a remote stack, so a frame shrinks by the factor
-squared before it crosses the link) and to everything downstream: the
-view, auto-complete, the recon slice and the aligned export all see the
-binned grid. Labels stay in raw pixels, so switching back and forth loses
-nothing; marker sizes and the recon row follow the grid. The factor is
-saved with the session and restored on load.
+squared before it crosses the link) and to the view, the recon slice and
+the aligned export, which all see the binned grid. Auto-complete does
+not: it tracks on a grid of its own, chosen from the feature's size (see
+"Tracking grid" below). Labels stay in raw pixels, so switching back and
+forth loses nothing. Marker sizes and the recon row follow the grid. The
+factor is saved with the session and restored on load.
 
 The active feature's predicted cross is drawn larger and in its feature
 color (others stay white). A toggle shows the active feature's labels
@@ -90,10 +91,43 @@ the earlier slogger pipeline:
 - Seeds on edge-like structure are refused up front (structure-tensor
   coherence > 0.4): a patch on a filament can slide along it with a
   confident correlation, and its position along the edge would be
-  fiction.
-- The forward-backward check tracks every accepted match back to its
-  seed and drops it if the round trip misses or correlates poorly.
-  Cheap, and it only ever removes labels.
+  fiction. Measured on a particle riding on its sample's edge
+  (lens1_v11_upper): with the gate off, those seeds produced labels 11 to
+  16 raw px wrong that the confidence still passed. A refused seed marks
+  a stretch of views that stays manual, and the report says which.
+- The forward-backward check (off by default) tracks every accepted
+  match back to its seed and drops it if the round trip lands more than
+  1 track px off the seed or the backward correlation falls below 0.10,
+  a correlation threshold separate from "min p". Measured on the lens1
+  particle it halved the coverage (50 against 79 percent of the views)
+  for 5 points of precision, whatever the correlation threshold: a
+  template cut far from its seed does not land back on it. The residual
+  rejection after the fit catches the same lock-ons. Turn it on when a
+  lookalike sits next to the feature.
+
+**Tracking grid.** The tracker works in pixels, so what a 40 px template
+sees depends on the grid. On a display grid binned by 4 it would cover
+160 raw px around a 12 px particle, which is all sample edges, and the
+coherence gate would refuse every seed (that is exactly what happened
+before this grid existed: 0 to 20 percent coverage against 79 percent on
+the file's grid). Auto-complete therefore picks its own grid from the
+feature's marker size, independent of the bin box: the coarsest
+mean-pool of the file's grid on which the template still covers four
+times the marker (a 12 px feature tracks at bin 1, a 25 px one at bin 2).
+The label under the parameters says what the next run will do for the
+active feature, and the "track bin" box overrides the choice. Set the
+marker size to the feature's real size in the table first, since the
+default 10 px is a guess. On the lens1 particle bin 2 was three times
+faster than bin 1 at 2.2 against 1.4 raw px median error, same
+precision, slightly less coverage. The first run on a grid high-passes
+the whole stack there (about three minutes for 907 views of 557x1816 at
+bin 1 on 8 cores, a quarter of that at bin 2), later runs reuse it. If
+the high-passed copy does not fit in memory the host steps the bin up
+and says so in the report.
+
+The search radius is entered in raw px so it means the same at every
+binning, and its maximum is what the template can see: 18 track px,
+which the box converts.
 
 Auto labels are drawn as HOLLOW circles (same color and size), carry
 their match quality, and enter the fit at full weight: the Huber loop
@@ -108,10 +142,20 @@ SAME views, so multi-label views become the norm and the
 staggered-labeling trap (warning W6, free shifts absorbing single-label
 views) largely disappears.
 
-Defaults, all measured: min p 0.20, search radius 8 px (+0.25 px per
-view from the seed), patch size 4x the feature's marker size (clipped
-16 to 96), high-pass sigma 12, coherence gate 0.4, three consecutive
-failures end a direction.
+Defaults, all measured: min p 0.20, search radius 8 raw px (+0.25
+track px per view from the seed, capped at 18 track px), patch 40 px on
+the tracking grid, high-pass sigma 12 track px, forward-backward off
+(when on: correlation 0.10 and round trip 1 px), coherence gate 0.4,
+three consecutive failures end a direction. With those, seeds every ~50
+views on the lens1 particle gave 79 percent coverage at 95 percent within
+4 raw px, and seeds every ~200 views 74 percent at 97 percent.
+
+**The report.** After a run the box under the status line keeps one
+block per feature until the next run (the fit never overwrites it): the
+grid tracked on, which seeds were used and which refused and why, how
+many views each gate dropped ("no match", "below min p", "fwd-back
+miss", "behind a stopped march"), and the largest unlabelled gap with
+the remedy, usually a manual label in the middle of it.
 
 **How a match is scored.** Completion uses a learned matcher (the earlier
 single-anchor phase-correlation completer has been removed). For each

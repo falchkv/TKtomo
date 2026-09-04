@@ -33,7 +33,11 @@ elsewhere shows up as a CRATERED backward correlation (different
 context), not as a confidently displaced landing; on smooth low-texture
 content whose phase-correlation mixtures are forgiving, the check adds
 little beyond the forward threshold. It is cheap (one extra match per
-accepted label) and one-sided: it only ever removes labels.
+accepted label) and one-sided: it only ever removes labels. Measured on a
+second sample (lens1_v11_upper, 2026-09-04) it removed half the good
+ones too, because a template cut far from its seed does not round-trip
+to within a pixel of it, so it is off by default and the residual
+rejection after the fit does its job.
 
 Everything is Qt-free and operates in LOADED-frame pixels; the caller
 converts through `CoordinateChain`.
@@ -182,13 +186,44 @@ def coherence(lam1, lam2):
     return 0.0 if s <= 0 else (lam1 - lam2) / s
 
 
+#: The template size the learned matcher was trained at, in TRACK px. The
+#: tracking grid is chosen so that this many pixels cover about four times
+#: the feature (`choose_track_bin`); the patch itself never changes.
+TRACK_PATCH = 40
+
+
 def patch_size(feature_size: float) -> int:
     """Template size from the feature's marker size: clip(4*size, 16, 96).
 
     The default marker size 10 gives P = 40, close to the 48 the slogger
-    tracker settled on for the same data at the same binning.
+    tracker settled on for the same data at the same binning. The learned
+    matcher ignores this and uses `TRACK_PATCH`; the grid is what adapts.
     """
     return int(np.clip(int(4 * float(feature_size)), 16, 96))
+
+
+def choose_track_bin(feature_size_file_px: float, *, max_bin: int = 8) -> int:
+    """The grid to track on, from the feature's size on the file's grid.
+
+    The largest bin b (1..max_bin) at which a `TRACK_PATCH` template still
+    covers at least four times the feature, i.e. the coarsest grid on which
+    the feature is at least a quarter of the patch. A 12 px particle tracks
+    at bin 1, a 25 px one at bin 2, a 45 px one at bin 4. Measured on a
+    12 raw px particle (lens1_v11_upper, 2026-09-04): at the display bin 4
+    the app used to track on, the 40 px patch spanned 160 raw px of sample
+    edges and the coherence gate refused 17 of 18 seeds; at bin 1 the same
+    tracker covered 79 percent of the views at 95 percent within 4 px.
+    """
+    size = float(feature_size_file_px)
+    if not np.isfinite(size) or size <= 0:
+        return 1
+    return int(max(1, min(int(max_bin), int(4 * size // TRACK_PATCH))))
+
+
+def max_search_radius(patch: int) -> float:
+    """The widest search box a `patch` px template can see: half the patch
+    minus a margin. Beyond it the phase correlation wraps."""
+    return float(int(patch) // 2 - 2)
 
 
 # ---------------------------------------------------------------------------
@@ -197,14 +232,33 @@ def patch_size(feature_size: float) -> int:
 
 @dataclass(frozen=True)
 class AutoTrackParams:
-    """All measured defaults; see the module docstring for provenance."""
+    """All measured defaults; see the module docstring for provenance.
+
+    Every length is in px of the grid `complete_track` runs on (the TRACK
+    grid, see `run_autotrack`). `min_corr` thresholds whatever the matcher
+    returns as quality (a probability for the learned matcher, a
+    correlation coefficient for a plain phase-correlation one), while
+    `fb_min_corr` thresholds the backward match's correlation coefficient,
+    which is always a plain correlation. They used to be one number.
+
+    `fb_check` defaults to off. Measured on lens1_v11_upper (feature 0, 18
+    seeds every ~50 views, 2026-09-04): on, the round trip ended enough
+    marches to halve the coverage, 50 against 79 percent of the views,
+    for 100 against 95 percent of the labels within 4 raw px, and the
+    result did not change between a backward correlation threshold of
+    0.0 and 0.2, so it is the round-trip distance that fails: a template
+    cut many views from its seed does not land back on it within
+    `fb_tol`. The residual rejection after the fit catches the lock-ons
+    the round trip was meant to catch, without the cost.
+    """
 
     patch: int = 40
-    search_radius: float = 8.0          # loaded px around the prediction
+    search_radius: float = 8.0          # track px around the prediction
     radius_growth: float = 0.25         # px per view of distance to the seed
     min_corr: float = 0.30
-    fb_check: bool = True
-    fb_tol: float = 1.0                 # loaded px round-trip miss
+    fb_check: bool = False
+    fb_min_corr: float = 0.10           # backward correlation coefficient
+    fb_tol: float = 1.0                 # track px round-trip miss
     hp_sigma: float = 12.0
     upsample: int = 20
     iters: int = 3
@@ -223,10 +277,23 @@ class AutoLabel:
 
 @dataclass
 class TrackResult:
+    """What one feature's completion produced, and where every view went.
+
+    `outcomes` maps each view that was not labelled to a short code:
+    ``none`` (no anchor matched inside the search box), ``low_p`` (matched
+    but below `min_corr`), ``fb_corr`` / ``fb_miss`` (the backward match
+    correlated below `fb_min_corr` / landed off the seed), ``stopped``
+    (behind a march that ended, never attempted). `stats` carries the
+    counts and the grid the run used, so a report can say which gate ate
+    the views rather than "some".
+    """
+
     labels: list = field(default_factory=list)          # [AutoLabel]
     seed_report: list = field(default_factory=list)     # per-seed dicts
     warnings: list = field(default_factory=list)
     cancelled: bool = False
+    stats: dict = field(default_factory=dict)
+    outcomes: dict = field(default_factory=dict)        # view -> code
 
 
 def complete_track(frames_hp, theta, seeds, params: AutoTrackParams, *,
@@ -268,32 +335,45 @@ def complete_track(frames_hp, theta, seeds, params: AutoTrackParams, *,
         return result
 
     # -- coherence gate on every seed's template --------------------------
+    # Kept fatal on purpose. Measured on lens1_v11_upper (2026-09-04): with
+    # the gate off, the seeds it would have refused (a particle riding on
+    # the sample's edge, coherence 0.91) produced labels 11 to 16 raw px
+    # off that the learned confidence still passed. A refused seed is a
+    # region the user labels by hand, and the report says so.
     usable = []
     for view, u, v in sorted(seeds):
         patch, _, _ = _patch(frames_hp[view], v, u, params.patch)
         if patch is None:
+            reason = "refused: template outside frame"
             result.warnings.append(
-                f"seed at view {view} refused: template does not fit "
-                f"inside the frame")
+                f"seed at view {view} refused: a {params.patch} px "
+                f"template around it does not fit inside the frame. "
+                f"Views near the border stay manual.")
             result.seed_report.append({"view": view, "used": False,
-                                       "coherence": float("nan")})
+                                       "coherence": float("nan"),
+                                       "reason": reason})
             continue
         lam1, lam2, _, _ = structure_tensor(patch)
         coh = coherence(lam1, lam2)
         used = coh <= params.max_coherence
-        result.seed_report.append({"view": view, "used": used,
-                                   "coherence": float(coh)})
+        result.seed_report.append({
+            "view": view, "used": used, "coherence": float(coh),
+            "reason": "" if used else f"refused: coherence {coh:.2f}"})
         if used:
             usable.append((int(view), float(u), float(v)))
         else:
             result.warnings.append(
                 f"seed at view {view} refused: coherence {coh:.2f} > "
-                f"{params.max_coherence:.2f} (edge-like, position along "
-                f"the structure would be fiction)")
+                f"{params.max_coherence:.2f}, the template sits on an edge "
+                f"and its position along it would be fiction. Views near "
+                f"it stay manual: label them by hand, the tracker cannot "
+                f"follow a feature that sits on an edge.")
     if not usable:
         result.warnings.append(
             "feature not trackable: every seed template failed the "
-            "coherence gate")
+            "coherence gate. Label it by hand, or pick a feature that is "
+            "a blob rather than a piece of an edge.")
+        _finish_stats(result, n_views, [s[0] for s in seeds], params)
         return result
 
     # -- bounded prediction from the manual seeds only --------------------
@@ -346,28 +426,39 @@ def complete_track(frames_hp, theta, seeds, params: AutoTrackParams, *,
                 else:
                     pred = last_accepted        # bounded hold beyond span
                 hit = matcher(frames_hp, usable, j, pred, max_step)
-                ok = hit is not None and hit[2] >= params.min_corr
-                if ok and params.fb_check:
+                if hit is None:
+                    code = "none"
+                elif hit[2] < params.min_corr:
+                    code = "low_p"
+                elif params.fb_check:
                     # the round trip must land on the seed AND look like
                     # the seed: a slip onto a persistent lookalike tracks
-                    # back to the lookalike's own position instead
+                    # back to the lookalike's own position instead. The
+                    # correlation threshold is fb_min_corr, a correlation
+                    # coefficient, never min_corr (see AutoTrackParams).
                     back = match_patch(
                         frames_hp[j], frames_hp[seed_view],
                         (hit[0], hit[1]), (sv, su), params.patch, max_step,
                         upsample=params.upsample, iters=params.iters,
                         tol=params.tol)
-                    ok = (back is not None
-                          and back[2] >= params.min_corr
-                          and np.hypot(back[0] - sv, back[1] - su)
-                          <= params.fb_tol)
-                if ok:
+                    if back is None or back[2] < params.fb_min_corr:
+                        code = "fb_corr"
+                    elif np.hypot(back[0] - sv, back[1] - su) > params.fb_tol:
+                        code = "fb_miss"
+                    else:
+                        code = "ok"
+                else:
+                    code = "ok"
+                if code == "ok":
                     result.labels.append(AutoLabel(
                         view=int(j), u=float(hit[1]), v=float(hit[0]),
                         quality=float(hit[2])))
                     labelled_views.add(j)
+                    result.outcomes.pop(j, None)
                     failures = 0
                     last_accepted = (hit[0], hit[1])
                 else:
+                    result.outcomes[j] = code
                     failures += 1
                     stop_at = j
                 done += 1
@@ -380,7 +471,56 @@ def complete_track(frames_hp, theta, seeds, params: AutoTrackParams, *,
                     rep[key] = stop_at if failures >= \
                         params.max_consecutive_failures else None
     result.labels.sort(key=lambda al: al.view)
+    _finish_stats(result, n_views, seed_views, params)
     return result
+
+
+def _finish_stats(result: TrackResult, n_views: int, seed_views,
+                  params: AutoTrackParams) -> None:
+    """Account for every view: labelled, one of the gate codes, or behind a
+    stopped march. Fills `result.stats` and completes `result.outcomes`."""
+    seeds = set(int(v) for v in seed_views)
+    labelled = {al.view for al in result.labels}
+    for j in range(n_views):
+        if j in seeds or j in labelled or j in result.outcomes:
+            continue
+        result.outcomes[j] = "stopped"
+    counts = {}
+    for code in result.outcomes.values():
+        counts[code] = counts.get(code, 0) + 1
+    unlabelled = [j for j in range(n_views) if j not in seeds
+                  and j not in labelled]
+    gap, best = None, 0
+    if unlabelled:
+        run_lo = prev = unlabelled[0]
+        for j in unlabelled[1:] + [None]:
+            if j is not None and j == prev + 1:
+                prev = j
+                continue
+            if prev - run_lo + 1 > best:
+                best, gap = prev - run_lo + 1, (run_lo, prev)
+            if j is not None:
+                run_lo = prev = j
+    report = result.seed_report
+    result.stats.update({
+        "n_views": int(n_views),
+        "n_unlabelled": int(n_views - len(seeds)),
+        "n_seeds": len(report),
+        "n_seeds_used": sum(1 for r in report if r.get("used")),
+        "n_seeds_refused": sum(1 for r in report if not r.get("used")),
+        "n_attempted": sum(v for k, v in counts.items() if k != "stopped")
+        + len(labelled),
+        "n_accepted": len(labelled),
+        "n_none": counts.get("none", 0),
+        "n_low_p": counts.get("low_p", 0),
+        "n_fb_miss": counts.get("fb_miss", 0),
+        "n_fb_corr": counts.get("fb_corr", 0),
+        "n_stopped": counts.get("stopped", 0),
+        "largest_gap": gap,
+        "min_corr": float(params.min_corr),
+        "patch_track_px": int(params.patch),
+        "search_radius_track_px": float(params.search_radius),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -389,19 +529,53 @@ def complete_track(frames_hp, theta, seeds, params: AutoTrackParams, *,
 
 @dataclass(frozen=True)
 class AutoTrackJob:
-    """One feature to complete: its manual seeds in LOADED-frame px."""
+    """One feature to complete: its manual seeds in SERVED-frame px.
+
+    `track_bin` is the grid to track on, as a mean-pool factor of the base
+    stack (the file's grid); 0 means the served grid, which is what a
+    client that predates the field asked for. Choose it with
+    `choose_track_bin` from the feature's size in file px.
+    """
 
     fid: int
     seeds: tuple                    # ((view, u, v), ...)
     params: AutoTrackParams
+    track_bin: int = 0
+
+
+class BinnedFrames:
+    """A stack mean-pooled by `factor`, one frame at a time on access.
+
+    `HighpassCache.frames` reads frames one by one, so with this in front
+    of the base stack the pooled copy never exists in memory: only the
+    high-passed frames do.
+    """
+
+    def __init__(self, base, factor: int) -> None:
+        self._base = base
+        self._factor = int(factor)
+
+    def __len__(self) -> int:
+        return len(self._base)
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        n, ny, nx = np.shape(self._base)[:3]
+        return (int(n), int(ny) // self._factor, int(nx) // self._factor)
+
+    def __getitem__(self, k):
+        from tktomo.ptycho_align.core.preprocess import bin_stack  # noqa: PLC0415
+
+        frame = np.asarray(self._base[k], np.float32)
+        return bin_stack(frame[None], self._factor)[0]
 
 
 class HighpassCache:
     """The high-passed copy of one stack, kept so repeated runs skip ~7 s.
 
-    Keyed by the stack's identity and sigma; at most one stack is cached.
-    The stack is NOT copied: frames are read one at a time from whatever
-    `stack[k]` returns.
+    Keyed by the stack's identity and sigma (or an explicit `key`); at most
+    one stack is cached. The stack is NOT copied: frames are read one at a
+    time from whatever `stack[k]` returns.
     """
 
     def __init__(self) -> None:
@@ -411,14 +585,20 @@ class HighpassCache:
     def clear(self) -> None:
         self._key, self._frames = None, None
 
-    def frames(self, stack, sigma: float, *, progress=None,
+    @property
+    def key(self):
+        return self._key
+
+    def frames(self, stack, sigma: float, *, key=None, progress=None,
                cancelled=None) -> list | None:
         """The high-passed frames, or None if cancelled before finishing.
 
         `progress(done, total, None)` every ten frames; `cancelled()` is
-        polled per frame.
+        polled per frame. `key` replaces the default `(id(stack), sigma)`
+        when the caller knows a better identity (the base stack plus a
+        binning factor: a lazily binned view is a new object every call).
         """
-        key = (id(stack), float(sigma))
+        key = (id(stack), float(sigma)) if key is None else key
         if self._key == key and self._frames is not None:
             return self._frames
         self.clear()
@@ -434,28 +614,61 @@ class HighpassCache:
         return hp
 
 
-def run_autotrack(stack, theta, jobs, *, hp_sigma: float, matcher,
+def run_autotrack(base, theta, jobs, *, hp_sigma: float, matcher,
                   cache: HighpassCache | None = None, progress=None,
-                  cancelled=None) -> list:
+                  cancelled=None, served_bin: int = 1) -> list:
     """Complete every job's track; returns [(fid, TrackResult)].
+
+    `base` is the stack on the file's grid and `served_bin` the mean-pool
+    factor of the grid the job's seeds are expressed in (what the window
+    shows). Each job tracks on its own `track_bin` grid: the seeds are
+    regridded there, `search_radius` (given in served px) is converted and
+    capped at what the template can see, `hp_sigma` is applied on the
+    track grid, and the labels come back in served px so the caller's
+    coordinate chain applies unchanged.
 
     Returns [] when cancelled (during the high-pass or mid-track), so the
     caller never applies a half-finished batch. `progress(done, total, fid)`
     is called once per job with its index, and with fid=None during the
     high-pass; `cancelled() -> bool` is polled throughout.
     """
+    from dataclasses import replace  # noqa: PLC0415
+
+    from tktomo.tracking.coords import regrid_uv  # noqa: PLC0415
+
     cache = cache if cache is not None else HighpassCache()
     theta = np.asarray(theta, float)
-    hp = cache.frames(stack, hp_sigma, progress=progress, cancelled=cancelled)
-    if hp is None:
-        return []
-    out = []
-    for idx, job in enumerate(jobs):
+    served_bin = int(served_bin)
+    out = [None] * len(jobs)
+    # jobs sharing a grid run back to back so the one-entry cache serves them
+    order = sorted(range(len(jobs)),
+                   key=lambda i: int(jobs[i].track_bin) or served_bin)
+    for idx in order:
+        job = jobs[idx]
+        b = int(job.track_bin) or served_bin
+        frames = base if b == 1 else BinnedFrames(base, b)
+        hp = cache.frames(frames, hp_sigma, key=(id(base), b, float(hp_sigma)),
+                          progress=progress, cancelled=cancelled)
+        if hp is None:
+            return []
         if progress is not None:
             progress(idx, len(jobs), job.fid)
-        result = complete_track(hp, theta, list(job.seeds), job.params,
+        seeds = []
+        for view, u, v in job.seeds:
+            tu, tv = regrid_uv(u, v, served_bin, b)
+            seeds.append((int(view), float(tu), float(tv)))
+        radius = min(float(job.params.search_radius) * served_bin / b,
+                     max_search_radius(job.params.patch))
+        params = replace(job.params, search_radius=radius)
+        result = complete_track(hp, theta, seeds, params,
                                 cancelled=cancelled, matcher=matcher)
         if result.cancelled:
             return []
-        out.append((job.fid, result))
+        result.labels = [
+            replace(al, u=float(su), v=float(sv))
+            for al in result.labels
+            for su, sv in [regrid_uv(al.u, al.v, b, served_bin)]]
+        result.stats.update({"track_bin": b, "served_bin": served_bin,
+                             "hp_sigma_track_px": float(hp_sigma)})
+        out[idx] = (job.fid, result)
     return out

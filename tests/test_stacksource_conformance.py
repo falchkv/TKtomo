@@ -12,7 +12,12 @@ import numpy as np
 import pytest
 
 from tests.helpers_tracking import write_blob_file
-from tktomo.tracking.autotrack import AutoTrackJob, AutoTrackParams, patch_size
+from tktomo.tracking.autotrack import (
+    TRACK_PATCH,
+    AutoTrackJob,
+    AutoTrackParams,
+    patch_size,
+)
 from tktomo.tracking.coords import CoordinateChain
 from tktomo.tracking.model import AxisModel
 from tktomo.tracking.recon import plan_slice
@@ -164,6 +169,63 @@ def test_autotrack_and_cancel(source, blob_file):
 
     cancelled = source.autotrack([job], hp_sigma=12.0, cancelled=lambda: True)
     assert cancelled == []
+
+
+def test_autotrack_tracks_on_the_file_grid_while_serving_binned(source,
+                                                                blob_file):
+    """The window shows bin 2; the job asks for bin 1. Seeds go in served
+    px, the tracker works on the file's grid, labels come back in served
+    px within a pixel of the truth."""
+    path, stack, theta, u, v = blob_file
+    ok, why = source.autotrack_available()
+    if not ok:
+        pytest.skip(why)
+    source.open_stack(path)
+    source.set_binning(2)
+    served = CoordinateChain(rebin=2)          # served px <-> file px
+    seeds = tuple(
+        (w, *[float(x) for x in served.from_parent(u[w], v[w])])
+        for w in (5, 20, 35))
+    job = AutoTrackJob(fid=0, seeds=seeds,
+                       params=AutoTrackParams(patch=TRACK_PATCH,
+                                              search_radius=4.0,
+                                              min_corr=0.2),
+                       track_bin=1)
+    out = source.autotrack([job], hp_sigma=12.0)
+    assert len(out) == 1
+    res = out[0][1]
+    assert res.stats["track_bin"] == 1 and res.stats["served_bin"] == 2
+    assert res.stats["search_radius_track_px"] == pytest.approx(8.0)
+    assert len(res.labels) >= 20
+    for al in res.labels:
+        fu, fv = served.to_parent(al.u, al.v)
+        assert abs(fu - u[al.view]) < 1.0 and abs(fv - v[al.view]) < 1.0
+    source.set_binning(1)
+
+
+def test_autotrack_memory_guard_steps_the_bin_up(blob_file, monkeypatch):
+    import tktomo.ptycho_align.core.telemetry as telemetry
+
+    path, stack, theta, u, v = blob_file
+    src = LocalStackSource()
+    ok, why = src.autotrack_available()
+    if not ok:
+        pytest.skip(why)
+    src.open_stack(path)
+    n, ny, nx = stack.shape
+    fits_bin_2 = int(n * (ny // 2) * (nx // 2) * 4 / 0.6) + 1
+    monkeypatch.setattr(telemetry, "available_ram_bytes", lambda: fits_bin_2)
+    seeds = tuple((w, float(u[w]), float(v[w])) for w in (5, 20, 35))
+    job = AutoTrackJob(fid=0, seeds=seeds,
+                       params=AutoTrackParams(patch=TRACK_PATCH,
+                                              search_radius=8.0,
+                                              min_corr=0.2),
+                       track_bin=1)
+    (fid, res), = src.autotrack([job], hp_sigma=12.0)
+    assert res.stats["track_bin"] == 2
+    assert res.warnings and "instead of bin 1" in res.warnings[0]
+    assert "GB are free" in res.warnings[0]
+    src.close()
 
 
 def test_export_aligned(source, blob_file, tmp_path):

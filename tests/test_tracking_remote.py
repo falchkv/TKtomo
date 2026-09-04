@@ -55,16 +55,23 @@ def test_payloads_round_trip():
     assert back.row_in_slab == 3 and back.extra_bin == 2
 
     job = AutoTrackJob(fid=1, seeds=((0, 1.0, 2.0), (5, 3.0, 4.0)),
-                       params=AutoTrackParams(patch=30))
+                       params=AutoTrackParams(patch=30, fb_min_corr=0.2),
+                       track_bin=2)
     back = _roundtrip(job)
     assert back.seeds == job.seeds and isinstance(back.seeds[0], tuple)
-    assert back.params.patch == 30
+    assert back.params.patch == 30 and back.params.fb_min_corr == 0.2
+    assert back.track_bin == 2
 
     result = TrackResult(labels=[AutoLabel(view=1, u=2.0, v=3.0, quality=0.5)],
                          seed_report=[{"view": 1, "ok": True}],
-                         warnings=["w"], cancelled=False)
+                         warnings=["w"], cancelled=False,
+                         stats={"track_bin": 2, "largest_gap": (3, 9)},
+                         outcomes={3: "low_p"})
     back = _roundtrip(result)
     assert back.labels[0].quality == 0.5 and back.seed_report == result.seed_report
+    assert back.stats["track_bin"] == 2
+    assert tuple(back.stats["largest_gap"]) == (3, 9)
+    assert list(back.outcomes.values()) == ["low_p"]
 
     exp = AlignedExportRequest(dx=np.zeros(2), dy=np.zeros(2),
                                rot_deg=np.zeros(2), metadata={"a": 1})

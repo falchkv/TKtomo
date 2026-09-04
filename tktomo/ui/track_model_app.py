@@ -32,7 +32,7 @@ from pathlib import Path
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QFontDatabase, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -68,6 +68,11 @@ from tktomo.tracking.export import (
     aligned_view_transforms,
     write_model_h5,
     write_slogger_shifts,
+)
+from tktomo.tracking.autotrack import (
+    TRACK_PATCH,
+    choose_track_bin,
+    max_search_radius,
 )
 from tktomo.tracking.labels import LabelStore
 from tktomo.tracking.model import (
@@ -587,24 +592,62 @@ class TrackModelWindow(QMainWindow):
             "keeps ~90% of answers from 10-view anchors with about 1% worse "
             "than 10 px; raise it when coverage is generous.")
         self.auto_radius = QDoubleSpinBox()
-        self.auto_radius.setRange(2.0, 50.0)
+        self.auto_radius.setRange(1.0, 1000.0)
         self.auto_radius.setValue(8.0)
-        self.auto_radius.setSuffix(" px")
+        self.auto_radius.setSuffix(" raw px")
         self.auto_radius.setToolTip(
-            "Search radius around the predicted position (grows slowly "
-            "with distance from the seed).")
+            "Search radius around the predicted position, in raw detector "
+            "px so it means the same at every display binning. It is "
+            "converted to the tracking grid, where it grows 0.25 px per "
+            "view of distance from the seed and can never exceed 18 track "
+            "px, which is what a 40 px template can see. The maximum of "
+            "this box is that cap.")
+        self.auto_radius.valueChanged.connect(
+            lambda _v: self._refresh_auto_grid())
         self.auto_fb = QCheckBox("fwd-back")
-        self.auto_fb.setChecked(True)
+        self.auto_fb.setChecked(False)
         self.auto_fb.setToolTip(
-            "Track every accepted match BACK to its seed and reject it "
-            "if the round trip misses or correlates poorly. Cheap, only "
-            "ever removes labels.")
+            "Track every accepted match back to its seed. Rejected when "
+            "the round trip lands more than 1 track px off the seed or the "
+            "backward correlation falls below 0.10. Off by default: "
+            "measured on lens1_v11_upper it halved the coverage (50 "
+            "against 79 percent of the views) for 5 points of precision, "
+            "because a template cut far from its seed does not land back "
+            "on it. The residual rejection below catches what it would "
+            "have. Turn it on when a lookalike sits next to the feature.")
+        self.auto_bin_combo = QComboBox()
+        for label, factor in (("auto", 0), ("1", 1), ("2", 2), ("4", 4),
+                              ("8", 8)):
+            self.auto_bin_combo.addItem(label, factor)
+        self.auto_bin_combo.setToolTip(
+            "The grid the tracker works on, as a mean-pool of the file's "
+            "grid. It is independent of the bin box above: that one is "
+            "for display, this one follows the feature. Auto picks the "
+            "coarsest grid on which a 40 px template still covers four "
+            "times the feature's marker size, so set the marker size to "
+            "the feature's real size first. Measured on a 12 raw px "
+            "particle: bin 1 gave 1.4 raw px median error, bin 2 was 3x "
+            "faster at 2.2 px with the same precision and a little less "
+            "coverage.")
+        self.auto_bin_combo.currentIndexChanged.connect(
+            lambda _i: self._refresh_auto_grid())
         param_row.addWidget(self.auto_thr_label)
         param_row.addWidget(self.auto_min_corr)
         param_row.addWidget(QLabel("search"))
         param_row.addWidget(self.auto_radius)
         param_row.addWidget(self.auto_fb)
+        param_row.addWidget(QLabel("track bin"))
+        param_row.addWidget(self.auto_bin_combo)
         auto_layout.addLayout(param_row)
+        self.auto_grid_label = QLabel("")
+        self.auto_grid_label.setWordWrap(True)
+        self.auto_grid_label.setToolTip(
+            "What the next auto-complete run will do for the active "
+            "feature. The tracking grid follows the marker size, not the "
+            "display bin: on a coarse display grid the template would "
+            "cover the sample's edges rather than the feature, and the "
+            "edge gate would refuse every seed.")
+        auto_layout.addWidget(self.auto_grid_label)
         reject_row = QHBoxLayout()
         self.auto_reject = QCheckBox("reject auto >")
         self.auto_reject.setChecked(True)
@@ -640,6 +683,20 @@ class TrackModelWindow(QMainWindow):
         self.auto_status = QLabel("")
         self.auto_status.setWordWrap(True)
         auto_layout.addWidget(self.auto_status)
+        self.auto_report = QPlainTextEdit()
+        self.auto_report.setReadOnly(True)
+        self.auto_report.setMaximumHeight(120)
+        self.auto_report.setFont(QFontDatabase.systemFont(
+            QFontDatabase.SystemFont.FixedFont))
+        self.auto_report.setPlaceholderText(
+            "The last auto-complete run's report: grid, seeds, where the "
+            "unlabelled views went, and what to do about the largest gap.")
+        self.auto_report.setToolTip(
+            "Per feature: the grid tracked on, which seeds were used or "
+            "refused and why, how many views each gate dropped, and the "
+            "largest unlabelled gap with the remedy. Stays until the next "
+            "run, the fit does not overwrite it.")
+        auto_layout.addWidget(self.auto_report)
         layout.addWidget(auto_box)
 
         model_box = QGroupBox("Model (check = fixed at the shown value)")
@@ -964,6 +1021,47 @@ class TrackModelWindow(QMainWindow):
         self._active = int(fid)
         self.active_label.setText(f"active feature: {self._active}")
         self._refresh_view()
+        self._refresh_auto_grid()
+
+    def _feature_size(self, fid: int) -> float:
+        """Marker size in loaded px. The default is 10 px on the FILE's
+        grid, so an untouched marker does not inflate with the display
+        binning (stored sizes are rescaled by `_set_binning`)."""
+        return float(self._feature_sizes.get(int(fid),
+                                             10.0 / self._chain.rebin))
+
+    def _track_bin_for(self, fid: int) -> int:
+        """The grid auto-complete tracks `fid` on: the combo's choice, or
+        the coarsest grid at which the template still covers the feature
+        four times over (`choose_track_bin`)."""
+        forced = int(self.auto_bin_combo.currentData() or 0)
+        if forced:
+            return forced
+        return choose_track_bin(self._feature_size(fid) * self._chain.rebin)
+
+    def _refresh_auto_grid(self) -> None:
+        """Tell the user what the next run will do for the active feature,
+        and cap the search radius at what the template can see."""
+        if not hasattr(self, "auto_grid_label") or self._stack.info() is None:
+            return
+        fid = self._active
+        b = self._track_bin_for(fid)
+        raw_per_track = b * self._chain.binning
+        cap_track = max_search_radius(TRACK_PATCH)
+        self.auto_radius.blockSignals(True)
+        self.auto_radius.setMaximum(cap_track * raw_per_track)
+        self.auto_radius.blockSignals(False)
+        radius_raw = float(self.auto_radius.value())
+        size_raw = self._feature_size(fid) * self._chain.scale
+        text = (f"Tracks feature {fid} at bin {b}: patch {TRACK_PATCH} px = "
+                f"{TRACK_PATCH * raw_per_track:.0f} raw px around a "
+                f"{size_raw:.0f} raw px feature. Search radius "
+                f"{radius_raw:.0f} raw px = {radius_raw / raw_per_track:.1f} "
+                f"track px (cap {cap_track:.0f}).")
+        if fid not in self._feature_sizes:
+            text += (" The marker size is the default 10 px: set it to the "
+                     "feature's real size in the table.")
+        self.auto_grid_label.setText(text)
 
     def _new_feature(self) -> None:
         ids = self._labels.feature_ids()
@@ -984,7 +1082,7 @@ class TrackModelWindow(QMainWindow):
         values matter to the solver."""
         if self._model is None:
             return None
-        sizes = np.array([self._feature_sizes.get(int(f), 10.0)
+        sizes = np.array([self._feature_size(int(f))
                           for f in self._model.feature_ids], float)
         if np.allclose(sizes, sizes[0] if sizes.size else 1.0):
             return None                    # uniform sizes = unweighted
@@ -1024,7 +1122,6 @@ class TrackModelWindow(QMainWindow):
         from tktomo.tracking.autotrack import (  # noqa: PLC0415
             AutoTrackJob,
             AutoTrackParams,
-            patch_size,
         )
 
         if self._stack.info() is None:
@@ -1056,13 +1153,21 @@ class TrackModelWindow(QMainWindow):
                 u_raw, v_raw = self._labels.get(fid, w)
                 u, v = self._chain.from_parent(u_raw, v_raw)
                 seeds.append((w, float(u), float(v)))
+            # the radius box is in raw px; the host wants served px and
+            # converts to the track grid itself, capped at what the
+            # template can see (max_search_radius)
+            track_bin = self._track_bin_for(fid)
+            cap_raw = (max_search_radius(TRACK_PATCH) * track_bin
+                       * self._chain.binning)
+            radius_served = (min(float(self.auto_radius.value()), cap_raw)
+                             / self._chain.scale)
             params = AutoTrackParams(
-                patch=patch_size(self._feature_sizes.get(fid, 10.0)),
-                search_radius=float(self.auto_radius.value()),
+                patch=TRACK_PATCH,
+                search_radius=radius_served,
                 min_corr=float(self.auto_min_corr.value()),
                 fb_check=self.auto_fb.isChecked())
             jobs.append(AutoTrackJob(fid=fid, seeds=tuple(seeds),
-                                     params=params))
+                                     params=params, track_bin=track_bin))
 
         if self._autotrack_worker is None:
             self._autotrack_worker = AutoTrackWorker(self._stack, self)
@@ -1076,6 +1181,8 @@ class TrackModelWindow(QMainWindow):
             btn.setEnabled(False)
         self.auto_cancel_btn.setEnabled(True)
         self.auto_status.setText("preparing…")
+        # hp_sigma is in TRACK px: 0.3 x the 40 px template the classifier
+        # was trained with, so it follows the tracking grid, not the display
         self._autotrack_worker.submit(jobs, hp_sigma=12.0)
 
     def _autotrack_progress(self, done: int, total: int, fid) -> None:
@@ -1095,7 +1202,7 @@ class TrackModelWindow(QMainWindow):
         if not results:
             self.auto_status.setText("cancelled, nothing applied")
             return
-        lines = []
+        summary, blocks = [], []
         for fid, res in results:
             self._labels.clear_auto(fid)
             added = 0
@@ -1105,21 +1212,62 @@ class TrackModelWindow(QMainWindow):
                                          float(v_raw), al.quality):
                     added += 1
             qualities = [al.quality for al in res.labels]
-            line = (f"feature {fid}: +{added} auto labels"
-                    + (f", median p "
-                       f"{float(np.median(qualities)):.2f}"
-                       if qualities else ""))
-            refusals = [w for w in res.warnings if "refused" in w
-                        or "not trackable" in w]
-            if refusals:
-                line += f" ({len(refusals)} seed(s) refused)"
-            lines.append(line)
-            for w in res.warnings:
-                lines.append(f"  {w}")
-        self.auto_status.setText("\n".join(lines))
+            st = res.stats
+            n_unl = int(st.get("n_unlabelled", 0))
+            head = f"feature {fid}: +{added} auto labels"
+            if n_unl:
+                head += f" ({added / n_unl:.0%} of {n_unl} unlabelled views)"
+            if qualities:
+                head += f", median p {float(np.median(qualities)):.2f}"
+            refused = [r for r in res.seed_report if not r.get("used")]
+            if refused:
+                head += f", {len(refused)} seed(s) refused"
+            summary.append(head)
+            blocks.append("\n".join(
+                [head] + self._autotrack_report_lines(fid, res, refused)))
+        self.auto_status.setText("\n".join(summary))
+        self.auto_report.setPlainText("\n\n".join(blocks))
         self._refresh_view()
         self._refresh_plots()
         self._request_fit()
+
+    def _autotrack_report_lines(self, fid: int, res, refused) -> list[str]:
+        """The per-feature block of the auto-complete report: grid, seeds,
+        where the unlabelled views went, and the largest gap with its
+        remedy. Numbers come from `TrackResult.stats` on the host."""
+        st = res.stats
+        lines = []
+        if st:
+            b = int(st.get("track_bin", 1))
+            raw_per_track = b * self._chain.binning
+            patch = int(st.get("patch_track_px", TRACK_PATCH))
+            lines.append(
+                f"  tracked at bin {b}: patch {patch} px = "
+                f"{patch * raw_per_track:.0f} raw px, feature "
+                f"{self._feature_size(fid) * self._chain.scale:.0f} raw px, "
+                f"search radius {st.get('search_radius_track_px', 0):.1f} "
+                f"track px (cap {max_search_radius(patch):.0f})")
+            seeds_line = f"  seeds: {st.get('n_seeds_used', 0)} used"
+            if refused:
+                seeds_line += ", " + ", ".join(
+                    f"view {r['view']} {r.get('reason') or 'refused'}"
+                    for r in refused)
+            lines.append(seeds_line)
+            lines.append(
+                f"  not labelled: {st.get('n_none', 0)} no match, "
+                f"{st.get('n_low_p', 0)} below min p "
+                f"{st.get('min_corr', 0):.2f}, "
+                f"{st.get('n_fb_corr', 0) + st.get('n_fb_miss', 0)} fwd-back "
+                f"miss, {st.get('n_stopped', 0)} behind a stopped march")
+            gap = st.get("largest_gap")
+            if gap and gap[1] - gap[0] >= 5:
+                lines.append(
+                    f"  largest gap: views {gap[0]} to {gap[1]}. Label it by "
+                    f"hand or place a seed near view {(gap[0] + gap[1]) // 2} "
+                    f"and re-run.")
+        for w in res.warnings:
+            lines.append(f"  {w}")
+        return lines
 
     def _cancel_autotrack(self) -> None:
         if self._autotrack_worker is not None:
@@ -1301,7 +1449,7 @@ class TrackModelWindow(QMainWindow):
             f"{np.rad2deg(self._stack.angles[view]):7.2f}°")
         self.viewer.set_image(self._stack.view(view))
 
-        sizes = {fid: self._feature_sizes.get(fid, 10.0)
+        sizes = {fid: self._feature_size(fid)
                  for fid in self._labels.feature_ids()}
         marks = []
         for fid, u_raw, v_raw, kind, _q in self._labels.in_view_full(view):
@@ -1392,7 +1540,7 @@ class TrackModelWindow(QMainWindow):
                           f"{self._model.a[row]:.1f}",
                           f"{self._model.b[row]:.1f}",
                           f"{self._model.y[row]:.1f}",
-                          f"{self._feature_sizes.get(fid, 10.0):.1f}")
+                          f"{self._feature_size(fid):.1f}")
                 for col, value in enumerate(values, start=1):
                     item = QTableWidgetItem(str(value))
                     if col in (4, 5, 6, 7):
@@ -1439,6 +1587,7 @@ class TrackModelWindow(QMainWindow):
                 return
             self._feature_sizes[fid] = max(size, 0.5)
             self._refresh_view()       # marker size updates immediately
+            self._refresh_auto_grid()  # and the tracking grid it implies
             self._request_fit()        # and so does the 1/size weighting
             return
         if col in (4, 5, 6):
@@ -1666,6 +1815,7 @@ class TrackModelWindow(QMainWindow):
         self._view = min(self._view, n - 1)
         self.viewer.reset_levels(self._stack.view(self._view))
         self._refresh_view()
+        self._refresh_auto_grid()
 
     def _bin_combo_changed(self, _index: int) -> None:
         if self._updating_ui:
@@ -1756,6 +1906,7 @@ class TrackModelWindow(QMainWindow):
             "auto_min_corr": self.auto_min_corr.value(),
             "auto_search_radius": self.auto_radius.value(),
             "auto_fb_check": self.auto_fb.isChecked(),
+            "auto_track_bin": int(self.auto_bin_combo.currentData() or 0),
         }
 
     def _save_session(self) -> None:
@@ -1825,7 +1976,9 @@ class TrackModelWindow(QMainWindow):
         self.auto_reject_k.setValue(float(ui.get("auto_reject_k", 3.0)))
         self.auto_min_corr.setValue(float(ui.get("auto_min_corr", 0.20)))
         self.auto_radius.setValue(float(ui.get("auto_search_radius", 8.0)))
-        self.auto_fb.setChecked(bool(ui.get("auto_fb_check", True)))
+        self.auto_fb.setChecked(bool(ui.get("auto_fb_check", False)))
+        idx = self.auto_bin_combo.findData(int(ui.get("auto_track_bin", 0)))
+        self.auto_bin_combo.setCurrentIndex(max(idx, 0))
         self.advance_box.setValue(int(ui.get("advance", 5)))
         degrees = ui.get("degrees", [0, 0, 0])
         self.deg_c.setValue(int(degrees[0]))

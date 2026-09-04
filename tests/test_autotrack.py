@@ -33,7 +33,7 @@ def blob(frame, v, u, amplitude=1.0, sigma=2.5):
 
 
 def synthetic_scan(n_views=60, ny=96, nx=160, jitter=0.0, seed=0,
-                   tracks=(((40.0, -25.0, 80.0), 40.0),)):
+                   tracks=(((40.0, -25.0, 80.0), 40.0),), sigma=2.5):
     """Frames with blobs on tracks u = a cosT + b sinT + c at height y.
 
     tracks: (((a, b, c), y), ...). Returns (frames, theta, truth_u (F,V),
@@ -51,7 +51,7 @@ def synthetic_scan(n_views=60, ny=96, nx=160, jitter=0.0, seed=0,
             u = a * np.cos(theta[j]) + b * np.sin(theta[j]) + c
             v = y + (jitter * rng.standard_normal() if jitter else 0.0)
             truth_u[f, j], truth_v[f, j] = u, v
-            blob(frame, v, u)
+            blob(frame, v, u, sigma=sigma)
         frames.append(frame.astype(np.float32))
     return frames, theta, truth_u, truth_v
 
@@ -189,6 +189,12 @@ def test_coherence_gate_refuses_edge():
     assert not result.labels
     assert any("not trackable" in w for w in result.warnings)
     assert all(not rep["used"] for rep in result.seed_report)
+    # the report names the reason and the warning ends with the remedy
+    assert all(rep["reason"].startswith("refused: coherence")
+               for rep in result.seed_report)
+    assert any("label them by hand" in w for w in result.warnings)
+    assert result.stats["n_seeds_refused"] == 2
+    assert result.stats["n_accepted"] == 0
 
 
 def test_forward_backward_gate(monkeypatch):
@@ -224,7 +230,7 @@ def test_forward_backward_gate(monkeypatch):
         return hit
 
     monkeypatch.setattr(at, "match_patch", fake)
-    params = default_params()
+    params = default_params(fb_check=True)
 
     behavior.update(back_miss=0.0, back_q=0.9)
     clean = at.complete_track(hp, theta, seeds, params, matcher=_pc(params))
@@ -234,9 +240,23 @@ def test_forward_backward_gate(monkeypatch):
     missed = at.complete_track(hp, theta, seeds, params, matcher=_pc(params))
     assert not missed.labels                  # round trip misses: rejected
 
+    assert "fb_miss" in missed.outcomes.values()
+
     behavior.update(back_miss=0.0, back_q=0.05)
     cratered = at.complete_track(hp, theta, seeds, params, matcher=_pc(params))
     assert not cratered.labels                # backward corr craters: rejected
+    assert "fb_corr" in cratered.outcomes.values()
+
+    # the backward threshold is fb_min_corr (a correlation), NOT min_corr:
+    # an anchored template correlates ~0.2 ten views out, so 0.15 must pass
+    behavior.update(back_miss=0.0, back_q=0.15)
+    weak = at.complete_track(hp, theta, seeds, params, matcher=_pc(params))
+    assert weak.labels
+    strict = AutoTrackParams(**{**params.__dict__, "fb_min_corr": 0.3})
+    assert not at.complete_track(hp, theta, seeds, strict,
+                                 matcher=_pc(strict)).labels
+    high = AutoTrackParams(**{**params.__dict__, "min_corr": 0.5})
+    assert at.complete_track(hp, theta, seeds, high, matcher=_pc(high)).labels
 
     behavior.update(back_miss=5.0, back_q=0.9)
     off_params = AutoTrackParams(**{**params.__dict__, "fb_check": False})
@@ -258,6 +278,11 @@ def test_stop_after_consecutive_failures():
     assert not any(v in got for v in (40, 41, 42))
     assert not any(v in got for v in range(43, 60))   # direction ended
     assert 39 in got                                   # tracked up to it
+    # every view is accounted for: the three corrupt ones were attempted,
+    # the rest of that direction sits behind the stop
+    assert result.stats["n_stopped"] == 17
+    assert all(result.outcomes[v] == "stopped" for v in range(43, 60))
+    assert result.stats["largest_gap"] == (40, 59)
 
     # a SINGLE corrupted frame is skipped, the march continues past it
     hp2 = [highpass2d(f, 8.0) for f in frames]
@@ -313,6 +338,15 @@ def test_complete_track_custom_matcher_is_used_and_thresholded():
     for al in res.labels:
         assert abs(al.u - tu[0, al.view]) < 1e-9
         assert abs(al.v - tv[0, al.view]) < 1e-9
+    # the accounting closes: labelled + each gate's count = unlabelled views
+    st = res.stats
+    assert st["n_unlabelled"] == 30 - 4
+    assert (st["n_accepted"] + st["n_none"] + st["n_low_p"] + st["n_fb_miss"]
+            + st["n_fb_corr"] + st["n_stopped"]) == st["n_unlabelled"]
+    assert st["n_low_p"] == sum(1 for j in range(30)
+                                if j not in views and j % 2 == 0)
+    assert set(res.outcomes) == {j for j in range(30)
+                                 if j not in views and j % 2 == 0}
 
 
 def test_complete_track_requires_a_matcher():
@@ -323,3 +357,125 @@ def test_complete_track_requires_a_matcher():
 
     with pytest.raises(ValueError, match="requires a matcher"):
         complete_track(hp, theta, seeds, default_params())
+
+
+# ---------------------------------------------------------------------------
+# the tracking grid
+# ---------------------------------------------------------------------------
+
+def test_choose_track_bin_rule():
+    from tktomo.tracking.autotrack import (
+        TRACK_PATCH,
+        choose_track_bin,
+        max_search_radius,
+    )
+
+    assert choose_track_bin(12) == 1
+    assert choose_track_bin(10) == 1
+    assert choose_track_bin(25) == 2
+    assert choose_track_bin(45) == 4
+    assert choose_track_bin(200) == 8
+    assert choose_track_bin(0) == 1
+    assert choose_track_bin(float("nan")) == 1
+    assert max_search_radius(TRACK_PATCH) == 18
+
+
+def test_regrid_uv_pixel_centre_round_trip():
+    from tktomo.tracking.coords import regrid_uv
+
+    # pixel 0 of a bin-4 grid is centred on parent pixel 1.5
+    u, v = regrid_uv(1.5, 1.5, 1, 4)
+    assert u == pytest.approx(0.0) and v == pytest.approx(0.0)
+    u, v = regrid_uv(0.0, 2.0, 4, 1)
+    assert u == pytest.approx(1.5) and v == pytest.approx(9.5)
+    u, v = regrid_uv(7.25, 3.5, 2, 2)
+    assert u == 7.25 and v == 3.5
+    back = regrid_uv(*regrid_uv(13.7, 4.2, 1, 8), 8, 1)
+    assert back[0] == pytest.approx(13.7) and back[1] == pytest.approx(4.2)
+
+
+def test_binned_frames_matches_bin_stack():
+    from tktomo.ptycho_align.core.preprocess import bin_stack
+    from tktomo.tracking.autotrack import BinnedFrames
+
+    rng = np.random.default_rng(0)
+    base = rng.standard_normal((3, 17, 22)).astype(np.float32)
+    frames = BinnedFrames(base, 4)
+    assert len(frames) == 3 and frames.shape == (3, 4, 5)
+    want = bin_stack(base, 4)
+    for k in range(3):
+        assert np.allclose(frames[k], want[k])
+
+
+def test_highpass_cache_keyed_on_base_and_track_bin():
+    from tktomo.tracking.autotrack import BinnedFrames, HighpassCache
+
+    frames, theta, tu, tv = synthetic_scan(n_views=4)
+    base = np.stack(frames)
+    cache = HighpassCache()
+    a = cache.frames(BinnedFrames(base, 2), 4.0, key=(id(base), 2, 4.0))
+    b = cache.frames(BinnedFrames(base, 2), 4.0, key=(id(base), 2, 4.0))
+    assert a is b                       # a new lazy view, same key: a hit
+    c = cache.frames(base, 4.0, key=(id(base), 1, 4.0))
+    assert c is not a and c[0].shape == base[0].shape
+
+
+def test_run_autotrack_regrids_between_served_and_track_grids():
+    """Seeds arrive in served px (bin 2), the tracking happens at bin 1
+    and the labels come back in served px."""
+    from tktomo.tracking.autotrack import AutoTrackJob, run_autotrack
+    from tktomo.tracking.coords import regrid_uv
+
+    frames, theta, tu, tv = synthetic_scan(n_views=40)
+    base = np.stack(frames)
+    seed_views = [5, 20, 35]
+    seeds = tuple(
+        (w, *[float(x) for x in regrid_uv(tu[0, w], tv[0, w], 1, 2)])
+        for w in seed_views)
+    params = default_params(fb_check=False)     # patch 32, radius 6 served
+    job = AutoTrackJob(fid=0, seeds=seeds, params=params, track_bin=1)
+    (fid, res), = run_autotrack(base, theta, [job], served_bin=2,
+                                hp_sigma=8.0, matcher=_pc(params))
+    assert fid == 0
+    assert res.stats["track_bin"] == 1 and res.stats["served_bin"] == 2
+    # 6 served px are 12 track px, under the 14 px cap of a 32 px patch
+    assert res.stats["search_radius_track_px"] == pytest.approx(12.0)
+    assert len(res.labels) >= 0.8 * (40 - len(seed_views))
+    for al in res.labels:
+        su, sv = regrid_uv(tu[0, al.view], tv[0, al.view], 1, 2)
+        assert abs(al.u - su) < 0.5 and abs(al.v - sv) < 0.5
+
+
+def test_run_autotrack_tracks_on_a_coarser_grid():
+    """A big blob tracked at bin 2 from bin-1 seeds: labels back in bin-1 px
+    and the radius converted and reported in track px."""
+    from tktomo.tracking.autotrack import AutoTrackJob, run_autotrack
+
+    frames, theta, tu, tv = synthetic_scan(
+        n_views=40, ny=192, nx=320, sigma=5.0,
+        tracks=(((80.0, -50.0, 160.0), 80.0),))
+    base = np.stack(frames)
+    seeds = tuple((w, float(tu[0, w]), float(tv[0, w])) for w in (5, 20, 35))
+    params = default_params(fb_check=False)
+    job = AutoTrackJob(fid=0, seeds=seeds, params=params, track_bin=2)
+    (fid, res), = run_autotrack(base, theta, [job], served_bin=1,
+                                hp_sigma=8.0, matcher=_pc(params))
+    assert res.stats["track_bin"] == 2
+    assert res.stats["search_radius_track_px"] == pytest.approx(3.0)
+    assert len(res.labels) >= 0.8 * 37
+    for al in res.labels:
+        assert abs(al.u - tu[0, al.view]) < 1.0
+        assert abs(al.v - tv[0, al.view]) < 1.0
+
+
+def test_run_autotrack_caps_the_search_radius():
+    from tktomo.tracking.autotrack import AutoTrackJob, run_autotrack
+
+    frames, theta, tu, tv = synthetic_scan(n_views=12)
+    base = np.stack(frames)
+    seeds = tuple((w, float(tu[0, w]), float(tv[0, w])) for w in (2, 6, 10))
+    params = default_params(search_radius=50.0, fb_check=False)
+    job = AutoTrackJob(fid=0, seeds=seeds, params=params)
+    (_, res), = run_autotrack(base, theta, [job], hp_sigma=8.0,
+                              matcher=_pc(params))
+    assert res.stats["search_radius_track_px"] == 32 // 2 - 2

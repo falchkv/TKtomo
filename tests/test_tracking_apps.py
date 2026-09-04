@@ -540,6 +540,53 @@ def test_auto_complete_produces_hollow_reviewable_labels(qtbot):
     assert n_before - 3 == len(auto_views)
 
 
+def test_auto_track_grid_follows_the_feature_not_the_display_bin(qtbot):
+    """The whole point: at display bin 4 the tracker still works on the
+    file's grid, where the 40 px template fits the feature, and finds the
+    blob. The grid label, the radius cap and the report say so."""
+    win, truth_u, truth_v = _blob_stack_window(qtbot)
+    win._set_active(0)
+    for w in (5, 20, 35):
+        win._set_view(w)
+        win._place(truth_u[w], truth_v[w])
+    assert win._track_bin_for(0) == 1
+    assert "at bin 1" in win.auto_grid_label.text()
+    assert "default 10 px" in win.auto_grid_label.text()
+    assert win.auto_radius.maximum() == pytest.approx(18.0)
+
+    win.bin_combo.setCurrentIndex(win.bin_combo.findData(4))
+    assert win._chain.rebin == 4
+    assert win._feature_size(0) == pytest.approx(2.5)   # 10 file px
+    assert win._track_bin_for(0) == 1
+    assert "at bin 1" in win.auto_grid_label.text()
+    assert win.auto_radius.maximum() == pytest.approx(18.0)
+
+    win._auto_complete(False)
+    worker = win._autotrack_worker
+    with qtbot.waitSignal(worker.finished_tracks, timeout=120000):
+        pass
+    qtbot.wait(50)
+    auto_views = [w for w in win._labels.views_of(0)
+                  if win._labels.kind_of(0, w) == 1]
+    assert len(auto_views) >= 20
+    errs = [np.hypot(*(np.subtract(win._labels.get(0, w),
+                                   (truth_u[w], truth_v[w]))))
+            for w in auto_views]
+    assert float(np.median(errs)) < 0.5
+    report = win.auto_report.toPlainText()
+    assert "tracked at bin 1" in report and "not labelled:" in report
+    assert "seeds: 3 used" in report
+
+    # the report survives a fit; a forced grid is honoured and saved
+    win._fit_now()
+    assert win.auto_report.toPlainText() == report
+    win.auto_bin_combo.setCurrentIndex(win.auto_bin_combo.findData(2))
+    assert win._track_bin_for(0) == 2
+    assert "at bin 2" in win.auto_grid_label.text()
+    assert win.auto_radius.maximum() == pytest.approx(36.0)
+    assert win._ui_state()["auto_track_bin"] == 2
+
+
 def test_auto_complete_requires_manual_seeds(qtbot):
     win, truth_u, truth_v = _blob_stack_window(qtbot)
     win._set_active(0)

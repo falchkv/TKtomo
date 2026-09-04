@@ -87,3 +87,12 @@ def test_app_uses_learned_matcher_only(qtbot):
     assert win.auto_min_corr.value() == pytest.approx(0.20)
     # with scikit-learn, joblib and the shipped model present it is available
     assert win._learned_ok is available()[0]
+
+
+def test_patch_is_the_track_patch():
+    """The classifier's patch is fixed on the tracking grid; the grid is
+    what adapts to the feature (autotrack.choose_track_bin)."""
+    from tktomo.tracking.autotrack import TRACK_PATCH
+    from tktomo.tracking.learned_match import P
+
+    assert P == TRACK_PATCH == 40
