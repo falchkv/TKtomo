@@ -369,3 +369,79 @@ def test_plan_slice_carries_the_rotations():
     moved = model.rot_beam != 0.0
     assert not np.allclose(req.sx[moved], plain.sx[moved])
     assert req.row_in_slab == 100 - req.lo
+
+
+# ------------------------------------------------ version 4: sphere tangents
+
+KIND_DATASETS = ("feature_kind", "feature_body", "feature_use_center",
+                 "body_radius", "free_radius")
+
+
+def _sphere_truth(n_view=16):
+    from tktomo.tracking.model import LAOS, POINT, RAOS
+
+    truth = make_truth(degrees=(1, 1, 0), n_feat=5, n_view=n_view)
+    truth.kind = np.array([LAOS, RAOS, POINT, LAOS, RAOS])
+    truth.body = np.array([0, 0, 1, 2, 2])
+    truth.radius = np.array([11.0, 0.0, 23.0])
+    truth.use_center = np.array([False, True, False, False, False])
+    return truth
+
+
+def test_model_h5_carries_the_spheres_and_reads_version_3(tmp_path):
+    truth = _sphere_truth()
+    fit, u, v, valid = make_fit(truth)
+    mask = FreeMask.all_free(truth)
+    path = tmp_path / "model.h5"
+    write_model_h5(path, fit, mask, LabelStore(), CoordinateChain())
+    out = read_model_h5(path)
+    m = out["model"]
+    assert np.array_equal(m.kind, truth.kind)
+    assert np.array_equal(m.body, truth.body)
+    assert np.allclose(m.radius, truth.radius)
+    assert np.array_equal(m.use_center, truth.use_center)
+    assert out["mask"].radius is not None
+    assert out["observed_dx"].any() and out["observed_dy"].any()
+
+    # a version-3 file predates the kinds: everything loads as a point
+    with h5py.File(path, "a") as f:
+        for name in (*KIND_DATASETS, "observed_dx", "observed_dy",
+                     "obs_u_i", "obs_u_j", "obs_v_i", "obs_v_j"):
+            del f[name]
+        f.attrs["model_version"] = 3
+    out = read_model_h5(path)
+    assert not out["model"].has_tangents
+    assert out["model"].n_bodies == truth.feature_ids.size
+    assert out["mask"].radius is None
+    assert np.array_equal(out["observed_dx"], out["observed_views"])
+
+
+def test_session_carries_the_spheres_and_reads_version_3(tmp_path):
+    from tktomo.tracking import sessionio
+
+    truth = _sphere_truth()
+    mask = FreeMask.all_free(truth)
+    path = tmp_path / "session.h5"
+    sessionio.save_session(path, labels=LabelStore(), model=truth, mask=mask,
+                           source={"kind": "test"}, ui_state={})
+    state = sessionio.load_session(path)
+    assert np.array_equal(state["model"].kind, truth.kind)
+    assert np.allclose(state["model"].radius, truth.radius)
+    assert state["mask"].radius is not None
+
+    with h5py.File(path, "a") as f:
+        for name in KIND_DATASETS:
+            del f[name]
+        f.attrs["session_version"] = 3
+    state = sessionio.load_session(path)
+    assert not state["model"].has_tangents
+    assert state["mask"].radius is None
+
+
+def test_slogger_counts_spheres_not_members(tmp_path):
+    truth = _sphere_truth()
+    fit, *_ = make_fit(truth)
+    path = tmp_path / "shifts.h5"
+    write_slogger_shifts(path, fit, CoordinateChain(), target_binning=2)
+    with h5py.File(path, "r") as f:
+        assert int(f.attrs["n_tracks_used"]) == 3

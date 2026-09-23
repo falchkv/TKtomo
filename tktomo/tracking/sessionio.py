@@ -21,7 +21,9 @@ from tktomo.tracking.model import AxisModel, FreeMask
 # version-1 files are still readable (LabelStore.from_table accepts both).
 # version 3: per-view rotations (rot_horiz, rot_beam, rot_axis) and their
 # free flags; older files load with the rotations at zero and fixed.
-SESSION_VERSION = 3
+# version 4: feature kinds, the bodies they share and the sphere radii;
+# older files load as all-point features, each its own body, no radii.
+SESSION_VERSION = 4
 ROTATIONS = ("rot_horiz", "rot_beam", "rot_axis")
 
 
@@ -50,6 +52,13 @@ def save_session(path: str | Path, *, labels: LabelStore,
                          "a", "b", "y", *ROTATIONS):
                 f.create_dataset(name, data=getattr(model, name))
             f.create_dataset("feature_id", data=model.feature_ids)
+            f.create_dataset("feature_kind", data=model.kind)
+            f.create_dataset("feature_body", data=model.body)
+            f.create_dataset("feature_use_center", data=model.use_center)
+            f.create_dataset("body_radius", data=model.radius)
+            f.create_dataset("free_radius",
+                             data=(np.ones(model.n_bodies, bool)
+                                   if mask.radius is None else mask.radius))
             f.create_dataset("free_c", data=mask.c)
             f.create_dataset("free_alpha", data=mask.alpha)
             f.create_dataset("free_beta", data=mask.beta)
@@ -64,9 +73,9 @@ def load_session(path: str | Path) -> dict:
 
     with h5py.File(path, "r") as f:
         version = int(f.attrs.get("session_version", -1))
-        if version not in (1, 2, SESSION_VERSION):
+        if version not in (1, 2, 3, SESSION_VERSION):
             raise ValueError(
-                f"session_version {version} is not 1, 2 or {SESSION_VERSION}")
+                f"session_version {version} is not 1, 2, 3 or {SESSION_VERSION}")
         out = {
             "labels": LabelStore.from_table(f["label_table"][()]),
             "source": json.loads(f.attrs["source"]),
@@ -88,6 +97,14 @@ def load_session(path: str | Path) -> dict:
                 theta_scale=float(info["theta_scale"]),
                 **{name: (f[name][()] if name in f else np.zeros(theta.size))
                    for name in ROTATIONS},
+                kind=(f["feature_kind"][()].astype(int)
+                      if "feature_kind" in f else None),
+                body=(f["feature_body"][()].astype(int)
+                      if "feature_body" in f else None),
+                use_center=(f["feature_use_center"][()].astype(bool)
+                            if "feature_use_center" in f else None),
+                radius=(f["body_radius"][()]
+                        if "body_radius" in f else None),
             )
             out["mask"] = FreeMask(
                 dx=bool(f.attrs["free_dx"]), dy=bool(f.attrs["free_dy"]),
@@ -97,5 +114,7 @@ def load_session(path: str | Path) -> dict:
                 features=f["free_features"][()].astype(bool),
                 **{name: bool(f.attrs.get(f"free_{name}", False))
                    for name in ROTATIONS},
+                radius=(f["free_radius"][()].astype(bool)
+                        if "free_radius" in f else None),
             )
     return out

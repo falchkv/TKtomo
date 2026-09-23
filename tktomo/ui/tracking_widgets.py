@@ -53,6 +53,19 @@ def feature_color(feature_id: int) -> tuple[int, int, int]:
     return FEATURE_COLORS[int(feature_id) % len(FEATURE_COLORS)]
 
 
+#: pyqtgraph symbol per tangent feature kind, pointing OUTWARD from the
+#: sphere so the marker says which side of it the label sits on. Keyed by
+#: `tktomo.tracking.model` kind codes; a point feature is not in here and
+#: keeps the plain circle.
+TANGENT_SYMBOL = {1: "t3", 2: "t2", 3: "t1", 4: "t"}
+
+
+def _circle(cu, cv, radius, n=64):
+    """Closed circle in data coordinates, for the sphere overlay."""
+    a = np.linspace(0.0, 2.0 * np.pi, n)
+    return cu + radius * np.cos(a), cv + radius * np.sin(a)
+
+
 class MarkableStackView(StackDisplay):
     """A StackDisplay that places labels and draws tracking overlays.
 
@@ -101,6 +114,12 @@ class MarkableStackView(StackDisplay):
         # can be sized to the physical feature and zoom with the image
         self._label_scatter = pg.ScatterPlotItem(pxMode=False)
         self._ghost_scatter = pg.ScatterPlotItem(pxMode=False)
+        # a tangent marker is a caret pointing out of the sphere, sized in
+        # SCREEN px: at data scale it would be the size of the bubble
+        self._tangent_scatter = pg.ScatterPlotItem(pxMode=True)
+        self._spheres = pg.PlotDataItem(
+            pen=pg.mkPen((255, 255, 255, 110), width=1,
+                         style=Qt.PenStyle.DashLine))
         self._pred_scatter = pg.ScatterPlotItem(
             size=11, symbol="x", pen=pg.mkPen((255, 255, 255, 200), width=1.5),
             brush=None, pxMode=True)
@@ -113,8 +132,10 @@ class MarkableStackView(StackDisplay):
         self._crop_rect = pg.PlotDataItem(
             pen=pg.mkPen((0, 255, 255, 200), width=1.5))
         self._texts: list[pg.TextItem] = []
-        for item in (self._trajectory, self._crop_rect, self._ghost_scatter,
+        for item in (self._trajectory, self._crop_rect, self._spheres,
+                     self._ghost_scatter,
                      self._pred_scatter, self._label_scatter,
+                     self._tangent_scatter,
                      self._probe_scatter):
             item.setZValue(10)
             view.addItem(item)
@@ -203,30 +224,49 @@ class MarkableStackView(StackDisplay):
     # -- overlays ---------------------------------------------------------
 
     def show_labels(self, labels, active_id: int | None = None,
-                    sizes: dict | None = None) -> None:
+                    sizes: dict | None = None, color_key: dict | None = None,
+                    feature_kinds: dict | None = None) -> None:
         """labels: (feature_id, u, v) or (feature_id, u, v, kind) tuples
         in the loaded frame; kind 1 (auto-placed) draws HOLLOW so the
         machine's work is distinguishable from the user's at a glance.
 
         `sizes` maps feature_id -> circle diameter in DATA pixels, so the
         marker can be matched to the physical feature it labels.
+        `color_key` maps feature_id -> the id its colour comes from, so
+        the members of one sphere can share a colour. `feature_kinds` maps
+        feature_id -> a tangent kind, which is drawn as an outward caret
+        at a fixed screen size instead of a circle: a caret says which
+        side of the sphere the label is on, and a circle the size of the
+        bubble would swallow the image.
         """
         view = self.image_view.getView()
         for text in self._texts:
             view.removeItem(text)
         self._texts.clear()
         spots = []
+        carets = []
         for entry in labels:
             fid, u, v = entry[0], entry[1], entry[2]
             kind = entry[3] if len(entry) > 3 else 0
-            color = feature_color(fid)
-            ring = 3 if (active_id is not None and fid == active_id) else 1.5
-            spots.append({
-                "pos": (u, v),
-                "size": float((sizes or {}).get(fid, 10.0)),
-                "pen": pg.mkPen(color, width=ring),
-                "brush": None if kind else pg.mkBrush(*color, 70),
-            })
+            color = feature_color((color_key or {}).get(fid, fid))
+            active = active_id is not None and fid == active_id
+            ring = 3 if active else 1.5
+            symbol = TANGENT_SYMBOL.get(int((feature_kinds or {}).get(fid, 0)))
+            if symbol is not None:
+                carets.append({
+                    "pos": (u, v),
+                    "symbol": symbol,
+                    "size": 15 if active else 11,
+                    "pen": pg.mkPen(color, width=ring),
+                    "brush": None if kind else pg.mkBrush(*color, 110),
+                })
+            else:
+                spots.append({
+                    "pos": (u, v),
+                    "size": float((sizes or {}).get(fid, 10.0)),
+                    "pen": pg.mkPen(color, width=ring),
+                    "brush": None if kind else pg.mkBrush(*color, 70),
+                })
             if not kind:      # auto labels stay untagged: less clutter
                 text = pg.TextItem(str(fid), color=color, anchor=(0.5, 1.3))
                 text.setPos(u, v)
@@ -234,13 +274,37 @@ class MarkableStackView(StackDisplay):
                 view.addItem(text)
                 self._texts.append(text)
         self._label_scatter.setData(spots)
+        self._tangent_scatter.setData(carets)
 
-    def show_ghosts(self, points, sizes: dict | None = None) -> None:
+    def show_spheres(self, circles) -> None:
+        """Dashed outlines of the fitted spheres: (u, v, radius) triples.
+
+        This is the check that a link is right: the circle should sit on
+        the bubble's wall in every view. None or empty clears it.
+        """
+        if not circles:
+            self._spheres.clear()
+            return
+        xs, ys = [], []
+        for cu, cv, radius in circles:
+            if not np.isfinite([cu, cv, radius]).all() or radius <= 0:
+                continue
+            x, y = _circle(float(cu), float(cv), float(radius))
+            xs.append(np.append(x, np.nan))
+            ys.append(np.append(y, np.nan))
+        if not xs:
+            self._spheres.clear()
+            return
+        self._spheres.setData(x=np.concatenate(xs), y=np.concatenate(ys),
+                              connect="finite")
+
+    def show_ghosts(self, points, sizes: dict | None = None,
+                    color_key: dict | None = None) -> None:
         """Faint markers of one feature's labels from OTHER frames:
         (feature_id, u, v) tuples, drawn at half size."""
         spots = []
         for fid, u, v in points:
-            color = feature_color(fid)
+            color = feature_color((color_key or {}).get(fid, fid))
             spots.append({
                 "pos": (u, v),
                 "size": float((sizes or {}).get(fid, 10.0)) / 2.0,
@@ -249,7 +313,8 @@ class MarkableStackView(StackDisplay):
             })
         self._ghost_scatter.setData(spots)
 
-    def show_predictions(self, points, active_id: int | None = None) -> None:
+    def show_predictions(self, points, active_id: int | None = None,
+                         color_key: dict | None = None) -> None:
         """Model-predicted positions: (feature_id, u, v) in the loaded
         frame ((u, v) pairs also accepted). The ACTIVE feature's cross is
         drawn in its feature color and larger; the rest stay white.
@@ -258,7 +323,8 @@ class MarkableStackView(StackDisplay):
         for p in points:
             fid, u, v = (None, *p) if len(p) == 2 else p
             active = active_id is not None and fid == active_id
-            color = feature_color(fid) if active else (255, 255, 255, 200)
+            color = (feature_color((color_key or {}).get(fid, fid))
+                     if active else (255, 255, 255, 200))
             spots.append({
                 "pos": (u, v),
                 "symbol": "x",

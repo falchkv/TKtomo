@@ -138,7 +138,9 @@ def test_tracker_pin_and_delete(tracker):
     truth = truth_for(tracker)
     label_from_truth(tracker, truth)
     tracker._fit_now()
-    tracker.feature_table.item(0, 8).setCheckState(Qt.CheckState.Checked)
+    from tktomo.ui.track_model_app import COL_PIN
+    tracker.feature_table.item(0, COL_PIN).setCheckState(
+        Qt.CheckState.Checked)
     assert 0 in tracker._pins
     tracker._fit_now()
     assert not tracker._mask.features[0]
@@ -1102,3 +1104,123 @@ def test_bin_survives_a_session_round_trip(tracker, tmp_path, monkeypatch):
     assert win._chain.rebin == 2
     assert win.bin_combo.currentData() == 2
     assert win._feature_sizes[1] == pytest.approx(5.0)
+
+
+# ------------------------------------------------- sphere tangent features
+
+def _sphere_truth(win, radius=9.0):
+    """Two spheres, each labelled by its left and its right apex."""
+    from tktomo.tracking.model import LAOS, RAOS
+
+    model = AxisModel.blank(win._stack.angles, np.arange(4),
+                            kind=np.array([LAOS, RAOS, LAOS, RAOS]),
+                            body=np.array([0, 0, 1, 1]),
+                            radius=np.array([radius, radius * 1.5]))
+    model.a = np.array([-20.0, -20.0, 22.0, 22.0])
+    model.b = np.array([14.0, 14.0, -11.0, -11.0])
+    model.y = np.array([40.0, 40.0, 80.0, 80.0])
+    model.c_coef[0] = 64.0
+    return model
+
+
+def _label_tangents(win, truth, every=4):
+    from tktomo.ui.track_model_app import KIND_ORDER
+
+    u_t, v_t = truth.predict()
+    for f in range(truth.feature_ids.size):
+        win._set_active(f)
+        win._kinds[f] = int(truth.kind[f])
+        for view in range(0, win._stack.angles.size, every):
+            win._set_view(view)
+            win._place(u_t[f, view], v_t[f, view])
+    assert KIND_ORDER[0] == 0
+
+
+def test_tracker_link_shares_a_centre_and_a_radius(tracker):
+    truth = _sphere_truth(tracker)
+    _label_tangents(tracker, truth)
+    tracker._fit_now()
+    # unlinked: four separate bodies, each with its own free offset
+    assert tracker._model.n_bodies == 4
+
+    for pair in ((0, 1), (2, 3)):
+        tracker.feature_table.clearSelection()
+        for row in pair:
+            tracker.feature_table.selectRow(row)
+            tracker.feature_table.setSelectionMode(
+                tracker.feature_table.SelectionMode.MultiSelection)
+        tracker._link_selected()
+        tracker.feature_table.setSelectionMode(
+            tracker.feature_table.SelectionMode.ExtendedSelection)
+    tracker._fit_now()
+
+    m = tracker._model
+    assert m.n_bodies == 2
+    assert m.a[0] == pytest.approx(m.a[1])
+    assert m.b[0] == pytest.approx(m.b[1])
+    assert m.radius[0] == pytest.approx(9.0, abs=0.05)
+    assert m.radius[1] == pytest.approx(13.5, abs=0.05)
+    assert tracker._fit.rms_u < 1e-6
+    # the two members wear the same colour, which is the sphere's
+    from tktomo.ui.track_model_app import COL_SPHERE
+
+    assert tracker._group_of(0) == tracker._group_of(1)
+    assert tracker.feature_table.item(0, COL_SPHERE).text() == "0"
+
+    tracker.feature_table.clearSelection()
+    tracker.feature_table.selectRow(1)
+    tracker._unlink_selected()
+    assert tracker._group_of(0) != tracker._group_of(1)
+
+
+def test_tracker_tangent_labels_give_no_dy(tracker):
+    truth = _sphere_truth(tracker)
+    _label_tangents(tracker, truth)
+    tracker._fit_now()
+    fit = tracker._fit
+    assert fit.obs_v[0].size == 0          # nothing observes v at all
+    assert not fit.observed_dy.any()
+    assert fit.observed_dx.any()
+
+
+def test_tracker_centre_box_opens_the_vertical(tracker):
+    from tktomo.ui.track_model_app import COL_CTR
+
+    truth = _sphere_truth(tracker)
+    _label_tangents(tracker, truth)
+    tracker._fit_now()
+    assert tracker._fit.obs_v[0].size == 0
+    tracker.feature_table.item(0, COL_CTR).setCheckState(
+        Qt.CheckState.Checked)
+    assert 0 in tracker._use_center
+    tracker._fit_now()
+    assert tracker._fit.obs_v[0].size > 0
+
+
+def test_tracker_sphere_state_survives_a_session(tracker, tmp_path,
+                                                 monkeypatch):
+    truth = _sphere_truth(tracker)
+    _label_tangents(tracker, truth)
+    tracker.feature_table.clearSelection()
+    tracker._group[1] = 0
+    tracker._use_center.add(2)
+    tracker._fit_now()
+    path = tmp_path / "spheres.h5"
+    monkeypatch.setattr(
+        "tktomo.ui.track_model_app.QFileDialog.getSaveFileName",
+        lambda *a, **k: (str(path), ""))
+    tracker._save_session()
+
+    win2 = TrackModelWindow()
+    monkeypatch.setattr(
+        "tktomo.ui.track_model_app.QFileDialog.getOpenFileName",
+        lambda *a, **k: (str(path), ""))
+    win2._load_session()
+    try:
+        assert win2._kind_of(0) == truth.kind[0]
+        assert win2._group_of(1) == 0
+        assert 2 in win2._use_center
+        assert win2._model.n_bodies == 3
+        assert win2._radii[0] == pytest.approx(9.0, abs=0.2)
+    finally:
+        win2.close()

@@ -63,6 +63,47 @@ Views without labels get no dx/dy columns; after the solve they are filled
 by PCHIP interpolation over angle and flagged, so plots and exports can
 distinguish measured from interpolated.
 
+Tangent features (`POINT`, `LAOS`, `RAOS`, `TAOS`, `BAOS`): features
+linked into one BODY share a centre (a, b, y) and a radius R. The model
+reads an object point out as u = m1.p + c + dx, v = m2.p + dy with
+m1 = e_s', m2 = alpha e_s' + beta e_t' + e_z' (the dual basis the ASTRA
+export is built on). A linear functional is extremal over a sphere at
+p = centre +- R m/|m|, so with |m1| = 1, |m2| = sqrt(1 + alpha^2 + beta^2)
+and m1.m2 = alpha:
+
+    laos/raos (s = -1/+1):  u = u_c + s R        v = v_c + s R alpha
+    taos/baos (s = -1/+1):  v = v_c + s R |m2|   u = u_c + s R alpha/|m2|
+
+Exact, not first order, and invariant to the per-view rotations, since a
+sphere projects to a disc of radius R under any orientation.
+`AxisModel.tangent_scales` is the one place those coefficients live and
+`tests/test_tangent_features.py` pins them against an extremum derived
+from `project` alone, tilts and rotations on.
+
+A tangent constrains ONE coordinate. The other is the centre's, exact for
+a sphere and false for a lopsided void, so it enters only where
+`use_center` says so. Hence two observation lists (`split_validity`,
+`FitResult.obs_u`/`obs_v`, `observed_dx`/`observed_dy`): the u stage and
+the v stage have their own rows, their own compaction maps and their own
+shift columns, so a view carrying only tangent labels gets a dx column
+and no dy one. The (a, b, y, R) blocks are per body, which is how the
+members share them, and body == arange for a point-only model so that fit
+is unchanged. A body with no vertical observation has no identifiable
+height: it reaches u only through rot_beam, so it is seeded from the
+clicked v as a nuisance value and held fixed, which also keeps it out of
+the vertical regauge (W11).
+
+The radius sits in the u system for a horizontal tangent and the v system
+for a vertical one, so a sphere labelled on both axes shares a parameter
+between the stages, which a two-stage solve cannot own: that case goes to
+the joint pass (`radius_couples_stages`). The radius stays OUT of the
+gauge basis, because a uniform translation does not change a radius. A
+body whose observations all ride on the same side has its radius and its
+centre exactly degenerate (W9), and if every one of them does, c is not
+identifiable at all (W8). The half-split diagnostics split by BODY, not by
+feature: two members of one sphere in opposite halves would put the same
+measurement in both and flatter every number.
+
 Per-view rotations (rot_horiz, rot_beam, rot_axis, rad, `AxisModel`):
 the beam frame rotated relative to the object by w in its own axes,
 p' = R(-w) p with p = (s, t, y) and R the Rodrigues rotation
@@ -97,6 +138,27 @@ the angles drift into near-degenerate directions with the feature
 heights and tilts, which is why the window caps sigma there. The mask
 defaults the rotations to fixed, so `FreeMask.all_free` and a missing
 mask still give the plain fit.
+
+Apex detectors (`tracking/apexdetect.py`) are the fourth registry in the
+repo, alongside aligners, recon backends and colormaps, and for the same
+reason: the window enumerates it, so a registered detector reaches the
+dropdown with no UI change. A detector answers
+`detect(frame, axis) -> (N, 4)` of (u, v, score, sign) and declares the
+`native_bin` its absolute pixel scales were tuned for, which
+`run_autotrack` then forces. The job carries only the NAME across the
+wire and the server resolves it in its own registry, so nothing about a
+detector has to be serialisable and a detector trained on a sample never
+enters this package. `TKTOMO_APEX_PLUGINS` names the modules to import,
+once, reported rather than raised on failure.
+
+`ApexMatcher` takes the detection NEAREST the prediction inside the box,
+not the highest scoring one: inside a box this small the anchored
+prediction is the better evidence, and the score is then an independent
+report on what was chosen rather than the reason it was chosen. The
+coordinate the feature does not constrain is gated generously and copied
+from the prediction, so an apex auto label still never becomes a centre
+observation. One `DetectionCache` per run holds one pass per (frame,
+axis) for every feature, since detection is whole-frame work.
 
 ## 4. Conventions pinned by tests
 

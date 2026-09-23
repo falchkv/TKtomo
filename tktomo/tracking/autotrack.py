@@ -541,6 +541,16 @@ class AutoTrackJob:
     seeds: tuple                    # ((view, u, v), ...)
     params: AutoTrackParams
     track_bin: int = 0
+    #: the feature kind (`tracking.model.POINT` and friends). A tangent
+    #: feature goes to the 1D edge matcher instead of the blob one, and
+    #: its coherence gate is switched off: an apex IS an edge, which is
+    #: the very thing that gate exists to refuse.
+    kind: int = 0
+    #: the name of a registered apex detector to snap to instead of
+    #: correlating (`tracking.apexdetect`). Empty means the 1D matcher.
+    #: Only the NAME crosses the wire: the server looks it up in its own
+    #: registry, so nothing about a detector has to be serialisable.
+    detector: str = ""
 
 
 class BinnedFrames:
@@ -619,6 +629,16 @@ def run_autotrack(base, theta, jobs, *, hp_sigma: float, matcher,
                   cancelled=None, served_bin: int = 1) -> list:
     """Complete every job's track; returns [(fid, TrackResult)].
 
+    `matcher` is used for point features. A job whose `kind` is a tangent
+    gets a `tktomo.tracking.edgetrack.EdgeMatcher` on the axis that kind
+    constrains, with the coherence gate lifted, and reports a plain
+    correlation rather than the learned probability. A job that also names
+    a `detector` gets an `ApexMatcher` on that registered detector
+    instead, which snaps to a detected apex rather than following the
+    edge, tracks on the detector's own grid (its pixel scales are
+    absolute) and reports the detector's confidence. One detection pass
+    per frame is shared by every job that wants it.
+
     `base` is the stack on the file's grid and `served_bin` the mean-pool
     factor of the grid the job's seeds are expressed in (what the window
     shows). Each job tracks on its own `track_bin` grid: the seeds are
@@ -635,10 +655,31 @@ def run_autotrack(base, theta, jobs, *, hp_sigma: float, matcher,
     from dataclasses import replace  # noqa: PLC0415
 
     from tktomo.tracking.coords import regrid_uv  # noqa: PLC0415
+    from tktomo.tracking.apexdetect import get_apex_detector  # noqa: PLC0415
+    from tktomo.tracking.edgetrack import (  # noqa: PLC0415
+        ApexMatcher,
+        DetectionCache,
+        EdgeMatcher,
+        axis_for_kind,
+        sign_for_kind,
+    )
 
     cache = cache if cache is not None else HighpassCache()
     theta = np.asarray(theta, float)
     served_bin = int(served_bin)
+    # a job that names a detector tracks on the DETECTOR's grid, whatever
+    # the feature size implies: its scale parameters are absolute pixels
+    # and the wrong grid misbehaves silently
+    jobs = list(jobs)
+    detectors = {}
+    for i, job in enumerate(jobs):
+        name = str(getattr(job, "detector", "") or "")
+        if not name or axis_for_kind(getattr(job, "kind", 0)) is None:
+            continue
+        det = get_apex_detector(name)
+        detectors[i] = det
+        jobs[i] = replace(job, track_bin=int(det.native_bin))
+    detect_caches: dict = {}
     out = [None] * len(jobs)
     # jobs sharing a grid run back to back so the one-entry cache serves them
     order = sorted(range(len(jobs)),
@@ -660,8 +701,27 @@ def run_autotrack(base, theta, jobs, *, hp_sigma: float, matcher,
         radius = min(float(job.params.search_radius) * served_bin / b,
                      max_search_radius(job.params.patch))
         params = replace(job.params, search_radius=radius)
+        job_matcher = matcher
+        how = "blob"
+        axis = axis_for_kind(getattr(job, "kind", 0))
+        if axis is not None:
+            job_matcher = EdgeMatcher(axis=axis)
+            how = "edge-1d"
+            # the structure-tensor gate refuses edge-like seeds, which is
+            # every tangent feature there is
+            params = replace(params, max_coherence=float("inf"))
+        det = detectors.get(idx)
+        if det is not None:
+            key = (id(det), b)
+            if key not in detect_caches:
+                detect_caches[key] = DetectionCache(det, frames)
+            job_matcher = ApexMatcher(
+                cache=detect_caches[key], axis=axis,
+                sign=sign_for_kind(job.kind),
+                across_tol=max(4.0 * radius, 8.0))
+            how = f"apex:{det.name}"
         result = complete_track(hp, theta, seeds, params,
-                                cancelled=cancelled, matcher=matcher)
+                                cancelled=cancelled, matcher=job_matcher)
         if result.cancelled:
             return []
         result.labels = [
@@ -669,6 +729,7 @@ def run_autotrack(base, theta, jobs, *, hp_sigma: float, matcher,
             for al in result.labels
             for su, sv in [regrid_uv(al.u, al.v, b, served_bin)]]
         result.stats.update({"track_bin": b, "served_bin": served_bin,
-                             "hp_sigma_track_px": float(hp_sigma)})
+                             "hp_sigma_track_px": float(hp_sigma),
+                             "matcher": how})
         out[idx] = (job.fid, result)
     return out

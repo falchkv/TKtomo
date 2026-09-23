@@ -273,7 +273,8 @@ def reject_auto_outliers(store: "LabelStore", fit, feature_ids,
     """Remove AUTO labels whose fit residual exceeds `limit` (raw px).
 
     `fit` is a `FitResult` from `solve_model`/`residuals` over arrays built
-    with `store.to_arrays(n_views, feature_ids)`, so `fit.obs` indexes rows
+    with `store.to_arrays(n_views, feature_ids)`, so `fit.obs_u` and
+    `fit.obs_v` index rows
     of `feature_ids`. Manual labels are never touched: a human click is
     evidence, an auto label is a guess. Returns the number removed.
 
@@ -284,12 +285,19 @@ def reject_auto_outliers(store: "LabelStore", fit, feature_ids,
     alignment test (dx rms 2.95 -> 2.43 raw px at 10-view anchors).
     """
     ids = np.asarray(feature_ids, int)
-    i, j = fit.obs
-    bad = (np.abs(fit.residual_u) > limit) | (np.abs(fit.residual_v) > limit)
     n = 0
-    for fi, vj in zip(i[bad], j[bad]):
-        fid, view = int(ids[fi]), int(vj)
-        if store.kind_of(fid, view) == KIND_AUTO:
-            store.remove(fid, view)
-            n += 1
+    seen = set()
+    # The two coordinates have their own observation lists once tangent
+    # features exist, so a label can be an outlier in either.
+    for (i, j), res in ((fit.obs_u, fit.residual_u),
+                        (fit.obs_v, fit.residual_v)):
+        bad = np.abs(res) > limit
+        for fi, vj in zip(i[bad], j[bad]):
+            fid, view = int(ids[fi]), int(vj)
+            if (fid, view) in seen:
+                continue
+            seen.add((fid, view))
+            if store.kind_of(fid, view) == KIND_AUTO:
+                store.remove(fid, view)
+                n += 1
     return n

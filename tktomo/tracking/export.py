@@ -40,8 +40,13 @@ from tktomo.tracking.model import AxisModel, FitResult, FreeMask
 # version-1 files are still readable (LabelStore.from_table accepts both).
 # version 3: per-view rotations and their free flags; older files load
 # with the rotations at zero and fixed.
-MODEL_VERSION = 3
+# version 4: feature kinds, the bodies they share, the sphere radii, and
+# the two observation lists; older files load as all-point features, each
+# its own body, no radii.
+MODEL_VERSION = 4
 ROTATIONS = ("rot_horiz", "rot_beam", "rot_axis")
+#: per-feature and per-body datasets added in version 4
+KINDS = ("feature_kind", "feature_body", "feature_use_center")
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +67,8 @@ def write_model_h5(path: str | Path, fit: FitResult, mask: FreeMask,
     import h5py  # noqa: PLC0415
 
     m = fit.model
-    i, j = fit.obs
+    iu, ju = fit.obs_u
+    iv, jv = fit.obs_v
     with h5py.File(path, "w") as f:
         f.attrs["model_version"] = MODEL_VERSION
         f.attrs["model"] = json.dumps({
@@ -85,12 +91,27 @@ def write_model_h5(path: str | Path, fit: FitResult, mask: FreeMask,
                      "a", "b", "y", *ROTATIONS):
             f.create_dataset(name, data=getattr(m, name))
         f.create_dataset("feature_id", data=m.feature_ids)
+        f.create_dataset("feature_kind", data=m.kind)
+        f.create_dataset("feature_body", data=m.body)
+        f.create_dataset("feature_use_center", data=m.use_center)
+        f.create_dataset("body_radius", data=m.radius)
+        f.create_dataset("free_radius",
+                         data=(np.ones(m.n_bodies, bool)
+                               if mask.radius is None else mask.radius))
         f.create_dataset("observed_views", data=fit.observed_views)
+        f.create_dataset("observed_dx", data=fit.observed_dx)
+        f.create_dataset("observed_dy", data=fit.observed_dy)
         table = f.create_dataset("label_table", data=labels.to_table())
         table.attrs["columns"] = ("feature_id view u_raw v_raw kind "
                                   "quality (kind: 0 manual, 1 auto)")
-        f.create_dataset("obs_i", data=i)
-        f.create_dataset("obs_j", data=j)
+        # obs_i/obs_j are the u observations, kept under their old names
+        # for readers that predate the split
+        f.create_dataset("obs_i", data=iu)
+        f.create_dataset("obs_j", data=ju)
+        f.create_dataset("obs_u_i", data=iu)
+        f.create_dataset("obs_u_j", data=ju)
+        f.create_dataset("obs_v_i", data=iv)
+        f.create_dataset("obs_v_j", data=jv)
         f.create_dataset("residual_u", data=fit.residual_u)
         f.create_dataset("residual_v", data=fit.residual_v)
         f.create_dataset("weight_u", data=fit.weight_u)
@@ -116,9 +137,9 @@ def read_model_h5(path: str | Path) -> dict:
 
     with h5py.File(path, "r") as f:
         version = int(f.attrs.get("model_version", -1))
-        if version not in (1, 2, MODEL_VERSION):
+        if version not in (1, 2, 3, MODEL_VERSION):
             raise ValueError(
-                f"model_version {version} is not 1, 2 or {MODEL_VERSION}")
+                f"model_version {version} is not 1, 2, 3 or {MODEL_VERSION}")
         info = json.loads(f.attrs["model"])
         theta = f["theta_rad"][()]
         model = AxisModel(
@@ -132,6 +153,13 @@ def read_model_h5(path: str | Path) -> dict:
             theta_scale=float(info["theta_scale"]),
             **{name: (f[name][()] if name in f else np.zeros(theta.size))
                for name in ROTATIONS},
+            kind=(f["feature_kind"][()].astype(int)
+                  if "feature_kind" in f else None),
+            body=(f["feature_body"][()].astype(int)
+                  if "feature_body" in f else None),
+            use_center=(f["feature_use_center"][()].astype(bool)
+                        if "feature_use_center" in f else None),
+            radius=(f["body_radius"][()] if "body_radius" in f else None),
         )
         mask = FreeMask(
             dx=bool(f.attrs["free_dx"]), dy=bool(f.attrs["free_dy"]),
@@ -141,12 +169,20 @@ def read_model_h5(path: str | Path) -> dict:
             features=f["free_features"][()].astype(bool),
             **{name: bool(f.attrs.get(f"free_{name}", False))
                for name in ROTATIONS},
+            radius=(f["free_radius"][()].astype(bool)
+                    if "free_radius" in f else None),
         )
         out = {
             "model": model,
             "mask": mask,
             "labels": LabelStore.from_table(f["label_table"][()]),
             "observed_views": f["observed_views"][()].astype(bool),
+            "observed_dx": (f["observed_dx"][()].astype(bool)
+                            if "observed_dx" in f
+                            else f["observed_views"][()].astype(bool)),
+            "observed_dy": (f["observed_dy"][()].astype(bool)
+                            if "observed_dy" in f
+                            else f["observed_views"][()].astype(bool)),
             "provenance": json.loads(f.attrs["provenance"]),
         }
         if "diagnostics" in f.attrs:
@@ -208,7 +244,8 @@ def write_slogger_shifts(path: str | Path, fit: FitResult,
         f.attrs["center_split_px"] = split
         f.attrs["center_reliable"] = bool(np.isfinite(split) and split <= 5.0)
         f.attrs["axis_tilt_rad"] = float(m.alpha_coef[0])
-        f.attrs["n_tracks_used"] = int(m.feature_ids.size)
+        # one entry per BODY: the two members of a sphere are one track
+        f.attrs["n_tracks_used"] = int(m.n_bodies)
         f.attrs["source"] = source
         f.attrs["binning"] = b
 

@@ -44,6 +44,66 @@ parameter (three passes), each angle under a Gaussian prior whose rms
 you set, weighed against the label noise. Without them the fit is bit
 for bit the two-stage one.
 
+## Feature kinds
+
+A feature is a plain **point** by default: a fixed object point, both of
+whose coordinates the label observes. It can instead be one of the four
+silhouette tangents of a sphere, which is what a bubble in a foam gives
+you when no point on it is trackable:
+
+| kind | sits at | observes |
+|---|---|---|
+| `laos` | the smaller u | u only |
+| `raos` | the larger u | u only |
+| `taos` | the smaller v, the visual top | v only |
+| `baos` | the larger v, the visual bottom | v only |
+
+Set the kind in the table's second column. Select two or more rows and
+press **Link** to join them into one sphere: the members then share a
+centre and a diameter, and the R column is that sphere's radius. **Unlink**
+takes a row back out. A sphere holds at most one apex of each kind, and a
+point feature may join it as a label of its centre.
+
+Why linking is worth doing. The midpoint of two opposite tangents is the
+projected centre at every angle, for any centrally symmetric body,
+sphere or not. So a linked left and right pair is an exact point feature
+that no single click could have produced. The constant diameter is the
+extra assumption, and what it buys is that a view showing only one edge
+still constrains the centre.
+
+A sphere labelled on ONE side only is allowed and warns (W9): shifting
+the axis and that radius together is invisible, so it carries the shifts
+and tells you nothing about the centre. Type a diameter you measured
+elsewhere into the R column, as a radius, and it counts again. If every
+horizontal observation comes from such a sphere, the axis position is not
+a measurement at all, and W8 says so. A radius that comes out negative
+means the members are the wrong way round (W10).
+
+The **ctr** checkbox lets the across-axis coordinate of a tangent click
+count as an observation of the sphere's centre: the widest point of a
+projected sphere sits exactly at the centre height. It is off by default,
+because that is exact for a round bubble and false for a lopsided void.
+Off, a laos is purely horizontal, and a view carrying only apex labels
+has no vertical information, so it gets no `dy` of its own and is marked
+interpolated in the plots.
+
+The markers say which kind they are: a point keeps its circle at the
+marker size, a tangent is a caret pointing out of the sphere at a fixed
+screen size, and each sphere is drawn as a dashed circle at its fitted
+centre and diameter. That circle sitting on the bubble's wall in every
+view is the check that a link is right, and it catches a swapped pair
+faster than any number in the table.
+
+The geometry is exact rather than approximate, tilts and per-view
+rotations included, because a sphere projects to a disc of radius R under
+any orientation. `tracking/model.py` derives it from the same dual basis
+the ASTRA export is built on, and a test pins it against an extremum
+computed from `project` alone.
+
+The **size** column still means how precisely you can click, which is what
+the 1/size weighting is about. For an apex that is the sharpness of the
+edge, NOT the size of the bubble, which lives in its own column.
+
 ## Labeling
 
 Digits 0 to 9 pick the active feature (the table picks any id), left click
@@ -148,6 +208,50 @@ and says so in the report.
 The search radius is entered in raw px so it means the same at every
 binning, and its maximum is what the template can see: 18 track px,
 which the box converts.
+
+**Tangent features track differently.** An apex IS an edge, and the
+coherence gate above exists to refuse edges, so a laos, raos, taos or
+baos goes to a one-dimensional matcher instead: it cuts a short profile
+along the axis that kind constrains, averaged over a few rows across it,
+and phase-correlates it against the same profile at the nearest manual
+seed. It searches along that one axis, and the other coordinate it
+returns is the prediction, untouched. An auto label on a tangent feature
+therefore never counts as a centre observation, whatever its ctr box
+says. Its quality is a plain correlation coefficient, not the learned
+probability the "min p" default was measured for, so read that threshold
+differently here. A second gate asks the correlation peak to beat its
+best rival, because a field of bubbles offers many similar edges.
+
+**A trained detector instead.** The **apex matcher** dropdown picks what
+a tangent feature is completed with. "Edge correlation (1D)" is the
+above. Anything else is a registered apex DETECTOR: it finds the apexes
+in each frame itself and takes the one nearest the prediction on the
+right side of its body, so it cannot drift along a wall, and its quality
+is the detector's own confidence, which is what "min p" was meant to
+threshold. It forces the tracking grid to the one it was tuned on,
+because its pixel scales are absolute, and one detection pass per frame
+is shared by every feature.
+
+Which to use is a measurement, not a preference. On a short run of frames
+differing only by a shift, correlation wins on every count: it is the
+ideal case for a correlator, and it was 20 times faster at 0.05 raw px
+against the detector's 0.12, with full coverage against 49 of 54 views.
+The detector's claim is the one that case cannot test, that it does not
+drift and does not decorrelate, so reach for it on long marches and where
+a neighbouring wall sits close. The gaps it leaves are detection
+dropouts, not match failures: measured on the spent-catalyst projections,
+the production detector fires on a given apex in about seven frames out of
+ten, which is why a looser variant is usually registered beside it.
+
+A detector for a particular sample does not ship with TKtomo, because it
+is about that sample. Put it in the analysis that owns the data and name
+its module in the `TKTOMO_APEX_PLUGINS` environment variable, comma
+separated, with the module on the PYTHONPATH. It is imported once, on the
+laptop and on the compute node alike, so set it in both places when the
+stack is remote. A plugin that fails to import is reported under the
+dropdown rather than stopping the window. The chosen detector is saved
+with the session, and a session naming one that is not registered here
+falls back to edge correlation instead of failing to load.
 
 Auto labels are drawn as HOLLOW circles (same color and size), carry
 their match quality, and enter the fit at full weight: the Huber loop

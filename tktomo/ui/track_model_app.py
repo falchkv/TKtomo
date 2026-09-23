@@ -69,17 +69,28 @@ from tktomo.tracking.export import (
     write_model_h5,
     write_slogger_shifts,
 )
+from tktomo.tracking.apexdetect import (
+    available_apex_detectors,
+    plugin_problems,
+)
 from tktomo.tracking.autotrack import (
     TRACK_PATCH,
     choose_track_bin,
     max_search_radius,
 )
-from tktomo.tracking.labels import LabelStore
+from tktomo.tracking.labels import KIND_AUTO, LabelStore
 from tktomo.tracking.model import (
+    BAOS,
+    LAOS,
+    POINT,
+    RAOS,
+    TAOS,
     AxisModel,
     FreeMask,
+    compact_bodies,
     residuals,
     solve_model,
+    split_validity,
 )
 from tktomo.tracking.recon import plan_slice
 from tktomo.tracking.stacksource import (
@@ -101,6 +112,16 @@ from tktomo.ui.tracking_widgets import (
 #: labels the active feature needs before "follow the prediction"
 #: pans to the model's guess: fewer and the guess is not worth chasing
 FOLLOW_MIN_LABELS = 4
+
+# feature table columns, by name because there are now thirteen of them
+(COL_ID, COL_KIND, COL_SPHERE, COL_N, COL_RMS_U, COL_RMS_V, COL_A, COL_B,
+ COL_Y, COL_R, COL_CTR, COL_SIZE, COL_PIN) = range(13)
+FEATURE_COLUMNS = ["id", "kind", "sphere", "n", "rms u", "rms v",
+                   "a", "b", "y", "R", "ctr", "size", "pin"]
+#: the order the kind combo offers, and the label each kind wears
+KIND_ORDER = (POINT, LAOS, RAOS, TAOS, BAOS)
+KIND_LABELS = {POINT: "point", LAOS: "laos (left)", RAOS: "raos (right)",
+               TAOS: "taos (top)", BAOS: "baos (bottom)"}
 
 # defaults, "labels per view" is the direct where-am-I-missing-data view
 PLOT_KINDS = [
@@ -225,6 +246,13 @@ class TrackModelWindow(QMainWindow):
         self._diagnostics: dict | None = None
         self._pins: set[int] = set()
         self._feature_sizes: dict[int, float] = {}   # loaded px, default 10
+        # feature kinds and the spheres they belong to. The group key is
+        # an arbitrary feature id shared by the members, which `_sync_model`
+        # turns into the model's compact body indices.
+        self._kinds: dict[int, int] = {}             # fid -> kind
+        self._group: dict[int, int] = {}             # fid -> group key
+        self._use_center: set[int] = set()           # fids
+        self._radii: dict[int, float] = {}           # group key -> raw px
         self._probe: tuple[float, float, float] | None = None  # (a, b, y) raw
         self._last_recon_info: dict | None = None
         self._active = 0
@@ -514,14 +542,39 @@ class TrackModelWindow(QMainWindow):
 
         feat_box = QGroupBox("Features (digit keys switch, click places)")
         feat_layout = QVBoxLayout(feat_box)
-        self.feature_table = QTableWidget(0, 9)
-        self.feature_table.setHorizontalHeaderLabels(
-            ["id", "n", "rms u", "rms v", "a", "b", "y", "size", "pin"])
-        self.feature_table.horizontalHeaderItem(7).setToolTip(
+        self.feature_table = QTableWidget(0, len(FEATURE_COLUMNS))
+        self.feature_table.setHorizontalHeaderLabels(FEATURE_COLUMNS)
+        self.feature_table.horizontalHeaderItem(COL_SIZE).setToolTip(
             "Marker diameter in image pixels. Match it to the feature: "
             "the fit weights each feature's labels by 1/size, because a "
             "click on a large diffuse feature localizes it less than one "
-            "on a small sharp feature.")
+            "on a small sharp feature. For an apex this is how precisely "
+            "you can click the edge, NOT the size of the bubble, which "
+            "lives in the R column.")
+        self.feature_table.horizontalHeaderItem(COL_KIND).setToolTip(
+            "point: a fixed object point, both coordinates observed.\n"
+            "laos / raos: the apex of a sphere at the smaller / larger u, "
+            "which observes u only.\n"
+            "taos / baos: the apex at the smaller / larger v (the visual "
+            "top / bottom), which observes v only.")
+        self.feature_table.horizontalHeaderItem(COL_SPHERE).setToolTip(
+            "Which sphere this feature belongs to. Linked features share "
+            "one centre and one diameter, which is what makes a left and "
+            "right pair worth more than two separate labels: their "
+            "midpoint is the projected centre at every angle.")
+        self.feature_table.horizontalHeaderItem(COL_R).setToolTip(
+            "The sphere's RADIUS in raw pixels, shared by its members and "
+            "fitted like a, b and y. Type a diameter you measured "
+            "elsewhere (as a radius) to give a sphere labelled on one "
+            "side only something to hold on to. The next fit overwrites "
+            "it unless the sphere is pinned.")
+        self.feature_table.horizontalHeaderItem(COL_CTR).setToolTip(
+            "Also use the OTHER coordinate of this click as an "
+            "observation of the sphere centre. The widest point of a "
+            "projected sphere sits exactly at the centre height, so this "
+            "is true for a round bubble and false for a lopsided void. "
+            "Off by default, which keeps an apex purely horizontal or "
+            "purely vertical.")
         self.feature_table.verticalHeader().hide()
         self.feature_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows)
@@ -536,6 +589,22 @@ class TrackModelWindow(QMainWindow):
         feat_row.addWidget(new_btn)
         feat_row.addWidget(drop_btn)
         feat_layout.addLayout(feat_row)
+        link_row = QHBoxLayout()
+        link_btn = QPushButton("Link")
+        link_btn.setToolTip(
+            "Join the selected rows into one sphere: they then share a "
+            "centre and a diameter. Two members of the same kind cannot "
+            "belong to one sphere. The radius is seeded from a view where "
+            "two opposite apexes are both labelled.")
+        link_btn.clicked.connect(self._link_selected)
+        unlink_btn = QPushButton("Unlink")
+        unlink_btn.setToolTip(
+            "Take the selected rows out of their sphere. Each becomes its "
+            "own body again, with its own centre and its own radius.")
+        unlink_btn.clicked.connect(self._unlink_selected)
+        link_row.addWidget(link_btn)
+        link_row.addWidget(unlink_btn)
+        feat_layout.addLayout(link_row)
         adv_row = QHBoxLayout()
         self.active_label = QLabel("active feature: 0")
         adv_row.addWidget(self.active_label, 1)
@@ -581,6 +650,33 @@ class TrackModelWindow(QMainWindow):
         run_row.addWidget(self.auto_feature_btn)
         run_row.addWidget(self.auto_all_btn)
         auto_layout.addLayout(run_row)
+        apex_row = QHBoxLayout()
+        apex_row.addWidget(QLabel("apex matcher"))
+        self.apex_detector = QComboBox()
+        self.apex_detector.addItem("edge correlation (1D)", "")
+        for name in available_apex_detectors():
+            self.apex_detector.addItem(name, name)
+        self.apex_detector.setToolTip(
+            "How a laos, raos, taos or baos is auto-completed. Point "
+            "features ignore this and always use the blob matcher.\n"
+            "Edge correlation follows the edge by correlating a short 1D "
+            "profile against the nearest manual seed: it needs no training "
+            "and knows nothing about what an apex is, so its quality is a "
+            "plain correlation coefficient.\n"
+            "A detector snaps to an apex it FOUND in the frame, so it "
+            "cannot drift along a wall, and its quality is the detector's "
+            "own confidence, which is what the min p box was meant to "
+            "threshold. It also forces the tracking grid to the one it was "
+            "tuned on, because its pixel scales are absolute.")
+        apex_row.addWidget(self.apex_detector, 1)
+        auto_layout.addLayout(apex_row)
+        problems = plugin_problems()
+        if problems:
+            warn = QLabel("apex detector plugin not loaded: "
+                          + "; ".join(problems))
+            warn.setWordWrap(True)
+            warn.setStyleSheet("color: rgb(220, 120, 60);")
+            auto_layout.addWidget(warn)
         param_row = QHBoxLayout()
         self._learned_ok, self._learned_why = self._stack.autotrack_available()
         self.auto_thr_label = QLabel("min p")
@@ -989,7 +1085,14 @@ class TrackModelWindow(QMainWindow):
         theta = self._stack.angles
         degrees = (self.deg_c.value(), self.deg_a.value(), self.deg_b.value())
         old = self._model
-        model = AxisModel.blank(theta, np.asarray(ids, int), degrees)
+        ids_i = np.asarray(ids, int)
+        kinds = np.array([self._kind_of(f) for f in ids_i], int)
+        body, keys = compact_bodies([self._group_of(f) for f in ids_i])
+        self._body_keys = keys
+        radius = np.array([self._radii.get(int(k), 0.0) for k in keys], float)
+        use_center = np.array([int(f) in self._use_center for f in ids_i], bool)
+        model = AxisModel.blank(theta, ids_i, degrees, kind=kinds, body=body,
+                                use_center=use_center, radius=radius)
         if old is not None and old.theta.size == theta.size:
             model.c_coef[:] = np.resize(old.c_coef, model.c_coef.shape)
             model.alpha_coef[:] = np.resize(old.alpha_coef,
@@ -1132,6 +1235,12 @@ class TrackModelWindow(QMainWindow):
             return forced
         return choose_track_bin(self._feature_size(fid) * self._chain.rebin)
 
+    def _apex_detector_name(self) -> str:
+        """The registered detector the apex matcher should use, or ""."""
+        if not hasattr(self, "apex_detector"):
+            return ""
+        return str(self.apex_detector.currentData() or "")
+
     def _refresh_auto_grid(self) -> None:
         """Tell the user what the next run will do for the active feature,
         and cap the search radius at what the template can see."""
@@ -1154,6 +1263,31 @@ class TrackModelWindow(QMainWindow):
         if fid not in self._feature_sizes:
             text += (" The marker size is the default 10 px: set it to the "
                      "feature's real size in the table.")
+        if self._kind_of(fid) != POINT:
+            axis = "u" if self._kind_of(fid) in (LAOS, RAOS) else "v"
+            name = self._apex_detector_name()
+            if name:
+                from tktomo.tracking.apexdetect import (  # noqa: PLC0415
+                    get_apex_detector,
+                )
+                det = get_apex_detector(name)
+                text = (f"Tracks feature {fid} with {name}: it detects the "
+                        f"apexes in each frame and takes the one nearest the "
+                        f"prediction along {axis}, so it cannot drift along "
+                        f"a wall. Tracking bin is forced to {det.native_bin} "
+                        f"(the grid the detector was tuned on), and min p "
+                        f"thresholds the detector's own confidence. The "
+                        f"other coordinate still comes from the prediction, "
+                        f"so an auto label here never becomes a centre "
+                        f"observation.")
+            else:
+                text = (f"Tracks feature {fid} at bin {b} with the 1D edge "
+                        f"matcher: it searches along {axis} only and copies "
+                        f"the other coordinate from the prediction, so an "
+                        f"auto label here never becomes a centre "
+                        f"observation. Its quality is a plain correlation "
+                        f"coefficient, NOT the learned probability the min p "
+                        f"box was measured for.")
         self.auto_grid_label.setText(text)
 
     def _new_feature(self) -> None:
@@ -1163,11 +1297,159 @@ class TrackModelWindow(QMainWindow):
     def _drop_feature(self) -> None:
         n = self._labels.clear_feature(self._active)
         self._pins.discard(self._active)
+        self._kinds.pop(self._active, None)
+        self._use_center.discard(self._active)
+        self._group.pop(self._active, None)
         if n:
             self._request_fit()
         self._refresh_view()
 
+    # ------------------------------------------------------ feature kinds
+
+    def _kind_of(self, fid: int) -> int:
+        return int(self._kinds.get(int(fid), POINT))
+
+    def _group_of(self, fid: int) -> int:
+        return int(self._group.get(int(fid), int(fid)))
+
+    def _known_ids(self) -> list[int]:
+        ids = set(self._labels.feature_ids()) | {self._active}
+        if self._model is not None:
+            ids |= {int(f) for f in self._model.feature_ids}
+        return sorted(ids)
+
+    def _members_of(self, key: int) -> list[int]:
+        return [f for f in self._known_ids() if self._group_of(f) == int(key)]
+
+    def _selected_ids(self) -> list[int]:
+        if self._model is None:
+            return []
+        rows = sorted({i.row() for i in self.feature_table.selectedIndexes()})
+        return [int(self._model.feature_ids[r]) for r in rows
+                if r < self._model.feature_ids.size]
+
+    def _seed_radius(self, key: int) -> None:
+        """Set a sphere's radius from a view where two opposite apexes sit.
+
+        Half the distance between them, which is the radius exactly, for
+        any view where both are labelled. The fit refines it; this is only
+        so the first fit starts somewhere sensible and the drawn circle
+        means something straight away.
+        """
+        members = self._members_of(key)
+        by_kind = {self._kind_of(f): f for f in members}
+        halves = []
+        for lo, hi, coord in ((LAOS, RAOS, 0), (TAOS, BAOS, 1)):
+            if lo not in by_kind or hi not in by_kind:
+                continue
+            a, b = by_kind[lo], by_kind[hi]
+            for w in self._labels.views_of(a):
+                pa, pb = self._labels.get(a, w), self._labels.get(b, w)
+                if pa is not None and pb is not None:
+                    halves.append((pb[coord] - pa[coord]) / 2.0)
+        if halves:
+            self._radii[int(key)] = float(np.median(halves))
+
+    def _link_selected(self) -> None:
+        ids = self._selected_ids()
+        if len(ids) < 2:
+            self.summary_label.setText(
+                "Link needs two or more selected rows.")
+            return
+        members = sorted({f for i in ids for f in self._members_of(
+            self._group_of(i))})
+        kinds = [self._kind_of(f) for f in members if self._kind_of(f) != POINT]
+        if len(kinds) != len(set(kinds)):
+            self.summary_label.setText(
+                "A sphere can hold at most one apex of each kind. Change a "
+                "kind, or unlink first.")
+            return
+        key = min(members)
+        old_keys = {self._group_of(f) for f in members}
+        for f in members:
+            self._group[f] = key
+        radii = [self._radii[k] for k in old_keys if k in self._radii]
+        for k in old_keys - {key}:
+            self._radii.pop(k, None)
+        if radii:
+            self._radii[key] = float(np.max(np.abs(radii)))
+        self._seed_radius(key)
+        self._request_fit()
+        self._refresh_view()
+        if self._fit is not None:
+            self._refresh_feature_table()
+
+    def _unlink_selected(self) -> None:
+        ids = self._selected_ids()
+        if not ids:
+            return
+        for f in ids:
+            key = self._group_of(f)
+            if key in self._radii:
+                self._radii.setdefault(f, self._radii[key])
+            self._group[f] = f
+        self._request_fit()
+        self._refresh_view()
+        if self._fit is not None:
+            self._refresh_feature_table()
+
     # ------------------------------------------------------------ fitting
+
+    def _validity(self, valid: np.ndarray, ids) -> tuple:
+        """(valid_u, valid_v) for the solve, from the feature kinds.
+
+        An AUTO label on a tangent feature never measured its across
+        coordinate: the 1D edge matcher copies the prediction into it. So
+        such a label can never become a centre observation, whatever the
+        ctr box says.
+        """
+        if self._model is None:
+            return valid, valid
+        measured = np.ones_like(valid, bool)
+        for row, fid in enumerate(ids):
+            fid = int(fid)
+            if self._kind_of(fid) == POINT:
+                continue
+            for w in self._labels.views_of(fid):
+                if 0 <= w < measured.shape[1] \
+                        and self._labels.kind_of(fid, w) == KIND_AUTO:
+                    measured[row, w] = False
+        return split_validity(valid, self._model, measured_across=measured)
+
+    def _adopt_kinds_from_model(self) -> None:
+        """Fall back to the model's own kinds when the UI keys are absent.
+
+        The model file describes itself, so a session written before the
+        UI keys existed, or a model file loaded on its own, still comes
+        back with its spheres intact.
+        """
+        m = self._model
+        if m is None or self._kinds:
+            return
+        for row, fid in enumerate(m.feature_ids):
+            fid = int(fid)
+            if int(m.kind[row]) != POINT:
+                self._kinds[fid] = int(m.kind[row])
+            if bool(m.use_center[row]):
+                self._use_center.add(fid)
+        for b in range(m.n_bodies):
+            rows = np.flatnonzero(m.body == b)
+            if rows.size == 0:
+                continue
+            key = int(m.feature_ids[rows[0]])
+            for r in rows:
+                self._group[int(m.feature_ids[r])] = key
+            self._radii[key] = float(m.radius[b])
+
+    def _store_fitted_radii(self) -> None:
+        """Carry the fitted radii back into the per-sphere table."""
+        keys = getattr(self, "_body_keys", None)
+        if self._fit is None or keys is None:
+            return
+        rad = self._fit.model.radius
+        for b, key in enumerate(keys):
+            if b < rad.size:
+                self._radii[int(key)] = float(rad[b])
 
     def _feature_weights(self) -> np.ndarray | None:
         """1/size per feature: a click's localization scales with the
@@ -1195,19 +1477,29 @@ class TrackModelWindow(QMainWindow):
         self._set_view(int(ahead[0] if ahead.size else targets[0]))
 
     def _goto_worst_outlier(self) -> None:
-        if self._fit is None or self._fit.residual_u.size == 0:
+        if self._fit is None:
             return
-        i, j = self._fit.obs
-        mag = np.hypot(self._fit.residual_u, self._fit.residual_v)
-        k = int(np.argmax(mag))
-        fid = int(self._fit.model.feature_ids[i[k]])
+        # u and v have their own observation lists once tangent features
+        # exist, so the worst one is the worst of either
+        best = None
+        for (i, j), res, name in ((self._fit.obs_u, self._fit.residual_u, "u"),
+                                  (self._fit.obs_v, self._fit.residual_v,
+                                   "v")):
+            if res.size == 0:
+                continue
+            k = int(np.argmax(np.abs(res)))
+            if best is None or abs(res[k]) > best[0]:
+                best = (abs(float(res[k])), int(i[k]), int(j[k]), name,
+                        float(res[k]))
+        if best is None:
+            return
+        mag, row, view, name, signed = best
+        fid = int(self._fit.model.feature_ids[row])
         self._set_active(fid)
-        self._set_view(int(j[k]))
+        self._set_view(view)
         self.statusBar().showMessage(
-            f"worst outlier: feature {fid} in view {int(j[k])}, "
-            f"residual {mag[k]:.2f} px "
-            f"(u {self._fit.residual_u[k]:+.2f}, "
-            f"v {self._fit.residual_v[k]:+.2f})", 8000)
+            f"worst outlier: feature {fid} in view {view}, "
+            f"residual {name} {signed:+.2f} px", 8000)
 
     # ---------------------------------------------------------- auto-track
 
@@ -1260,7 +1552,9 @@ class TrackModelWindow(QMainWindow):
                 min_corr=float(self.auto_min_corr.value()),
                 fb_check=self.auto_fb.isChecked())
             jobs.append(AutoTrackJob(fid=fid, seeds=tuple(seeds),
-                                     params=params, track_bin=track_bin))
+                                     params=params, track_bin=track_bin,
+                                     kind=self._kind_of(fid),
+                                     detector=self._apex_detector_name()))
 
         if self._autotrack_worker is None:
             self._autotrack_worker = AutoTrackWorker(self._stack, self)
@@ -1403,14 +1697,17 @@ class TrackModelWindow(QMainWindow):
         if not valid.any():
             return
         try:
-            self._fit = solve_model(u, v, valid, self._model, self._mask,
-                                    **self._solve_kwargs())
+            vu, vv = self._validity(valid, ids)
+            self._fit = solve_model(u, v, vu, self._model, self._mask,
+                                    valid_v=vv, **self._solve_kwargs())
             n_rej = self._reject_auto_outliers(ids)
             if n_rej:
                 u, v, valid, ids = self._labels.to_arrays(
                     self._stack.angles.size, self._model.feature_ids)
-                self._fit = solve_model(u, v, valid, self._fit.model,
-                                        self._mask, **self._solve_kwargs())
+                vu, vv = self._validity(valid, ids)
+                self._fit = solve_model(u, v, vu, self._fit.model,
+                                        self._mask, valid_v=vv,
+                                        **self._solve_kwargs())
         except ValueError as exc:
             self.summary_label.setText(f"fit failed: {exc}")
             return
@@ -1420,6 +1717,7 @@ class TrackModelWindow(QMainWindow):
                 f"{self.auto_reject_k.value():g} x Huber, refitted")
             self._refresh_view()
         self._model = self._fit.model
+        self._store_fitted_radii()
         self._diagnostics = None
         self._push_model_to_ui()
         self._after_evaluate()
@@ -1444,7 +1742,8 @@ class TrackModelWindow(QMainWindow):
             self._stack.angles.size, self._model.feature_ids)
         if not valid.any():
             return
-        self._fit = residuals(u, v, valid, self._model)
+        vu, vv = self._validity(valid, self._model.feature_ids)
+        self._fit = residuals(u, v, vu, self._model, valid_v=vv)
         self._after_evaluate()
 
     def _sync_model_dims_only(self) -> None:
@@ -1511,8 +1810,10 @@ class TrackModelWindow(QMainWindow):
         self._sync_model()
         u, v, valid, _ids = self._labels.to_arrays(
             self._stack.angles.size, self._model.feature_ids)
-        self._diagnostics = run_diagnostics(u, v, valid, self._model,
+        vu, vv = self._validity(valid, self._model.feature_ids)
+        self._diagnostics = run_diagnostics(u, v, vu, self._model,
                                             self._mask, self._fit,
+                                            valid_v=vv,
                                             **self._solve_kwargs())
         d = self._diagnostics
         chain = self._chain
@@ -1568,11 +1869,15 @@ class TrackModelWindow(QMainWindow):
 
         sizes = {fid: self._feature_size(fid)
                  for fid in self._labels.feature_ids()}
+        known = self._known_ids()
+        colors = {f: self._group_of(f) for f in known}
+        kinds = {f: self._kind_of(f) for f in known}
         marks = []
         for fid, u_raw, v_raw, kind, _q in self._labels.in_view_full(view):
             u, v = self._chain.from_parent(u_raw, v_raw, view=view)
             marks.append((fid, float(u), float(v), kind))
-        self.viewer.show_labels(marks, active_id=self._active, sizes=sizes)
+        self.viewer.show_labels(marks, active_id=self._active, sizes=sizes,
+                                color_key=colors, feature_kinds=kinds)
 
         ghosts = []
         if self.ghost_box.isChecked():
@@ -1582,7 +1887,7 @@ class TrackModelWindow(QMainWindow):
                 u_raw, v_raw = self._labels.get(self._active, w)
                 u, v = self._chain.from_parent(u_raw, v_raw, view=view)
                 ghosts.append((self._active, float(u), float(v)))
-        self.viewer.show_ghosts(ghosts, sizes=sizes)
+        self.viewer.show_ghosts(ghosts, sizes=sizes, color_key=colors)
 
         preds = []
         if self._fit is not None and self._model is not None \
@@ -1594,6 +1899,7 @@ class TrackModelWindow(QMainWindow):
                 u, v = self._chain.from_parent(u_pred[row, view],
                                                v_pred[row, view], view=view)
                 preds.append((int(fid), float(u), float(v)))
+            self._show_spheres(view)
             row = list(self._model.feature_ids).index(self._active) \
                 if self._active in self._model.feature_ids else None
             if row is not None and self._chain.view_origin is None:
@@ -1613,11 +1919,21 @@ class TrackModelWindow(QMainWindow):
                 c_of, alpha_of, beta_of = m.axis_curves()
                 u_tr = s_row + c_of
                 v_tr = m.y[row] + alpha_of * s_row + beta_of * t_row
+                if m.kind[row] != POINT:
+                    # a tangent feature's track is the apex's, not the
+                    # centre's: it rides one radius off it
+                    du, dv = m.tangent_scales()
+                    rad = m.radius[m.body[row]]
+                    u_tr = u_tr + du[row] * rad
+                    v_tr = v_tr + dv[row] * rad
                 u_all, v_all = self._chain.from_parent(u_tr, v_tr)
                 self.viewer.show_trajectory(u_all, v_all)
             else:
                 self.viewer.show_trajectory(None)
-        self.viewer.show_predictions(preds, active_id=self._active)
+        else:
+            self.viewer.show_spheres(None)
+        self.viewer.show_predictions(preds, active_id=self._active,
+                                     color_key=colors)
 
         # the slice probe: an object point picked in the recon slice,
         # projected into THIS view through the model
@@ -1630,6 +1946,36 @@ class TrackModelWindow(QMainWindow):
         else:
             self.viewer.show_probe(None)
 
+    def _show_spheres(self, view: int) -> None:
+        """Draw every fitted sphere as a dashed circle in this view.
+
+        The circle should sit on the bubble's wall at every angle. That is
+        the check that a link is right, and it catches a swapped pair
+        faster than any number in the table.
+        """
+        m = self._model
+        if m is None or not m.has_tangents:
+            self.viewer.show_spheres(None)
+            return
+        u_c, v_c = m.predict_centers(views=[view])
+        scale = max(1, int(self._chain.rebin))
+        circles = []
+        seen = set()
+        for row, fid in enumerate(m.feature_ids):
+            b = int(m.body[row])
+            if b in seen or m.kind[row] == POINT:
+                continue
+            if self._labels.counts().get(int(fid), 0) == 0:
+                continue
+            seen.add(b)
+            radius = float(m.radius[b])
+            if not np.isfinite(radius) or abs(radius) < 1e-6:
+                continue
+            u, v = self._chain.from_parent(float(u_c[row, 0]),
+                                           float(v_c[row, 0]), view=view)
+            circles.append((float(u), float(v), abs(radius) / scale))
+        self.viewer.show_spheres(circles)
+
     def _refresh_feature_table(self) -> None:
         if self._model is None or self._fit is None:
             return
@@ -1637,38 +1983,76 @@ class TrackModelWindow(QMainWindow):
         rms_u, rms_v = self._fit.feature_rms()
         counts = self._labels.counts()
         ids = self._model.feature_ids
+        radius = self._model.body_radius_per_feature()
         self._updating_ui = True
         try:
             table.setRowCount(ids.size)
             for row, fid in enumerate(ids):
                 fid = int(fid)
+                key = self._group_of(fid)
                 id_item = QTableWidgetItem(str(fid))
                 id_item.setFlags(Qt.ItemFlag.ItemIsEnabled
                                  | Qt.ItemFlag.ItemIsSelectable)
-                id_item.setBackground(pg.mkBrush(*feature_color(fid), 120))
-                table.setItem(row, 0, id_item)
-                values = (counts.get(fid, 0),
-                          _fmt(rms_u[row]), _fmt(rms_v[row]),
-                          f"{self._model.a[row]:.1f}",
-                          f"{self._model.b[row]:.1f}",
-                          f"{self._model.y[row]:.1f}",
-                          f"{self._feature_size(fid):.1f}")
-                for col, value in enumerate(values, start=1):
+                id_item.setBackground(pg.mkBrush(*feature_color(key), 120))
+                table.setItem(row, COL_ID, id_item)
+
+                combo = table.cellWidget(row, COL_KIND)
+                if combo is None:
+                    combo = QComboBox()
+                    for k in KIND_ORDER:
+                        combo.addItem(KIND_LABELS[k], k)
+                    combo.currentIndexChanged.connect(
+                        lambda _i, r=row: self._kind_cell_changed(r))
+                    table.setCellWidget(row, COL_KIND, combo)
+                combo.blockSignals(True)
+                combo.setCurrentIndex(KIND_ORDER.index(self._kind_of(fid)))
+                combo.blockSignals(False)
+
+                members = self._members_of(key)
+                sphere = "" if len(members) < 2 else str(key)
+                is_tangent = self._kind_of(fid) != POINT
+                values = {
+                    COL_SPHERE: sphere,
+                    COL_N: counts.get(fid, 0),
+                    COL_RMS_U: _fmt(rms_u[row]),
+                    COL_RMS_V: _fmt(rms_v[row]),
+                    COL_A: f"{self._model.a[row]:.1f}",
+                    COL_B: f"{self._model.b[row]:.1f}",
+                    COL_Y: f"{self._model.y[row]:.1f}",
+                    COL_R: (f"{radius[row]:.1f}" if is_tangent else ""),
+                    COL_SIZE: f"{self._feature_size(fid):.1f}",
+                }
+                for col, value in values.items():
                     item = QTableWidgetItem(str(value))
-                    if col in (4, 5, 6, 7):
+                    editable = (col in (COL_A, COL_B, COL_Y, COL_SIZE)
+                                or (col == COL_R and is_tangent))
+                    if editable:
                         item.setFlags(item.flags()
                                       | Qt.ItemFlag.ItemIsEditable)
                     else:
                         item.setFlags(Qt.ItemFlag.ItemIsEnabled
                                       | Qt.ItemFlag.ItemIsSelectable)
                     table.setItem(row, col, item)
+
+                ctr = QTableWidgetItem()
+                flags = (Qt.ItemFlag.ItemIsEnabled
+                         | Qt.ItemFlag.ItemIsSelectable)
+                if is_tangent:
+                    flags |= Qt.ItemFlag.ItemIsUserCheckable
+                ctr.setFlags(flags)
+                if is_tangent:
+                    ctr.setCheckState(
+                        Qt.CheckState.Checked if fid in self._use_center
+                        else Qt.CheckState.Unchecked)
+                table.setItem(row, COL_CTR, ctr)
+
                 pin = QTableWidgetItem()
                 pin.setFlags(Qt.ItemFlag.ItemIsEnabled
                              | Qt.ItemFlag.ItemIsUserCheckable
                              | Qt.ItemFlag.ItemIsSelectable)
                 pin.setCheckState(Qt.CheckState.Checked if fid in self._pins
                                   else Qt.CheckState.Unchecked)
-                table.setItem(row, 8, pin)
+                table.setItem(row, COL_PIN, pin)
         finally:
             self._updating_ui = False
 
@@ -1679,20 +2063,47 @@ class TrackModelWindow(QMainWindow):
             if row < self._model.feature_ids.size:
                 self._set_active(int(self._model.feature_ids[row]))
 
+    def _kind_cell_changed(self, row: int) -> None:
+        if self._updating_ui or self._model is None:
+            return
+        if row >= self._model.feature_ids.size:
+            return
+        combo = self.feature_table.cellWidget(row, COL_KIND)
+        if combo is None:
+            return
+        fid = int(self._model.feature_ids[row])
+        kind = int(combo.currentData())
+        if kind == self._kind_of(fid):
+            return
+        self._kinds[fid] = kind
+        if kind == POINT:
+            self._use_center.discard(fid)
+        key = self._group_of(fid)
+        if len(self._members_of(key)) > 1:
+            self._seed_radius(key)
+        self._request_fit()
+        self._refresh_view()
+
     def _feature_cell_edited(self, row: int, col: int) -> None:
         if self._updating_ui or self._model is None:
             return
         if row >= self._model.feature_ids.size:
             return
         fid = int(self._model.feature_ids[row])
-        if col == 8:
-            item = self.feature_table.item(row, 8)
+        if col == COL_PIN:
+            item = self.feature_table.item(row, COL_PIN)
             pinned = item.checkState() == Qt.CheckState.Checked
             (self._pins.add if pinned else self._pins.discard)(fid)
             self._request_fit()
             return
-        if col == 7:
-            item = self.feature_table.item(row, 7)
+        if col == COL_CTR:
+            item = self.feature_table.item(row, COL_CTR)
+            on = item.checkState() == Qt.CheckState.Checked
+            (self._use_center.add if on else self._use_center.discard)(fid)
+            self._request_fit()
+            return
+        if col == COL_SIZE:
+            item = self.feature_table.item(row, COL_SIZE)
             try:
                 size = float(item.text())
             except (TypeError, ValueError):
@@ -1702,14 +2113,27 @@ class TrackModelWindow(QMainWindow):
             self._refresh_auto_grid()  # and the tracking grid it implies
             self._request_fit()        # and so does the 1/size weighting
             return
-        if col in (4, 5, 6):
+        if col == COL_R:
+            item = self.feature_table.item(row, COL_R)
+            try:
+                value = float(item.text())
+            except (TypeError, ValueError):
+                return
+            self._radii[self._group_of(fid)] = value
+            self._model.radius[self._model.body[row]] = value
+            self._evaluate()
+            return
+        if col in (COL_A, COL_B, COL_Y):
             item = self.feature_table.item(row, col)
             try:
                 value = float(item.text())
             except (TypeError, ValueError):
                 return
-            attr = {4: "a", 5: "b", 6: "y"}[col]
-            getattr(self._model, attr)[row] = value
+            attr = {COL_A: "a", COL_B: "b", COL_Y: "y"}[col]
+            # the members of a sphere share a centre, so an edit on one
+            # row moves all of them
+            same = self._model.body == self._model.body[row]
+            getattr(self._model, attr)[same] = value
             self._evaluate()
 
     def _refresh_plots(self) -> None:
@@ -1773,13 +2197,14 @@ class TrackModelWindow(QMainWindow):
         if fit is None:
             return
         model = fit.model
-        i, j = fit.obs
+        iu, ju = fit.obs_u
+        iv, jv = fit.obs_v
 
         if kind == "dx shifts":
-            self._render_shift_plot(plot, model.dx, fit.observed_views,
+            self._render_shift_plot(plot, model.dx, fit.observed_dx,
                                     (255, 200, 0), "dx")
         elif kind == "dy shifts":
-            self._render_shift_plot(plot, model.dy, fit.observed_views,
+            self._render_shift_plot(plot, model.dy, fit.observed_dy,
                                     (0, 200, 255), "dy")
         elif kind in ("rot horiz", "rot beam", "rot axis"):
             attr = kind.replace(" ", "_")
@@ -1789,12 +2214,15 @@ class TrackModelWindow(QMainWindow):
                                     fit.observed_views, color, kind,
                                     unit="deg")
         elif kind in ("residual u", "residual v"):
-            res = fit.residual_u if kind == "residual u" else fit.residual_v
+            if kind == "residual u":
+                res, fi_idx, vj = fit.residual_u, iu, ju
+            else:
+                res, fi_idx, vj = fit.residual_v, iv, jv
             plot.setLabel("left", f"{kind} [raw px]")
             plot.setLabel("bottom", "angle [deg]")
-            brushes = [pg.mkBrush(*feature_color(int(model.feature_ids[fi])))
-                       for fi in i]
-            plot.plot(deg[j], res, pen=None, symbol="o", symbolSize=5,
+            brushes = [pg.mkBrush(*feature_color(
+                self._group_of(int(model.feature_ids[fi])))) for fi in fi_idx]
+            plot.plot(deg[vj], res, pen=None, symbol="o", symbolSize=5,
                       symbolBrush=brushes, symbolPen=None)
             plot.addLine(y=0, pen=pg.mkPen((255, 255, 255, 60)))
         elif kind == "per-view spread":
@@ -1803,9 +2231,9 @@ class TrackModelWindow(QMainWindow):
             )
             plot.setLabel("left", "MAD [raw px], u yellow / v cyan")
             plot.setLabel("bottom", "angle [deg]")
-            for res, color in ((fit.residual_u, (255, 200, 0)),
-                               (fit.residual_v, (0, 200, 255))):
-                spread = per_view_spread(res, j, model.theta.size)
+            for res, vj, color in ((fit.residual_u, ju, (255, 200, 0)),
+                                   (fit.residual_v, jv, (0, 200, 255))):
+                spread = per_view_spread(res, vj, model.theta.size)
                 good = np.isfinite(spread)
                 plot.plot(deg[good], spread[good],
                           pen=pg.mkPen(color, width=1.5))
@@ -1897,6 +2325,11 @@ class TrackModelWindow(QMainWindow):
         self._mask = None
         self._fit = None
         self._pins.clear()
+        self._feature_sizes.clear()
+        self._kinds.clear()
+        self._group.clear()
+        self._use_center.clear()
+        self._radii.clear()
         self._adopt_stack(chain, source)
 
     def _show_data(self, data: ProjectionData, chain: CoordinateChain,
@@ -2021,11 +2454,19 @@ class TrackModelWindow(QMainWindow):
             "view": self._view,
             "feature_sizes": {str(k): float(size)
                               for k, size in self._feature_sizes.items()},
+            "feature_kinds": {str(k): int(v)
+                              for k, v in self._kinds.items() if v != POINT},
+            "feature_groups": {str(k): int(v)
+                               for k, v in self._group.items() if int(k) != v},
+            "use_center": sorted(self._use_center),
+            "sphere_radii": {str(k): float(r)
+                             for k, r in self._radii.items()},
             "ghosts": self.ghost_box.isChecked(),
             "follow_prediction": self.follow_box.isChecked(),
             "auto_reject": self.auto_reject.isChecked(),
             "auto_reject_k": self.auto_reject_k.value(),
             "auto_min_corr": self.auto_min_corr.value(),
+            "apex_detector": self._apex_detector_name(),
             "auto_search_radius": self.auto_radius.value(),
             "auto_fb_check": self.auto_fb.isChecked(),
             "auto_track_bin": int(self.auto_bin_combo.currentData() or 0),
@@ -2103,6 +2544,14 @@ class TrackModelWindow(QMainWindow):
         self._pins = set(ui.get("pins", []))
         self._feature_sizes = {int(k): float(size) for k, size in
                                ui.get("feature_sizes", {}).items()}
+        self._kinds = {int(k): int(v)
+                       for k, v in ui.get("feature_kinds", {}).items()}
+        self._group = {int(k): int(v)
+                       for k, v in ui.get("feature_groups", {}).items()}
+        self._use_center = {int(k) for k in ui.get("use_center", [])}
+        self._radii = {int(k): float(r)
+                       for k, r in ui.get("sphere_radii", {}).items()}
+        self._adopt_kinds_from_model()
         self.ghost_box.setChecked(bool(ui.get("ghosts", False)))
         self.follow_box.setChecked(bool(ui.get("follow_prediction", False)))
         self.auto_reject.setChecked(bool(ui.get("auto_reject", True)))
@@ -2112,6 +2561,10 @@ class TrackModelWindow(QMainWindow):
         self.auto_fb.setChecked(bool(ui.get("auto_fb_check", False)))
         idx = self.auto_bin_combo.findData(int(ui.get("auto_track_bin", 0)))
         self.auto_bin_combo.setCurrentIndex(max(idx, 0))
+        # a session labelled against a detector that is not registered here
+        # falls back to edge correlation rather than failing to load
+        idx = self.apex_detector.findData(str(ui.get("apex_detector", "")))
+        self.apex_detector.setCurrentIndex(max(idx, 0))
         self.advance_box.setValue(int(ui.get("advance", 5)))
         degrees = ui.get("degrees", [0, 0, 0])
         self.deg_c.setValue(int(degrees[0]))

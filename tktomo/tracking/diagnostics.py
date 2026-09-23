@@ -16,6 +16,7 @@ from __future__ import annotations
 import numpy as np
 
 from tktomo.tracking.model import (
+    POINT,
     AxisModel,
     FreeMask,
     poly_basis,
@@ -56,15 +57,31 @@ def tilt_significance(res_v: np.ndarray, s: np.ndarray,
     return abs(alpha0) / se if se > 0 else 0.0
 
 
-def _split_features(valid: np.ndarray, seed: int) -> tuple[np.ndarray, np.ndarray]:
+def _split_features(valid: np.ndarray, seed: int,
+                    model: AxisModel | None = None
+                    ) -> tuple[np.ndarray, np.ndarray]:
+    """Two disjoint halves of the observed features, split by BODY.
+
+    The halves have to share no data for their disagreement to be an error
+    bar. Two members of the same sphere share a centre and a diameter, so
+    splitting them apart would put the same measurement in both halves and
+    flatter every number here.
+    """
     idx = np.flatnonzero(valid.sum(axis=1) > 0)
     rng = np.random.default_rng(seed)
-    rng.shuffle(idx)
-    return idx[::2], idx[1::2]
+    if model is None:
+        rng.shuffle(idx)
+        return idx[::2], idx[1::2]
+    bodies = np.unique(model.body[idx])
+    rng.shuffle(bodies)
+    half = {int(b): k % 2 for k, b in enumerate(bodies)}
+    side = np.array([half[int(model.body[f])] for f in idx], int)
+    return idx[side == 0], idx[side == 1]
 
 
 def holdout_error(u: np.ndarray, v: np.ndarray, valid: np.ndarray,
                   model: AxisModel, mask: FreeMask, *, seed: int = 0,
+                  valid_v: np.ndarray | None = None,
                   iters: int = 4, huber: float = 3.0,
                   feature_weight: np.ndarray | None = None,
                   **solve_kw) -> dict:
@@ -74,7 +91,10 @@ def holdout_error(u: np.ndarray, v: np.ndarray, valid: np.ndarray,
     the disagreement between two disjoint halves is the number that catches
     an ill-posed fit, which a residual never will.
     """
-    a_idx, b_idx = _split_features(valid, seed)
+    valid_u = np.asarray(valid, bool)
+    valid_v = valid_u if valid_v is None else np.asarray(valid_v, bool)
+    any_valid = valid_u | valid_v
+    a_idx, b_idx = _split_features(any_valid, seed, model)
     out = {"n_a": int(a_idx.size), "n_b": int(b_idx.size),
            "rms_u": float("nan"), "rms_v": float("nan"),
            "center_split": float("nan"), "alpha_split": float("nan"),
@@ -85,13 +105,13 @@ def holdout_error(u: np.ndarray, v: np.ndarray, valid: np.ndarray,
     def sub_w(idx):
         return None if feature_weight is None else feature_weight[idx]
 
-    fit_a = solve_model(u[a_idx], v[a_idx], valid[a_idx],
-                        model.subset(a_idx), mask.subset(a_idx),
-                        iters=iters, huber=huber,
+    fit_a = solve_model(u[a_idx], v[a_idx], valid_u[a_idx],
+                        model.subset(a_idx), mask.subset(a_idx, model),
+                        valid_v=valid_v[a_idx], iters=iters, huber=huber,
                         feature_weight=sub_w(a_idx), **solve_kw)
-    fit_b = solve_model(u[b_idx], v[b_idx], valid[b_idx],
-                        model.subset(b_idx), mask.subset(b_idx),
-                        iters=iters, huber=huber,
+    fit_b = solve_model(u[b_idx], v[b_idx], valid_u[b_idx],
+                        model.subset(b_idx), mask.subset(b_idx, model),
+                        valid_v=valid_v[b_idx], iters=iters, huber=huber,
                         feature_weight=sub_w(b_idx), **solve_kw)
     ma, mb = fit_a.model, fit_b.model
     out["center_split"] = abs(ma.center_at_mean_theta()
@@ -110,24 +130,46 @@ def holdout_error(u: np.ndarray, v: np.ndarray, valid: np.ndarray,
     # The model is affine in (a, b, y) for a fixed geometry, so the three
     # columns are the projections of the unit vectors, through `project`
     # so the rotations are honoured (u depends on y through them).
+    # One BODY at a time, since a sphere's members share their unknowns.
+    # The unknowns are (a, b), plus y where the body has vertical
+    # observations, plus the radius where it has a tangent member. A
+    # column that no row constrains is left out rather than fitted to
+    # nothing.
     ru, rv = [], []
-    for f in b_idx:
-        m = valid[f]
-        if m.sum() < 4:
+    for b in np.unique(model.body[b_idx]):
+        rows = [int(f) for f in b_idx if model.body[f] == b]
+        has_v = any(valid_v[f].any() for f in rows)
+        has_tan = any(model.kind[f] != POINT for f in rows)
+        units = [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0)]
+        if has_v:
+            units.append((0.0, 0.0, 1.0))
+        blocks, rhs_all, sizes = [], [], []
+        for f in rows:
+            for sel, mask_f, obs in ((0, valid_u[f], u), (1, valid_v[f], v)):
+                if not mask_f.any():
+                    continue
+                views = np.flatnonzero(mask_f)
+                base = ma.project(0.0, 0.0, 0.0, views=views)[sel][0]
+                cols = [(ma.project(*unit, views=views)[sel][0] - base)
+                        for unit in units]
+                if has_tan:
+                    cols.append(ma.tangent_scales_for(
+                        [model.kind[f]], views=views)[sel][0])
+                blocks.append(np.column_stack(cols))
+                rhs_all.append(obs[f, mask_f] - base)
+                sizes.append((sel, views.size))
+        if not blocks:
             continue
-        views = np.flatnonzero(m)
-        u0, v0 = ma.project(0.0, 0.0, 0.0, views=views)
-        cols_u, cols_v = [], []
-        for unit in ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)):
-            uu, vv = ma.project(*unit, views=views)
-            cols_u.append((uu - u0)[0])
-            cols_v.append((vv - v0)[0])
-        g = np.concatenate([np.column_stack(cols_u), np.column_stack(cols_v)])
-        rhs = np.concatenate([u[f, m] - u0[0], v[f, m] - v0[0]])
+        g = np.concatenate(blocks)
+        rhs = np.concatenate(rhs_all)
+        if g.shape[0] < g.shape[1] + 1:
+            continue
         coef, *_ = np.linalg.lstsq(g, rhs, rcond=None)
         res = rhs - g @ coef
-        ru.append(res[:views.size])
-        rv.append(res[views.size:])
+        at = 0
+        for sel, n in sizes:
+            (ru if sel == 0 else rv).append(res[at:at + n])
+            at += n
     if ru:
         out["rms_u"] = float(np.sqrt(np.mean(np.concatenate(ru) ** 2)))
         out["rms_v"] = float(np.sqrt(np.mean(np.concatenate(rv) ** 2)))
@@ -137,6 +179,7 @@ def holdout_error(u: np.ndarray, v: np.ndarray, valid: np.ndarray,
 def shift_split(u: np.ndarray, v: np.ndarray, valid: np.ndarray,
                 model: AxisModel, mask: FreeMask, *, seed: int = 0,
                 order: int = 3, iters: int = 4, huber: float = 3.0,
+                valid_v: np.ndarray | None = None,
                 feature_weight: np.ndarray | None = None,
                 **solve_kw) -> dict:
     """Solve on disjoint feature halves; compare the shift curves.
@@ -147,7 +190,9 @@ def shift_split(u: np.ndarray, v: np.ndarray, valid: np.ndarray,
     of the full solve and the difference sqrt(2) of one half, so the full
     solution's error is about rms(difference)/2.
     """
-    a_idx, b_idx = _split_features(valid, seed)
+    valid_u = np.asarray(valid, bool)
+    valid_v = valid_u if valid_v is None else np.asarray(valid_v, bool)
+    a_idx, b_idx = _split_features(valid_u | valid_v, seed, model)
     out = {"dx_rms": float("nan"), "dy_rms": float("nan"),
            "dx_detrended_rms": float("nan"), "dy_detrended_rms": float("nan"),
            "rot_horiz_rms_deg": float("nan"), "rot_beam_rms_deg": float("nan"),
@@ -158,13 +203,13 @@ def shift_split(u: np.ndarray, v: np.ndarray, valid: np.ndarray,
     def sub_w(idx):
         return None if feature_weight is None else feature_weight[idx]
 
-    fit_a = solve_model(u[a_idx], v[a_idx], valid[a_idx],
-                        model.subset(a_idx), mask.subset(a_idx),
-                        iters=iters, huber=huber,
+    fit_a = solve_model(u[a_idx], v[a_idx], valid_u[a_idx],
+                        model.subset(a_idx), mask.subset(a_idx, model),
+                        valid_v=valid_v[a_idx], iters=iters, huber=huber,
                         feature_weight=sub_w(a_idx), **solve_kw)
-    fit_b = solve_model(u[b_idx], v[b_idx], valid[b_idx],
-                        model.subset(b_idx), mask.subset(b_idx),
-                        iters=iters, huber=huber,
+    fit_b = solve_model(u[b_idx], v[b_idx], valid_u[b_idx],
+                        model.subset(b_idx), mask.subset(b_idx, model),
+                        valid_v=valid_v[b_idx], iters=iters, huber=huber,
                         feature_weight=sub_w(b_idx), **solve_kw)
     both = fit_a.observed_views & fit_b.observed_views
     if both.sum() <= order + 1:
@@ -216,6 +261,7 @@ def regauge_condition(model: AxisModel, observed: np.ndarray) -> float:
 def run_diagnostics(u: np.ndarray, v: np.ndarray, valid: np.ndarray,
                     model: AxisModel, mask: FreeMask, fit,
                     feature_weight: np.ndarray | None = None,
+                    valid_v: np.ndarray | None = None,
                     **solve_kw) -> dict:
     """The full on-demand panel: splits, holdout, spreads, significance.
 
@@ -224,15 +270,16 @@ def run_diagnostics(u: np.ndarray, v: np.ndarray, valid: np.ndarray,
     noise_px, iters, huber) goes to every solve so the half splits use the
     same priors as the fit they judge.
     """
-    i, j = fit.obs
+    iu, ju = fit.obs_u
+    iv, jv = fit.obs_v
     ct, sn = np.cos(model.theta), np.sin(model.theta)
-    s = fit.model.a[i] * ct[j] + fit.model.b[i] * sn[j]
-    ho = holdout_error(u, v, valid, model, mask,
+    s = fit.model.a[iv] * ct[jv] + fit.model.b[iv] * sn[jv]
+    ho = holdout_error(u, v, valid, model, mask, valid_v=valid_v,
                        feature_weight=feature_weight, **solve_kw)
-    sp = shift_split(u, v, valid, model, mask,
+    sp = shift_split(u, v, valid, model, mask, valid_v=valid_v,
                      feature_weight=feature_weight, **solve_kw)
-    spread_u = per_view_spread(fit.residual_u, j, model.theta.size)
-    spread_v = per_view_spread(fit.residual_v, j, model.theta.size)
+    spread_u = per_view_spread(fit.residual_u, ju, model.theta.size)
+    spread_v = per_view_spread(fit.residual_v, jv, model.theta.size)
     cond = regauge_condition(fit.model, fit.observed_views)
     out = {
         "holdout": ho,
