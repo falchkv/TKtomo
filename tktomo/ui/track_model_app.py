@@ -254,6 +254,10 @@ class TrackModelWindow(QMainWindow):
         self._use_center: set[int] = set()           # fids
         self._radii: dict[int, float] = {}           # group key -> raw px
         self._probe: tuple[float, float, float] | None = None  # (a, b, y) raw
+        #: a line drawn in the recon slice, as its two endpoints in object
+        #: coordinates (a, b, y) raw px. Both share the y of the slice it
+        #: was drawn on, so it lies in a horizontal plane of the object.
+        self._slice_line: tuple | None = None
         self._last_recon_info: dict | None = None
         self._active = 0
         self._view = 0
@@ -475,12 +479,23 @@ class TrackModelWindow(QMainWindow):
         self.recon_bin.currentTextChanged.connect(self._recon_maybe)
         recon_btn = QPushButton("Reconstruct now")
         recon_btn.clicked.connect(self._request_recon)
+        self.line_btn = QPushButton("Draw line")
+        self.line_btn.setCheckable(True)
+        self.line_btn.setToolTip(
+            "While this is down, dragging with the left button in the "
+            "slice draws a line instead of panning the view. The line is "
+            "a set of object points, so its projection is drawn in the "
+            "projection view and follows the object as you step frames. "
+            "Drag again to replace it, Escape over the projection clears "
+            "it. Panning is unaffected while this is up.")
+        self.line_btn.toggled.connect(self._line_mode_changed)
         controls.addWidget(self.live_recon)
         controls.addWidget(QLabel("detector row:"))
         controls.addWidget(self.slice_row)
         controls.addWidget(QLabel("bin:"))
         controls.addWidget(self.recon_bin)
         controls.addWidget(recon_btn)
+        controls.addWidget(self.line_btn)
         controls.addStretch(1)
         layout.addLayout(controls)
         self.recon_status = QLabel("")
@@ -492,9 +507,92 @@ class TrackModelWindow(QMainWindow):
         self.recon_display.setToolTip(
             "Click a point in the slice to mark it as a magenta diamond "
             "in the projection view, following the point across frames. "
-            "Escape (over the projection) clears it.")
+            "With Draw line down, drag instead to draw a line whose "
+            "projection is shown there too. Escape (over the projection) "
+            "clears both.")
+        # the drawn line, shown where it was drawn
+        self._slice_line_item = pg.PlotDataItem(
+            pen=pg.mkPen((255, 0, 255), width=2),
+            symbol="s", symbolSize=8,
+            symbolPen=pg.mkPen((255, 0, 255), width=2), symbolBrush=None)
+        self._slice_line_item.setZValue(10)
+        view_box = self.recon_display.image_view.getView()
+        view_box.addItem(self._slice_line_item)
+        # A drag in the slice means pan by default and draw when the
+        # toggle is down. Wrapping the ViewBox's own handler keeps every
+        # other mouse behaviour (zoom, right drag, axis drags) untouched.
+        original_drag = view_box.mouseDragEvent
+
+        def drag(ev, axis=None, _orig=original_drag):
+            if (self.line_btn.isChecked() and axis is None
+                    and ev.button() == Qt.MouseButton.LeftButton):
+                self._slice_line_drag(ev)
+                return
+            _orig(ev, axis)
+
+        view_box.mouseDragEvent = drag
         layout.addWidget(self.recon_display, 1)
         return holder
+
+    def _line_mode_changed(self, on: bool) -> None:
+        box = self.recon_display.image_view.getView()
+        box.setMouseEnabled(x=not on, y=not on)
+        self.recon_display.setCursor(
+            Qt.CursorShape.CrossCursor if on else Qt.CursorShape.ArrowCursor)
+
+    def _slice_line_drag(self, ev) -> None:
+        """Left drag in the slice, with the toggle down: draw the line."""
+        if self._last_recon_info is None or self._stack.info() is None:
+            return
+        view_box = self.recon_display.image_view.getView()
+        start = view_box.mapSceneToView(ev.buttonDownScenePos())
+        now = view_box.mapSceneToView(ev.scenePos())
+        self.set_slice_line((float(start.x()), float(start.y())),
+                            (float(now.x()), float(now.y())))
+        ev.accept()
+
+    def set_slice_line(self, p0, p1) -> None:
+        """Set the line from two points in SLICE pixel coordinates.
+
+        The pointer path goes through here, and so do the tests.
+        """
+        if self._last_recon_info is None:
+            return
+        a0 = self._slice_to_probe(float(p0[0]), float(p0[1]))
+        a1 = self._slice_to_probe(float(p1[0]), float(p1[1]))
+        self._slice_line = (a0, a1)
+        self._refresh_slice_line()
+        self._refresh_view()
+
+    def _probe_to_slice(self, a_raw: float, b_raw: float):
+        """Object (a, b) in raw px -> slice pixel (col, row).
+
+        The inverse of `_slice_to_probe`, so the drawn line is redrawn on
+        the right pixels when the reconstruction bin changes under it.
+        """
+        info = self._last_recon_info
+        n = int(info["width"])
+        scale = info["extra_bin"] * self._chain.scale
+        return (a_raw / scale + (n + 1) // 2,
+                (n // 2 - 1) - b_raw / scale)
+
+    def _refresh_slice_line(self) -> None:
+        """Draw the line on the slice, and report its length."""
+        if not hasattr(self, "_slice_line_item"):
+            return
+        if self._slice_line is None or self._last_recon_info is None:
+            self._slice_line_item.clear()
+            return
+        (a0, b0, y0), (a1, b1, _y1) = self._slice_line
+        c0, r0 = self._probe_to_slice(a0, b0)
+        c1, r1 = self._probe_to_slice(a1, b1)
+        self._slice_line_item.setData(x=[c0, c1], y=[r0, r1])
+        length = float(np.hypot(a1 - a0, b1 - b0))
+        base = self.recon_status.text().split("  |  line")[0]
+        self.recon_status.setText(
+            f"{base}  |  line {length:.1f} raw px "
+            f"({length / self._chain.scale:.1f} loaded px) at y "
+            f"{y0:.1f} raw px")
 
     def _slice_clicked(self, event) -> None:
         if event.button() != Qt.MouseButton.LeftButton or event.double():
@@ -532,9 +630,13 @@ class TrackModelWindow(QMainWindow):
         return (float(a_raw), float(b_raw), y_raw)
 
     def _clear_probe(self) -> None:
-        if self._probe is not None:
-            self._probe = None
-            self._refresh_view()
+        """Escape over the projection clears both slice picks."""
+        if self._probe is None and self._slice_line is None:
+            return
+        self._probe = None
+        self._slice_line = None
+        self._refresh_slice_line()
+        self._refresh_view()
 
     def _build_controls(self) -> QWidget:
         panel = QWidget()
@@ -1946,6 +2048,22 @@ class TrackModelWindow(QMainWindow):
         else:
             self.viewer.show_probe(None)
 
+        # the line drawn in the recon slice, projected into THIS view. u
+        # and v are affine in (a, b, y), so the projection of a straight
+        # segment is the segment between its projected ends, exactly, and
+        # two points are the whole story.
+        if self._slice_line is not None and self._model is not None \
+                and self._model.theta.size == self._stack.angles.size:
+            ends = []
+            for a, b, y in self._slice_line:
+                u_raw, v_raw = self._model.project(a, b, y, views=[view])
+                u, v = self._chain.from_parent(float(u_raw[0, 0]),
+                                               float(v_raw[0, 0]), view=view)
+                ends.append((float(u), float(v)))
+            self.viewer.show_probe_line(ends)
+        else:
+            self.viewer.show_probe_line(None)
+
     def _show_spheres(self, view: int) -> None:
         """Draw every fitted sphere as a dashed circle in this view.
 
@@ -2303,6 +2421,9 @@ class TrackModelWindow(QMainWindow):
     def _show_slice(self, image) -> None:
         self.recon_status.setText("")
         self.recon_display.set_image(np.asarray(image))
+        # the drawn line is an OBJECT line, so a new bin or a new row does
+        # not invalidate it, but it does move which slice pixels it falls on
+        self._refresh_slice_line()
 
     # ------------------------------------------------------------ loading
 

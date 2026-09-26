@@ -126,6 +126,14 @@ class MarkableStackView(StackDisplay):
         self._probe_scatter = pg.ScatterPlotItem(
             size=16, symbol="d", pen=pg.mkPen((255, 0, 255), width=2),
             brush=pg.mkBrush(255, 0, 255, 90), pxMode=True)
+        # a line drawn in the recon slice, projected into this view. Same
+        # magenta as the probe, because it comes from the same place, with
+        # square ends so the two are still told apart at a glance.
+        self._probe_line = pg.PlotDataItem(
+            pen=pg.mkPen((255, 0, 255), width=2),
+            symbol="s", symbolSize=8,
+            symbolPen=pg.mkPen((255, 0, 255), width=2),
+            symbolBrush=None)
         self._trajectory = pg.PlotDataItem(
             pen=pg.mkPen((255, 255, 0, 160), width=1.5,
                          style=Qt.PenStyle.DashLine))
@@ -136,7 +144,7 @@ class MarkableStackView(StackDisplay):
                      self._ghost_scatter,
                      self._pred_scatter, self._label_scatter,
                      self._tangent_scatter,
-                     self._probe_scatter):
+                     self._probe_line, self._probe_scatter):
             item.setZValue(10)
             view.addItem(item)
 
@@ -341,6 +349,20 @@ class MarkableStackView(StackDisplay):
             self._probe_scatter.clear()
         else:
             self._probe_scatter.setData(x=[point[0]], y=[point[1]])
+
+    def show_probe_line(self, points=None) -> None:
+        """The projection of a line drawn in the recon slice.
+
+        `points` is [(u0, v0), (u1, v1)] in the loaded frame, or None to
+        clear. Only the endpoints are needed: u and v are affine in the
+        object coordinates, so the projection of a straight segment is the
+        straight segment between its projected ends, exactly.
+        """
+        if not points:
+            self._probe_line.clear()
+            return
+        pts = np.asarray(points, float)
+        self._probe_line.setData(x=pts[:, 0], y=pts[:, 1])
 
     def show_trajectory(self, u=None, v=None) -> None:
         if u is None or len(u) == 0:

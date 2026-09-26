@@ -1224,3 +1224,111 @@ def test_tracker_sphere_state_survives_a_session(tracker, tmp_path,
         assert win2._radii[0] == pytest.approx(9.0, abs=0.2)
     finally:
         win2.close()
+
+
+# ------------------------------------------------- line drawn in the slice
+
+def _prepared_tracker(tracker, extra_bin=2, width=64, row_loaded=40):
+    truth = truth_for(tracker)
+    label_from_truth(tracker, truth)
+    tracker._fit_now()
+    tracker._last_recon_info = {"extra_bin": extra_bin,
+                                "row_loaded": row_loaded, "width": width}
+    return tracker._model
+
+
+def test_slice_line_round_trips_through_the_slice_pixels(tracker):
+    m = _prepared_tracker(tracker)
+    scale = 2 * tracker._chain.binning
+    axis_row, axis_col = 64 // 2 - 1, (64 + 1) // 2
+    # two points placed where features 0 and 2 would appear in the slice
+    pts = []
+    for f in (0, 2):
+        pts.append((m.a[f] / scale + axis_col, axis_row - m.b[f] / scale))
+    tracker.set_slice_line(*pts)
+
+    (a0, b0, y0), (a1, b1, y1) = tracker._slice_line
+    assert a0 == pytest.approx(m.a[0])
+    assert b0 == pytest.approx(m.b[0])
+    assert a1 == pytest.approx(m.a[2])
+    assert b1 == pytest.approx(m.b[2])
+    assert y0 == pytest.approx(y1)          # one slice, one height
+
+    # and back to the slice pixels it was drawn on
+    for (a, b, _y), (col, row) in zip(tracker._slice_line, pts):
+        c, r = tracker._probe_to_slice(a, b)
+        assert c == pytest.approx(col)
+        assert r == pytest.approx(row)
+
+
+def test_slice_line_projects_onto_the_features_it_was_drawn_through(tracker):
+    m = _prepared_tracker(tracker)
+    scale = 2 * tracker._chain.binning
+    axis_row, axis_col = 64 // 2 - 1, (64 + 1) // 2
+    pts = [(m.a[f] / scale + axis_col, axis_row - m.b[f] / scale)
+           for f in (0, 2)]
+    tracker.set_slice_line(*pts)
+
+    u_pred, _v_pred = m.predict()
+    y_slice = tracker._slice_line[0][2]
+    for view in (0, 20, 45):
+        tracker._set_view(view)
+        x, y = tracker.viewer._probe_line.getData()
+        assert len(x) == 2
+        for k, f in enumerate((0, 2)):
+            # horizontally the ends sit on the features they were drawn
+            # through, since u does not depend on the height
+            assert x[k] == pytest.approx(u_pred[f, view], abs=1e-6)
+            # vertically they sit at the height of the SLICE, not at the
+            # features' own heights: the line lies in the slice plane
+            _u, v_line = m.project(m.a[f], m.b[f], y_slice, views=[view])
+            assert y[k] == pytest.approx(float(v_line[0, 0]), abs=1e-6)
+        assert y_slice != pytest.approx(m.y[0])
+
+
+def test_projected_line_is_straight(tracker):
+    """u and v are affine in (a, b, y), so the midpoint of the object line
+    projects onto the midpoint of the drawn segment. That is why drawing
+    only the two ends is exact rather than an approximation."""
+    m = _prepared_tracker(tracker)
+    tracker.set_slice_line((10.0, 12.0), (50.0, 44.0))
+    (a0, b0, y0), (a1, b1, _) = tracker._slice_line
+    mid = ((a0 + a1) / 2, (b0 + b1) / 2, y0)
+    for view in (0, 17, 39):
+        tracker._set_view(view)
+        x, y = tracker.viewer._probe_line.getData()
+        u_mid, v_mid = m.project(*mid, views=[view])
+        u_raw, v_raw = tracker._chain.to_parent(np.mean(x), np.mean(y),
+                                                view=view)
+        assert u_raw == pytest.approx(float(u_mid[0, 0]), abs=1e-6)
+        assert v_raw == pytest.approx(float(v_mid[0, 0]), abs=1e-6)
+
+
+def test_slice_line_survives_a_bin_change_and_clears_on_escape(tracker):
+    _prepared_tracker(tracker, extra_bin=2, width=64)
+    tracker.set_slice_line((10.0, 12.0), (50.0, 44.0))
+    before = tracker._slice_line
+    x0, _y0 = tracker._slice_line_item.getData()
+
+    # the same object line on a coarser grid lands on different pixels
+    tracker._last_recon_info = {"extra_bin": 4, "row_loaded": 40,
+                                "width": 32}
+    tracker._refresh_slice_line()
+    x1, _y1 = tracker._slice_line_item.getData()
+    assert tracker._slice_line == before          # the object line is fixed
+    assert not np.allclose(x0, x1)                # its pixels are not
+    assert "line" in tracker.recon_status.text()
+
+    tracker._clear_probe()
+    assert tracker._slice_line is None
+    assert len(tracker.viewer._probe_line.getData()[0] or []) == 0
+
+
+def test_draw_mode_takes_the_drag_from_the_pan(tracker):
+    _prepared_tracker(tracker)
+    box = tracker.recon_display.image_view.getView()
+    assert all(box.state["mouseEnabled"])
+    tracker.line_btn.setChecked(True)
+    assert not any(box.state["mouseEnabled"])     # dragging no longer pans
+    tracker.line_btn.setChecked(False)
+    assert all(box.state["mouseEnabled"])

@@ -144,7 +144,27 @@ small sharp feature. Uniform sizes mean unweighted.
 
 Clicking a point in the reconstructed slice marks it as a magenta
 diamond in the projection view, projected through the model so it
-follows the object point across frames (Escape clears it). The
+follows the object point across frames (Escape clears it).
+
+**Draw line** in the recon controls turns a left drag in the slice into a
+line instead of a pan, and its projection appears in the projection view
+as a magenta segment with square ends, following the object as you step
+frames just as the diamond does. Drag again to replace it, Escape over
+the projection clears both it and the diamond, and panning is untouched
+while the button is up.
+
+Only the two endpoints are projected, and that is exact rather than an
+approximation: u and v are affine in the object coordinates (a, b, y), so
+the projection of a straight segment is the straight segment between its
+projected ends. A test places the midpoint of the object line and checks
+it lands on the midpoint of the drawn one.
+
+The line is an OBJECT line, living in the horizontal plane of the slice
+it was drawn on. Changing the reconstruction bin redraws it on the right
+pixels of the new grid, and changing the detector row leaves it where it
+is, which is what you want when comparing one feature's position across
+heights. The status line under the recon controls gives its length in raw
+and loaded px and the height it sits at. The
 slice-to-object mapping is pinned against tomopy's grid convention by a
 dedicated test.
 
