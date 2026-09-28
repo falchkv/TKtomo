@@ -32,14 +32,13 @@ from pathlib import Path
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QFontDatabase, QKeySequence
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
-    QFormLayout,
-    QGroupBox,
+    QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -51,7 +50,8 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
-    QTabWidget,
+    QStyle,
+    QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -99,6 +99,7 @@ from tktomo.tracking.stacksource import (
     StackSource,
     ViewPrefetcher,
 )
+from tktomo.ui import theme
 from tktomo.ui.common import run_app
 from tktomo.ui.tracking_widgets import (
     MarkableStackView,
@@ -138,6 +139,53 @@ PLOT_KINDS = [
     "tilts alpha/beta",
     "residual histogram",
 ]
+
+
+#: pyqtgraph axis-label style on the residual plot
+_AXIS_STYLE = {"color": theme.TEXT_HINT, "font-size": "10px",
+               "font-family": theme.UI_FONT}
+
+
+def _detach_controls(display) -> QWidget:
+    """Lift a StackDisplay's own control row (colormap, auto levels, and
+    the tracking view's high-pass) out of the display so it can sit on
+    the tab row. The widgets stay owned and wired by the display."""
+    tools = display.controls_layout.parentWidget()
+    display.layout().removeWidget(tools)
+    display.controls_layout.setContentsMargins(0, 0, 0, 0)
+    display.controls_layout.setSpacing(10)
+    for i in range(display.controls_layout.count()):
+        widget = display.controls_layout.itemAt(i).widget()
+        if isinstance(widget, QLabel):
+            widget.setProperty("role", "muted")
+    return tools
+
+
+def _model_row(title: str, *widgets: QWidget) -> QWidget:
+    """A row of the model card: a fixed-width name, the controls, and the
+    last control pushed to the right edge."""
+    holder = QWidget()
+    row = QHBoxLayout(holder)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(10)
+    name = theme.label(title, role="table")
+    name.setFixedWidth(66)
+    row.addWidget(name)
+    for widget in widgets[:-1]:
+        row.addWidget(widget)
+    row.addStretch(1)
+    row.addWidget(widgets[-1])
+    return holder
+
+
+class _ActiveBarDelegate(QStyledItemDelegate):
+    """Paints the 2 px champagne bar at the left of the selected row."""
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        if option.state & QStyle.StateFlag.State_Selected:
+            painter.fillRect(option.rect.left(), option.rect.top(), 2,
+                             option.rect.height(), theme.qcolor(theme.GOLD))
 
 
 class ReconWorker(QThread):
@@ -232,7 +280,7 @@ class TrackModelWindow(QMainWindow):
         super().__init__()
         self._stack: StackSource = (source if source is not None
                                     else LocalStackSource())
-        title = "TKtomo track model"
+        title = "TKtomo feature tracking"
         if self._stack.is_remote:
             title += f"  [stack on {self._stack.describe()}]"
         self.setWindowTitle(title)
@@ -276,6 +324,7 @@ class TrackModelWindow(QMainWindow):
         self._prefetch: ViewPrefetcher | None = None
 
         self.viewer = MarkableStackView()
+        theme.style_image_view(self.viewer.image_view)
         self.viewer.placeRequested.connect(self._place)
         self.viewer.deleteRequested.connect(self._delete_near)
         self.viewer.stepRequested.connect(self._step)
@@ -286,7 +335,9 @@ class TrackModelWindow(QMainWindow):
         self.slider.valueChanged.connect(self._set_view)
         self.view_box = QSpinBox()
         self.view_box.valueChanged.connect(self._set_view)
-        self.angle_label = QLabel("")
+        self.angle_label = theme.label("", role="gold", mono=True)
+        self.angle_label.setMinimumWidth(60)
+        self.angle_label.setToolTip("Projection angle of the shown view.")
         self.bin_combo = QComboBox()
         for k in (1, 2, 4, 8):
             self.bin_combo.addItem(str(k), k)
@@ -298,38 +349,59 @@ class TrackModelWindow(QMainWindow):
             "shrinks by the factor squared, which is what makes a slow "
             "link bearable.")
         self.bin_combo.currentIndexChanged.connect(self._bin_combo_changed)
+        # the view bar under the bezel: VIEW, slider, index, angle, BIN
         row = QHBoxLayout()
-        row.addWidget(QLabel("View:"))
+        row.setContentsMargins(20, 10, 20, 0)
+        row.setSpacing(14)
+        row.addWidget(theme.kicker("View"))
         row.addWidget(self.slider, 1)
+        self.view_box.setFixedWidth(64)
         row.addWidget(self.view_box)
         row.addWidget(self.angle_label)
-        row.addWidget(QLabel("bin:"))
-        row.addWidget(self.bin_combo)
+        row.addWidget(theme.vdivider())
+        bin_group = QHBoxLayout()
+        bin_group.setSpacing(8)
+        bin_group.addWidget(theme.kicker("Bin", role="hint"))
+        bin_group.addWidget(self.bin_combo)
+        row.addLayout(bin_group)
+        hint = theme.label("0 to 9 select feature · click or Space places · "
+                           "Del removes · ←/→ steps view", role="hint")
+        hint.setContentsMargins(20, 0, 20, 14)
+        self.bezel = theme.Bezel(self.viewer, "knurl")
         left = QWidget()
         left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.addWidget(self.viewer, 1)
-        row_w = QWidget()
-        row_w.setLayout(row)
-        left_layout.addWidget(row_w)
+        left_layout.setContentsMargins(18, 0, 18, 0)
+        left_layout.setSpacing(0)
+        left_layout.addWidget(self.bezel, 1)
+        left_layout.addLayout(row)
+        left_layout.addWidget(hint)
 
-        # top: projection viewer and recon slice as tabs; bottom: one
-        # residual plot, 3:1 by default; controls on the right
-        self.tabs = QTabWidget()
-        self.tabs.addTab(left, "Projection")
-        self.tabs.addTab(self._build_recon_panel(), "Recon slice")
+        # top: projection viewer and recon slice as segmented tabs in one
+        # card, each page with its own tools on the tab row; bottom: one
+        # residual plot, 3:1 by default; the control cards on the right
+        self.tabs = theme.SegmentedTabs()
+        self.tabs.addTab(left, "Projection", _detach_controls(self.viewer))
+        recon_page, recon_tools = self._build_recon_panel()
+        self.tabs.addTab(recon_page, "Recon slice", recon_tools)
+        viewer_card, viewer_card_layout = theme.card((0, 0, 0, 0), 0)
+        viewer_card_layout.addWidget(self.tabs)
         self.vsplitter = QSplitter(Qt.Orientation.Vertical)
-        self.vsplitter.addWidget(self.tabs)
+        self.vsplitter.addWidget(viewer_card)
         self.vsplitter.addWidget(self._build_plots_panel())
         self.vsplitter.setStretchFactor(0, 3)
         self.vsplitter.setStretchFactor(1, 1)
-        self.vsplitter.setSizes([660, 220])
+        self.vsplitter.setSizes([640, 240])
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self.vsplitter)
         splitter.addWidget(self._build_controls())
-        splitter.setSizes([1040, 420])
-        self.setCentralWidget(splitter)
+        splitter.setSizes([1040, 404])
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(14, 14, 14, 14)
+        central_layout.addWidget(splitter)
+        self.setCentralWidget(central)
         self._build_menu()
+        theme.install(self)
         self.resize(1500, 900)
 
         if path:
@@ -398,6 +470,48 @@ class TrackModelWindow(QMainWindow):
         menu.addSeparator()
         add("Quit", self.close, "Ctrl+Q")
 
+        # the menu bar is the title bar: wordmark on the left, the loaded
+        # dataset in a pill on the right
+        bar = self.menuBar()
+        # parented explicitly: setCornerWidget does not hand ownership
+        # over on the Python side, and an unowned widget is collected
+        wordmark = QWidget(bar)
+        mark_row = QHBoxLayout(wordmark)
+        mark_row.setContentsMargins(6, 0, 16, 0)
+        mark_row.setSpacing(10)
+        name = QLabel(f'T<span style="color:{theme.GOLD};">&nbsp;&amp;&nbsp;'
+                      "</span>K tomo")
+        name.setTextFormat(Qt.TextFormat.RichText)
+        name.setProperty("role", "wordmark")
+        name.setFont(theme.ui_font(17, 400, 0.4))
+        kick = QLabel("FEATURE TRACKING")
+        kick.setProperty("role", "kicker")
+        kick.setFont(theme.ui_font(10, 500, 2.4))
+        mark_row.addWidget(name)
+        mark_row.addWidget(kick)
+        bar.setCornerWidget(wordmark, Qt.Corner.TopLeftCorner)
+        pill = QFrame()
+        pill.setObjectName("pill")
+        pill_row = QHBoxLayout(pill)
+        pill_row.setContentsMargins(14, 5, 14, 5)
+        pill_row.setSpacing(9)
+        pill_row.addWidget(theme.Swatch(theme.BLUE, size=6, glow=True))
+        self.dataset_label = theme.label("no stack loaded", role="muted",
+                                         mono=True)
+        pill_row.addWidget(self.dataset_label)
+        holder = QWidget(bar)
+        holder_row = QHBoxLayout(holder)
+        holder_row.setContentsMargins(0, 0, 6, 0)
+        holder_row.addWidget(pill, 0, Qt.AlignmentFlag.AlignVCenter)
+        bar.setCornerWidget(holder, Qt.Corner.TopRightCorner)
+
+    def _refresh_dataset_pill(self, n: int, n_rows: int, n_cols: int) -> None:
+        path = self._source.get("path")
+        name = (Path(path).name if path
+                else str(self._source.get("kind") or "stack"))
+        self.dataset_label.setText(
+            f"{name} · {n} projections · {n_cols}×{n_rows}")
+
     def _build_plots_panel(self) -> QWidget:
         """One residual plot with a plot-kind dropdown. Default labels per view.
 
@@ -405,13 +519,10 @@ class TrackModelWindow(QMainWindow):
         turns the plot into navigation: see a gap or a bad point, click
         it, and you are looking at that projection.
         """
-        holder = QWidget()
-        layout = QVBoxLayout(holder)
-        layout.setContentsMargins(0, 0, 0, 0)
-        panes = QHBoxLayout()
-        layout.addLayout(panes, 1)
+        holder, layout = theme.card((18, 14, 18, 14), 8)
         self._plot_selectors: list[QComboBox] = []
         self._plot_widgets: list[pg.PlotWidget] = []
+        self._view_lines: list[pg.InfiniteLine] = []
         for default in ("labels per view",):
             combo = QComboBox()
             combo.addItems(PLOT_KINDS)
@@ -419,24 +530,28 @@ class TrackModelWindow(QMainWindow):
             combo.currentTextChanged.connect(
                 lambda _t: self._refresh_plots())
             plot = pg.PlotWidget()
-            plot.showGrid(x=True, y=True, alpha=0.3)
+            theme.style_plot(plot)
             plot.scene().sigMouseClicked.connect(
                 lambda ev, c=combo: self._plot_clicked(ev, c))
-            pane = QVBoxLayout()
             head = QHBoxLayout()
-            head.addWidget(QLabel("Residuals:"))
+            head.setSpacing(12)
+            head.addWidget(theme.title_label("Residuals"))
             head.addWidget(combo)
             head.addStretch(1)
-            pane.addLayout(head)
-            pane.addWidget(plot, 1)
-            panes.addLayout(pane, 1)
+            for color, shape, text in ((theme.BLUE, "dot", "labeled"),
+                                       (theme.GOLD_DATA, "dot", "one label"),
+                                       (theme.RED, "tick", "none")):
+                head.addWidget(theme.Swatch(color, shape=shape,
+                                            size=7 if shape == "dot" else 9))
+                head.addSpacing(-6)
+                head.addWidget(theme.label(text, role="muted"))
+            layout.addLayout(head)
+            layout.addWidget(theme.Bezel(plot, "well"), 1)
             self._plot_selectors.append(combo)
             self._plot_widgets.append(plot)
-        hint = QLabel("click in a plot to jump to the nearest frame; "
-                      "dots = labeled views (orange = only one label), "
-                      "red base ticks = views with NO labels")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
+        layout.addWidget(theme.label(
+            "Click the plot to jump to the nearest view. The pale line "
+            "is the view shown now.", role="hint", wrap=True))
         return holder
 
     def _plot_clicked(self, event, combo) -> None:
@@ -458,15 +573,21 @@ class TrackModelWindow(QMainWindow):
         deg = np.rad2deg(self._stack.angles)
         self._set_view(int(np.argmin(np.abs(deg - x_deg))))
 
-    def _build_recon_panel(self) -> QWidget:
+    def _build_recon_panel(self) -> tuple[QWidget, QWidget]:
+        """The recon slice page and its tool row for the tab bar."""
         from tktomo.ptycho_align.ui.panels.base import (  # noqa: PLC0415
             StackDisplay,
         )
-        holder = QWidget()
-        layout = QVBoxLayout(holder)
-        controls = QHBoxLayout()
-        self.live_recon = QCheckBox("Live (recompute on change)")
+        tools = QWidget()
+        controls = QHBoxLayout(tools)
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(12)
+        self.live_recon = QCheckBox("Live recompute")
         self.live_recon.setChecked(False)
+        self.live_recon.setToolTip(
+            "Recompute the slice whenever the model, the row or the bin "
+            "changes, debounced. Off by default because a gridrec slice "
+            "costs seconds on a real stack.")
         self.slice_row = QSpinBox()
         self.slice_row.valueChanged.connect(self._recon_maybe)
         self.recon_bin = QComboBox()
@@ -477,9 +598,11 @@ class TrackModelWindow(QMainWindow):
             "pixel), so 2 is much more than twice as fast; use it for "
             "live evaluation and go back to 1 for the final look.")
         self.recon_bin.currentTextChanged.connect(self._recon_maybe)
-        recon_btn = QPushButton("Reconstruct now")
+        recon_btn = QPushButton("Reconstruct")
+        theme.set_kind(recon_btn, "primary")
         recon_btn.clicked.connect(self._request_recon)
         self.line_btn = QPushButton("Draw line")
+        theme.set_kind(self.line_btn, "ghost")
         self.line_btn.setCheckable(True)
         self.line_btn.setToolTip(
             "While this is down, dragging with the left button in the "
@@ -490,18 +613,27 @@ class TrackModelWindow(QMainWindow):
             "it. Panning is unaffected while this is up.")
         self.line_btn.toggled.connect(self._line_mode_changed)
         controls.addWidget(self.live_recon)
-        controls.addWidget(QLabel("detector row:"))
+        controls.addWidget(theme.kicker("Row", role="hint"))
+        self.slice_row.setToolTip("Detector row the slice is cut at, on "
+                                  "the loaded grid.")
         controls.addWidget(self.slice_row)
-        controls.addWidget(QLabel("bin:"))
+        controls.addWidget(theme.kicker("Bin", role="hint"))
         controls.addWidget(self.recon_bin)
-        controls.addWidget(recon_btn)
         controls.addWidget(self.line_btn)
-        controls.addStretch(1)
-        layout.addLayout(controls)
-        self.recon_status = QLabel("")
-        layout.addWidget(self.recon_status)
+        controls.addWidget(recon_btn)
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 0, 18, 0)
+        layout.setSpacing(4)
         self.recon_display = StackDisplay()
         self.recon_display.auto_levels_box.setChecked(True)
+        theme.style_image_view(self.recon_display.image_view)
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(2, 0, 2, 0)
+        self.recon_status = theme.label("", role="hint", mono=True)
+        status_row.addWidget(self.recon_status, 1)
+        status_row.addWidget(_detach_controls(self.recon_display))
+        layout.addLayout(status_row)
         self.recon_display.image_view.scene.sigMouseClicked.connect(
             self._slice_clicked)
         self.recon_display.setToolTip(
@@ -531,8 +663,8 @@ class TrackModelWindow(QMainWindow):
             _orig(ev, axis)
 
         view_box.mouseDragEvent = drag
-        layout.addWidget(self.recon_display, 1)
-        return holder
+        layout.addWidget(theme.Bezel(self.recon_display, "ring"), 1)
+        return page, tools
 
     def _line_mode_changed(self, on: bool) -> None:
         box = self.recon_display.image_view.getView()
@@ -640,12 +772,28 @@ class TrackModelWindow(QMainWindow):
 
     def _build_controls(self) -> QWidget:
         panel = QWidget()
+        panel.setObjectName("controlsPanel")
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 4, 0)
+        layout.setSpacing(12)
 
-        feat_box = QGroupBox("Features (digit keys switch, click places)")
-        feat_layout = QVBoxLayout(feat_box)
+        feat_box, feat_layout = theme.card()
+        feat_layout.addWidget(theme.section_header(
+            "Features", "digits switch, click places"))
         self.feature_table = QTableWidget(0, len(FEATURE_COLUMNS))
-        self.feature_table.setHorizontalHeaderLabels(FEATURE_COLUMNS)
+        self.feature_table.setHorizontalHeaderLabels(
+            [c.upper() for c in FEATURE_COLUMNS])
+        self.feature_table.setShowGrid(False)
+        header = self.feature_table.horizontalHeader()
+        header.setHighlightSections(False)
+        header.setDefaultSectionSize(50)
+        header.resizeSection(COL_ID, 32)
+        header.resizeSection(COL_KIND, 96)
+        header.resizeSection(COL_N, 34)
+        header.resizeSection(COL_PIN, 34)
+        self.feature_table.verticalHeader().setDefaultSectionSize(26)
+        self.feature_table.setItemDelegateForColumn(
+            COL_ID, _ActiveBarDelegate(self.feature_table))
         self.feature_table.horizontalHeaderItem(COL_SIZE).setToolTip(
             "Marker diameter in image pixels. Match it to the feature: "
             "the fit weights each feature's labels by 1/size, because a "
@@ -693,6 +841,7 @@ class TrackModelWindow(QMainWindow):
         feat_layout.addLayout(feat_row)
         link_row = QHBoxLayout()
         link_btn = QPushButton("Link")
+        theme.set_kind(link_btn, "ghost")
         link_btn.setToolTip(
             "Join the selected rows into one sphere: they then share a "
             "centre and a diameter. Two members of the same kind cannot "
@@ -700,6 +849,7 @@ class TrackModelWindow(QMainWindow):
             "two opposite apexes are both labelled.")
         link_btn.clicked.connect(self._link_selected)
         unlink_btn = QPushButton("Unlink")
+        theme.set_kind(unlink_btn, "ghost")
         unlink_btn.setToolTip(
             "Take the selected rows out of their sphere. Each becomes its "
             "own body again, with its own centre and its own radius.")
@@ -708,9 +858,13 @@ class TrackModelWindow(QMainWindow):
         link_row.addWidget(unlink_btn)
         feat_layout.addLayout(link_row)
         adv_row = QHBoxLayout()
-        self.active_label = QLabel("active feature: 0")
+        adv_row.setSpacing(10)
+        self.active_dot = theme.Swatch(theme.FEATURE_PALETTE[0], size=9,
+                                       ring=True)
+        adv_row.addWidget(self.active_dot)
+        self.active_label = theme.label("Active feature 0", role="strong")
         adv_row.addWidget(self.active_label, 1)
-        adv_row.addWidget(QLabel("advance"))
+        adv_row.addWidget(theme.label("advance", role="hint"))
         self.advance_box = QSpinBox()
         self.advance_box.setRange(0, 100)
         self.advance_box.setValue(5)
@@ -718,7 +872,7 @@ class TrackModelWindow(QMainWindow):
             "How many views the viewer steps forward after each placed "
             "label. 0 stays on the current view.")
         adv_row.addWidget(self.advance_box)
-        adv_row.addWidget(QLabel("views/click"))
+        adv_row.addWidget(theme.label("views", role="hint"))
         feat_layout.addLayout(adv_row)
         self.ghost_box = QCheckBox("Ghost labels from other frames")
         self.ghost_box.setToolTip(
@@ -737,13 +891,17 @@ class TrackModelWindow(QMainWindow):
         feat_layout.addWidget(self.follow_box)
         layout.addWidget(feat_box)
 
-        auto_box = QGroupBox("Auto-track (manual labels are the anchors)")
-        auto_layout = QVBoxLayout(auto_box)
+        auto_box, auto_layout = theme.card()
+        auto_layout.addWidget(theme.section_header(
+            "Auto-track", "manual labels are anchors"))
         run_row = QHBoxLayout()
-        self.auto_feature_btn = QPushButton("Auto-complete feature")
+        self.auto_feature_btn = QPushButton("Complete feature")
+        self.auto_feature_btn.setToolTip(
+            "Auto-complete the active feature from its manual labels, "
+            "outward from each seed until the match quality drops.")
         self.auto_feature_btn.clicked.connect(
             lambda: self._auto_complete(False))
-        self.auto_all_btn = QPushButton("Auto-complete all")
+        self.auto_all_btn = QPushButton("Complete all")
         self.auto_all_btn.clicked.connect(lambda: self._auto_complete(True))
         self.auto_all_btn.setToolTip(
             "Every feature with at least 2 manual labels. Templates are "
@@ -753,7 +911,7 @@ class TrackModelWindow(QMainWindow):
         run_row.addWidget(self.auto_all_btn)
         auto_layout.addLayout(run_row)
         apex_row = QHBoxLayout()
-        apex_row.addWidget(QLabel("apex matcher"))
+        apex_row.addWidget(theme.label("apex matcher", role="hint"))
         self.apex_detector = QComboBox()
         self.apex_detector.addItem("edge correlation (1D)", "")
         for name in available_apex_detectors():
@@ -777,11 +935,11 @@ class TrackModelWindow(QMainWindow):
             warn = QLabel("apex detector plugin not loaded: "
                           + "; ".join(problems))
             warn.setWordWrap(True)
-            warn.setStyleSheet("color: rgb(220, 120, 60);")
+            warn.setProperty("role", "warn")
             auto_layout.addWidget(warn)
         param_row = QHBoxLayout()
         self._learned_ok, self._learned_why = self._stack.autotrack_available()
-        self.auto_thr_label = QLabel("min p")
+        self.auto_thr_label = theme.label("min p", role="hint")
         self.auto_min_corr = QDoubleSpinBox()
         self.auto_min_corr.setRange(0.05, 0.95)
         self.auto_min_corr.setSingleStep(0.05)
@@ -834,14 +992,17 @@ class TrackModelWindow(QMainWindow):
             lambda _i: self._refresh_auto_grid())
         param_row.addWidget(self.auto_thr_label)
         param_row.addWidget(self.auto_min_corr)
-        param_row.addWidget(QLabel("search"))
+        param_row.addWidget(theme.label("search", role="hint"))
         param_row.addWidget(self.auto_radius)
         param_row.addWidget(self.auto_fb)
-        param_row.addWidget(QLabel("track bin"))
-        param_row.addWidget(self.auto_bin_combo)
+        param_row.addStretch(1)
         auto_layout.addLayout(param_row)
-        self.auto_grid_label = QLabel("")
-        self.auto_grid_label.setWordWrap(True)
+        grid_row = QHBoxLayout()
+        grid_row.addWidget(theme.label("track bin", role="hint"))
+        grid_row.addWidget(self.auto_bin_combo)
+        grid_row.addStretch(1)
+        auto_layout.addLayout(grid_row)
+        self.auto_grid_label = theme.label("", role="hint", wrap=True)
         self.auto_grid_label.setToolTip(
             "What the next auto-complete run will do for the active "
             "feature. The tracking grid follows the marker size, not the "
@@ -850,7 +1011,7 @@ class TrackModelWindow(QMainWindow):
             "edge gate would refuse every seed.")
         auto_layout.addWidget(self.auto_grid_label)
         reject_row = QHBoxLayout()
-        self.auto_reject = QCheckBox("reject auto >")
+        self.auto_reject = QCheckBox("Reject auto >")
         self.auto_reject.setChecked(True)
         self.auto_reject.setToolTip(
             "After every fit, drop AUTO labels whose residual exceeds this "
@@ -862,33 +1023,40 @@ class TrackModelWindow(QMainWindow):
         self.auto_reject_k.setRange(1.0, 20.0)
         self.auto_reject_k.setSingleStep(0.5)
         self.auto_reject_k.setValue(3.0)
-        self.auto_reject_k.setSuffix(" x Huber")
+        self.auto_reject_k.setFixedWidth(76)
         self.auto_reject.toggled.connect(lambda _: self._request_fit())
         self.auto_reject_k.valueChanged.connect(lambda _: self._request_fit())
         reject_row.addWidget(self.auto_reject)
         reject_row.addWidget(self.auto_reject_k)
+        reject_row.addWidget(theme.label("× Huber", role="hint"))
         reject_row.addStretch(1)
         auto_layout.addLayout(reject_row)
         clear_row = QHBoxLayout()
-        clear_feat = QPushButton("Clear auto: feature")
+        clear_row.setSpacing(8)
+        clear_feat = QPushButton("Clear feature")
+        theme.set_kind(clear_feat, "ghost")
+        clear_feat.setToolTip("Remove the AUTO labels of the active "
+                              "feature. Manual labels stay.")
         clear_feat.clicked.connect(lambda: self._clear_auto(False))
-        clear_all = QPushButton("Clear auto: all")
+        clear_all = QPushButton("Clear all")
+        theme.set_kind(clear_all, "ghost")
+        clear_all.setToolTip("Remove every AUTO label of every feature. "
+                             "Manual labels stay.")
         clear_all.clicked.connect(lambda: self._clear_auto(True))
         self.auto_cancel_btn = QPushButton("Cancel")
+        theme.set_kind(self.auto_cancel_btn, "ghost")
         self.auto_cancel_btn.setEnabled(False)
         self.auto_cancel_btn.clicked.connect(self._cancel_autotrack)
-        clear_row.addWidget(clear_feat)
-        clear_row.addWidget(clear_all)
-        clear_row.addWidget(self.auto_cancel_btn)
+        clear_row.addWidget(clear_feat, 3)
+        clear_row.addWidget(clear_all, 3)
+        clear_row.addWidget(self.auto_cancel_btn, 2)
         auto_layout.addLayout(clear_row)
-        self.auto_status = QLabel("")
-        self.auto_status.setWordWrap(True)
+        self.auto_status = theme.label("", role="info", mono=True, wrap=True)
         auto_layout.addWidget(self.auto_status)
         self.auto_report = QPlainTextEdit()
+        self.auto_report.setObjectName("autoReport")
         self.auto_report.setReadOnly(True)
         self.auto_report.setMaximumHeight(120)
-        self.auto_report.setFont(QFontDatabase.systemFont(
-            QFontDatabase.SystemFont.FixedFont))
         self.auto_report.setPlaceholderText(
             "The last auto-complete run's report: grid, seeds, where the "
             "unlabelled views went, and what to do about the largest gap.")
@@ -900,9 +1068,11 @@ class TrackModelWindow(QMainWindow):
         auto_layout.addWidget(self.auto_report)
         layout.addWidget(auto_box)
 
-        model_box = QGroupBox("Model (check = fixed at the shown value)")
-        self._model_form = QFormLayout(model_box)
+        model_box, model_layout = theme.card()
+        model_layout.addWidget(theme.section_header("Model", "check = fixed"))
         deg_row = QHBoxLayout()
+        deg_row.setContentsMargins(0, 0, 0, 0)
+        deg_row.setSpacing(8)
         self.deg_c = QSpinBox()
         self.deg_a = QSpinBox()
         self.deg_b = QSpinBox()
@@ -910,21 +1080,25 @@ class TrackModelWindow(QMainWindow):
                            ("β", self.deg_b)):
             box.setRange(0, 4)
             box.valueChanged.connect(self._degrees_changed)
-            deg_row.addWidget(QLabel(f"deg {label}"))
-            deg_row.addWidget(box)
+            deg_row.addWidget(theme.chip(f"deg {label}", box))
         deg_row.addStretch(1)
         deg_holder = QWidget()
         deg_holder.setLayout(deg_row)
         deg_holder.setToolTip(
             "Polynomial degree in theta of the axis center c, the in-plane "
             "tilt alpha and the out-of-plane tilt beta.")
-        self._model_form.addRow("Degrees:", deg_holder)
+        model_layout.addWidget(deg_holder)
+        self._coef_layout = QVBoxLayout()
+        self._coef_layout.setContentsMargins(0, 0, 0, 0)
+        self._coef_layout.setSpacing(8)
+        model_layout.addLayout(self._coef_layout)
+        model_layout.addWidget(theme.divider())
         self._coef_rows: dict[str, list[tuple[QCheckBox, QDoubleSpinBox]]] = {
             "c": [], "alpha": [], "beta": []}
         self._rebuild_coef_rows()
-        self.free_dx = QCheckBox("dx free")
+        self.free_dx = QCheckBox("free")
         self.free_dx.setChecked(False)
-        self.free_dy = QCheckBox("dy free")
+        self.free_dy = QCheckBox("free")
         self.free_dy.setChecked(False)
         self.free_dx.setToolTip(
             "dx: one HORIZONTAL displacement of the whole projection per "
@@ -958,16 +1132,11 @@ class TrackModelWindow(QMainWindow):
             "Set every per-view vertical shift to zero (projections "
             "assumed vertically aligned). Combine with an unchecked "
             "'dy free' to keep zeros through the next fit.")
-        for label, check, zero in (("Shift dx:", self.free_dx, zero_dx),
-                                   ("Shift dy:", self.free_dy, zero_dy)):
+        for label, check, zero in (("Shift dx", self.free_dx, zero_dx),
+                                   ("Shift dy", self.free_dy, zero_dy)):
             check.toggled.connect(lambda _c: self._request_fit())
-            shift_row = QHBoxLayout()
-            shift_row.addWidget(check)
-            shift_row.addWidget(zero)
-            shift_row.addStretch(1)
-            shift_holder = QWidget()
-            shift_holder.setLayout(shift_row)
-            self._model_form.addRow(label, shift_holder)
+            theme.set_kind(zero, "ghost")
+            model_layout.addWidget(_model_row(label, check, zero))
         # Per-view rotations: the whole object tilting at a view. Same
         # free/frozen mechanism as the shifts, plus a Gaussian prior rms
         # each, because with few labels per view they are only weakly
@@ -975,21 +1144,21 @@ class TrackModelWindow(QMainWindow):
         self.free_rot: dict[str, QCheckBox] = {}
         self.rot_sigma: dict[str, QDoubleSpinBox] = {}
         rot_rows = (
-            ("rot_horiz", "Rot horiz:", "rot horiz free",
+            ("rot_horiz", "Rot horiz", "free",
              "Rotation of the whole object about the HORIZONTAL axis "
              "across the beam at that view (an out-of-plane tilt): the "
              "point's height picks up its depth along the beam, v changes "
              "by minus the angle times t. Not expressible in 2D, so the "
              "recon slice and the aligned export leave it out; the ASTRA "
              "vectors carry it exactly."),
-            ("rot_beam", "Rot beam:", "rot beam free",
+            ("rot_beam", "Rot beam", "free",
              "Rotation of the whole object about the BEAM at that view: an "
              "in-plane rotation of the image about the axis column at the "
              "top row, v changes by the angle times s and u by minus the "
              "angle times y. The recon slice and the aligned export undo "
              "it. It shares its lever with dy and y, so free dx and dy "
              "with it and label three or more features in the same views."),
-            ("rot_axis", "Rot axis:", "rot axis free",
+            ("rot_axis", "Rot axis", "free",
              "Rotation of the whole object about the ROTATION AXIS at that "
              "view: an increment of the projection angle, added to the "
              "nominal one (theta + rot axis), u changes by the angle times "
@@ -1027,28 +1196,23 @@ class TrackModelWindow(QMainWindow):
                 "Set this per-view angle to zero in every view. Combine "
                 "with the box unchecked to keep it there through the next "
                 "fit.")
-            row = QHBoxLayout()
-            row.addWidget(check)
-            row.addWidget(sigma)
-            row.addWidget(zero)
-            row.addStretch(1)
-            holder = QWidget()
-            holder.setLayout(row)
-            self._model_form.addRow(label, holder)
+            theme.set_kind(zero, "ghost")
+            model_layout.addWidget(_model_row(label, check, sigma, zero))
             self.free_rot[attr] = check
             self.rot_sigma[attr] = sigma
         # Frozen shifts are invisible state that changes what a fit means;
         # this line keeps them visible so "why does my fit depend on
         # earlier clicking" has an on-screen answer.
-        self.shift_state_label = QLabel("dx: zero   dy: zero")
-        self.shift_state_label.setWordWrap(True)
+        self.shift_state_label = theme.label("dx: zero   dy: zero",
+                                             role="hint", mono=True, wrap=True)
         self.shift_state_label.setToolTip(
             "Current content of the per-view shifts and rotations. 'free' "
             "is refitted from the labels every fit (history cannot "
             "matter); 'FROZEN' is held at the shown rms, which is whatever "
             "the last free fit left, so the fit DOES depend on that "
             "history until you press Zero.")
-        self._model_form.addRow("", self.shift_state_label)
+        model_layout.addWidget(self.shift_state_label)
+        model_layout.addWidget(theme.divider())
         self.huber = QDoubleSpinBox()
         self.huber.setRange(0.5, 20.0)
         self.huber.setValue(3.0)
@@ -1069,11 +1233,13 @@ class TrackModelWindow(QMainWindow):
             "rms). Twice the noise is four times the prior's pull.")
         self.noise_px.valueChanged.connect(lambda _v: self._request_fit())
         robust_row = QHBoxLayout()
-        robust_row.addWidget(QLabel("huber k"))
+        robust_row.setContentsMargins(0, 0, 0, 0)
+        robust_row.setSpacing(8)
+        robust_row.addWidget(theme.label("huber k", role="hint"))
         robust_row.addWidget(self.huber)
-        robust_row.addWidget(QLabel("iters"))
+        robust_row.addWidget(theme.label("iters", role="hint"))
         robust_row.addWidget(self.iters)
-        robust_row.addWidget(QLabel("label noise"))
+        robust_row.addWidget(theme.label("label noise", role="hint"))
         robust_row.addWidget(self.noise_px)
         robust_row.addStretch(1)
         robust_holder = QWidget()
@@ -1082,27 +1248,40 @@ class TrackModelWindow(QMainWindow):
             "Huber threshold k in units of the residual scale, the number "
             "of reweighting (IRLS) passes per fit, and the label noise the "
             "rotation priors are weighed against.")
-        self._model_form.addRow("Robust:", robust_holder)
+        model_layout.addWidget(robust_holder)
         layout.addWidget(model_box)
 
+        fit_box, fit_layout = theme.card()
         fit_row = QHBoxLayout()
-        fit_btn = QPushButton("Fit")
+        fit_row.setSpacing(10)
+        fit_btn = QPushButton("FIT")
+        fit_btn.setObjectName("fitButton")
+        theme.set_kind(fit_btn, "primary")
+        fit_btn.setFont(theme.ui_font(14, 600, 1.4))
+        fit_btn.setToolTip("Solve the model from the labels now. With "
+                           "Auto-fit on this also happens after every "
+                           "edit, debounced.")
         fit_btn.clicked.connect(self._fit_now)
         self.auto_fit = QCheckBox("Auto-fit")
         self.auto_fit.setChecked(True)
-        diag_btn = QPushButton("Run diagnostics")
+        diag_btn = QPushButton("Diagnostics")
+        diag_btn.setToolTip("Run the diagnostic checks on the current fit "
+                            "and show the report.")
         diag_btn.clicked.connect(self._run_diagnostics)
         outlier_btn = QPushButton("Worst outlier")
+        theme.set_kind(outlier_btn, "ghost")
         outlier_btn.setToolTip(
             "Jump to the label with the largest residual and make its "
             "feature active, ready to inspect or fix.")
         outlier_btn.clicked.connect(self._goto_worst_outlier)
-        fit_row.addWidget(fit_btn)
+        fit_row.addWidget(fit_btn, 13)
         fit_row.addWidget(self.auto_fit)
-        fit_row.addWidget(diag_btn)
-        layout.addLayout(fit_row)
+        fit_row.addWidget(diag_btn, 10)
+        fit_layout.addLayout(fit_row)
         fit_row = QHBoxLayout()
+        fit_row.setSpacing(8)
         unlabeled_btn = QPushButton("Next unlabelled")
+        theme.set_kind(unlabeled_btn, "ghost")
         unlabeled_btn.setToolTip(
             "Step forward (wrapping around) to the next projection that "
             "carries no label at all, always leaving the current one even "
@@ -1111,17 +1290,20 @@ class TrackModelWindow(QMainWindow):
             "without labels are where the per-view shifts are only "
             "interpolated, never measured.")
         unlabeled_btn.clicked.connect(self._goto_next_unlabelled)
-        fit_row.addWidget(outlier_btn)
-        fit_row.addWidget(unlabeled_btn)
-        layout.addLayout(fit_row)
+        fit_row.addWidget(outlier_btn, 1)
+        fit_row.addWidget(unlabeled_btn, 1)
+        fit_layout.addLayout(fit_row)
 
-        self.summary_label = QLabel("no fit yet")
-        self.summary_label.setWordWrap(True)
-        layout.addWidget(self.summary_label)
+        self.summary_label = theme.label("no fit yet", role="strong",
+                                         wrap=True)
+        fit_layout.addWidget(self.summary_label)
         self.warnings_box = QPlainTextEdit()
         self.warnings_box.setReadOnly(True)
-        self.warnings_box.setMaximumHeight(140)
-        layout.addWidget(self.warnings_box)
+        self.warnings_box.setMaximumHeight(100)
+        self.warnings_box.setPlaceholderText(
+            "Warnings from the last fit, each ending with what to do.")
+        fit_layout.addWidget(self.warnings_box)
+        layout.addWidget(fit_box)
 
         layout.addStretch(1)
 
@@ -1139,9 +1321,11 @@ class TrackModelWindow(QMainWindow):
 
     def _rebuild_coef_rows(self) -> None:
         """One (fixed-checkbox, value-spinbox) row per polynomial coefficient."""
-        for group, rows in self._coef_rows.items():
-            for check, spin in rows:
-                self._model_form.removeRow(check.parentWidget())
+        while self._coef_layout.count():
+            item = self._coef_layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        for rows in self._coef_rows.values():
             rows.clear()
         degrees = (self.deg_c.value(), self.deg_a.value(), self.deg_b.value())
         for group, symbol, degree, decimals, step in (
@@ -1159,14 +1343,19 @@ class TrackModelWindow(QMainWindow):
                 spin.setDecimals(decimals)
                 spin.setRange(-1e6, 1e6)
                 spin.setSingleStep(step)
+                spin.setAlignment(Qt.AlignmentFlag.AlignRight)
                 spin.valueChanged.connect(self._coef_edited)
                 check.toggled.connect(lambda _c: self._request_fit())
-                row = QHBoxLayout()
+                holder = QWidget()
+                row = QHBoxLayout(holder)
+                row.setContentsMargins(0, 0, 0, 0)
+                row.setSpacing(10)
+                name = theme.label(f"{symbol}[{k}]", role="table", mono=True)
+                name.setFixedWidth(40)
+                row.addWidget(name)
                 row.addWidget(check)
                 row.addWidget(spin, 1)
-                holder = QWidget()
-                holder.setLayout(row)
-                self._model_form.addRow(f"{symbol}[{k}]", holder)
+                self._coef_layout.addWidget(holder)
                 self._coef_rows[group].append((check, spin))
 
     def _degrees_changed(self) -> None:
@@ -1317,7 +1506,8 @@ class TrackModelWindow(QMainWindow):
 
     def _set_active(self, fid: int) -> None:
         self._active = int(fid)
-        self.active_label.setText(f"active feature: {self._active}")
+        self.active_label.setText(f"Active feature {self._active}")
+        self.active_dot.set_color(feature_color(self._group_of(self._active)))
         self._refresh_view()
         self._refresh_auto_grid()
 
@@ -1966,8 +2156,9 @@ class TrackModelWindow(QMainWindow):
             return
         view = self._view
         self.angle_label.setText(
-            f"{np.rad2deg(self._stack.angles[view]):7.2f}°")
+            f"{np.rad2deg(self._stack.angles[view]):.1f}°")
         self.viewer.set_image(self._stack.view(view))
+        self._place_view_lines()
 
         sizes = {fid: self._feature_size(fid)
                  for fid in self._labels.feature_ids()}
@@ -2111,7 +2302,8 @@ class TrackModelWindow(QMainWindow):
                 id_item = QTableWidgetItem(str(fid))
                 id_item.setFlags(Qt.ItemFlag.ItemIsEnabled
                                  | Qt.ItemFlag.ItemIsSelectable)
-                id_item.setBackground(pg.mkBrush(*feature_color(key), 120))
+                id_item.setForeground(pg.mkBrush(*feature_color(key)))
+                id_item.setFont(theme.mono_font(11, 500))
                 table.setItem(row, COL_ID, id_item)
 
                 combo = table.cellWidget(row, COL_KIND)
@@ -2257,9 +2449,26 @@ class TrackModelWindow(QMainWindow):
     def _refresh_plots(self) -> None:
         if self._stack.info() is None:
             return
+        self._view_lines.clear()
         for combo, plot in zip(self._plot_selectors, self._plot_widgets):
             plot.clear()
             self._render_plot(combo.currentText(), plot)
+            # the view shown now, so a click in the plot and the frame
+            # under the pointer can be related at a glance
+            line = pg.InfiniteLine(
+                angle=90, movable=False,
+                pen=pg.mkPen(theme.rgba(theme.GOLD_LIGHTER, 90), width=1))
+            line.setVisible(combo.currentText() != "residual histogram")
+            plot.addItem(line)
+            self._view_lines.append(line)
+        self._place_view_lines()
+
+    def _place_view_lines(self) -> None:
+        if self._stack.info() is None or not self._view_lines:
+            return
+        deg = float(np.rad2deg(self._stack.angles[self._view]))
+        for line in self._view_lines:
+            line.setPos(deg)
 
     def _label_counts_per_view(self) -> np.ndarray:
         return self._labels.counts_per_view(self._stack.angles.size)
@@ -2272,25 +2481,26 @@ class TrackModelWindow(QMainWindow):
         label exists (the shift is pure interpolation)."""
         deg = np.rad2deg(self._stack.angles)
         counts = self._label_counts_per_view()
-        plot.setLabel("left", f"{name} [{unit}]")
-        plot.setLabel("bottom", "angle [deg]")
-        plot.plot(deg, values, pen=pg.mkPen(*color, 90, width=1,
+        plot.setLabel("left", f"{name} [{unit}]", **_AXIS_STYLE)
+        plot.setLabel("bottom", "angle [deg]", **_AXIS_STYLE)
+        plot.plot(deg, values, pen=pg.mkPen(*color, 120, width=1.5,
                                             style=Qt.PenStyle.DashLine))
         solid = observed & (counts >= 2)
         thin = observed & (counts == 1)
         if solid.any():
             plot.plot(deg[solid], values[solid], pen=None, symbol="o",
-                      symbolSize=5, symbolBrush=color, symbolPen=None)
+                      symbolSize=5, symbolBrush=theme.rgb(theme.BLUE),
+                      symbolPen=None)
         if thin.any():
             plot.plot(deg[thin], values[thin], pen=None, symbol="o",
-                      symbolSize=5, symbolBrush=(255, 140, 0),
+                      symbolSize=5, symbolBrush=theme.rgb(theme.GOLD_DATA),
                       symbolPen=None)
         missing = counts == 0
         if missing.any() and values.size:
             base = float(values.min()) - 0.08 * (float(np.ptp(values)) or 1.0)
             plot.plot(deg[missing], np.full(int(missing.sum()), base),
                       pen=None, symbol="t1", symbolSize=6,
-                      symbolBrush=(255, 60, 60), symbolPen=None)
+                      symbolBrush=theme.rgb(theme.RED), symbolPen=None)
 
     def _render_plot(self, kind: str, plot) -> None:
         deg = np.rad2deg(self._stack.angles)
@@ -2298,17 +2508,18 @@ class TrackModelWindow(QMainWindow):
 
         if kind == "labels per view":
             counts = self._label_counts_per_view()
-            plot.setLabel("left", "labels in view")
-            plot.setLabel("bottom", "angle [deg]")
-            plot.plot(deg, counts, pen=pg.mkPen((200, 200, 200), width=1),
+            plot.setLabel("left", "labels in view", **_AXIS_STYLE)
+            plot.setLabel("bottom", "angle [deg]", **_AXIS_STYLE)
+            plot.plot(deg, counts,
+                      pen=pg.mkPen(theme.rgb(theme.TEXT_MUTED), width=1),
                       symbol="o", symbolSize=4,
-                      symbolBrush=(200, 200, 200), symbolPen=None)
+                      symbolBrush=theme.rgb(theme.BLUE), symbolPen=None)
             missing = counts == 0
             if missing.any():
                 plot.plot(deg[missing], np.zeros(int(missing.sum())),
                           pen=None, symbol="t1", symbolSize=7,
-                          symbolBrush=(255, 60, 60), symbolPen=None)
-            plot.addLine(y=2, pen=pg.mkPen((255, 140, 0, 120),
+                          symbolBrush=theme.rgb(theme.RED), symbolPen=None)
+            plot.addLine(y=2, pen=pg.mkPen(theme.rgba(theme.GOLD_DATA, 140),
                                            style=Qt.PenStyle.DashLine))
             return
 
@@ -2320,14 +2531,15 @@ class TrackModelWindow(QMainWindow):
 
         if kind == "dx shifts":
             self._render_shift_plot(plot, model.dx, fit.observed_dx,
-                                    (255, 200, 0), "dx")
+                                    theme.rgb(theme.GOLD_LIGHT), "dx")
         elif kind == "dy shifts":
             self._render_shift_plot(plot, model.dy, fit.observed_dy,
-                                    (0, 200, 255), "dy")
+                                    theme.rgb(theme.BLUE_INFO), "dy")
         elif kind in ("rot horiz", "rot beam", "rot axis"):
             attr = kind.replace(" ", "_")
-            color = {"rot horiz": (255, 120, 200), "rot beam": (120, 255, 120),
-                     "rot axis": (200, 160, 255)}[kind]
+            color = {"rot horiz": theme.rgb("#c78ad6"),
+                     "rot beam": theme.rgb("#3fd6c4"),
+                     "rot axis": theme.rgb(theme.BLUE_INFO)}[kind]
             self._render_shift_plot(plot, np.rad2deg(getattr(model, attr)),
                                     fit.observed_views, color, kind,
                                     unit="deg")
@@ -2336,43 +2548,46 @@ class TrackModelWindow(QMainWindow):
                 res, fi_idx, vj = fit.residual_u, iu, ju
             else:
                 res, fi_idx, vj = fit.residual_v, iv, jv
-            plot.setLabel("left", f"{kind} [raw px]")
-            plot.setLabel("bottom", "angle [deg]")
+            plot.setLabel("left", f"{kind} [raw px]", **_AXIS_STYLE)
+            plot.setLabel("bottom", "angle [deg]", **_AXIS_STYLE)
             brushes = [pg.mkBrush(*feature_color(
                 self._group_of(int(model.feature_ids[fi])))) for fi in fi_idx]
             plot.plot(deg[vj], res, pen=None, symbol="o", symbolSize=5,
                       symbolBrush=brushes, symbolPen=None)
-            plot.addLine(y=0, pen=pg.mkPen((255, 255, 255, 60)))
+            plot.addLine(y=0, pen=pg.mkPen(theme.rgba(theme.GOLD_LIGHTER, 90)))
         elif kind == "per-view spread":
             from tktomo.tracking.diagnostics import (  # noqa: PLC0415
                 per_view_spread,
             )
-            plot.setLabel("left", "MAD [raw px], u yellow / v cyan")
-            plot.setLabel("bottom", "angle [deg]")
-            for res, vj, color in ((fit.residual_u, ju, (255, 200, 0)),
-                                   (fit.residual_v, jv, (0, 200, 255))):
+            plot.setLabel("left", "MAD [raw px], u gold / v blue", **_AXIS_STYLE)
+            plot.setLabel("bottom", "angle [deg]", **_AXIS_STYLE)
+            for res, vj, color in ((fit.residual_u, ju, theme.GOLD_LIGHT),
+                                   (fit.residual_v, jv, theme.BLUE)):
                 spread = per_view_spread(res, vj, model.theta.size)
                 good = np.isfinite(spread)
                 plot.plot(deg[good], spread[good],
-                          pen=pg.mkPen(color, width=1.5))
-            plot.addLine(y=1.0, pen=pg.mkPen((255, 80, 80, 120),
+                          pen=pg.mkPen(theme.rgb(color), width=1.5))
+            plot.addLine(y=1.0, pen=pg.mkPen(theme.rgba(theme.RED, 140),
                                              style=Qt.PenStyle.DashLine))
         elif kind == "axis center c":
-            plot.setLabel("left", "c [raw px]")
-            plot.setLabel("bottom", "angle [deg]")
+            plot.setLabel("left", "c [raw px]", **_AXIS_STYLE)
+            plot.setLabel("bottom", "angle [deg]", **_AXIS_STYLE)
             c_of, _, _ = model.axis_curves()
-            plot.plot(deg, c_of, pen=pg.mkPen((255, 255, 255), width=1.5))
+            plot.plot(deg, c_of, pen=pg.mkPen(theme.rgb(theme.GOLD_LIGHTEST),
+                                              width=1.5))
         elif kind == "tilts alpha/beta":
-            plot.setLabel("left", "tilt [rad], alpha yellow / beta cyan")
-            plot.setLabel("bottom", "angle [deg]")
+            plot.setLabel("left", "tilt [rad], alpha gold / beta blue", **_AXIS_STYLE)
+            plot.setLabel("bottom", "angle [deg]", **_AXIS_STYLE)
             _, alpha_of, beta_of = model.axis_curves()
-            plot.plot(deg, alpha_of, pen=pg.mkPen((255, 200, 0), width=1.5))
-            plot.plot(deg, beta_of, pen=pg.mkPen((0, 200, 255), width=1.5))
+            plot.plot(deg, alpha_of, pen=pg.mkPen(theme.rgb(theme.GOLD_LIGHT),
+                                                  width=1.5))
+            plot.plot(deg, beta_of, pen=pg.mkPen(theme.rgb(theme.BLUE),
+                                                 width=1.5))
         elif kind == "residual histogram":
-            plot.setLabel("left", "count, u yellow / v cyan")
-            plot.setLabel("bottom", "residual [raw px]")
-            for res, color in ((fit.residual_u, (255, 200, 0, 140)),
-                               (fit.residual_v, (0, 200, 255, 140))):
+            plot.setLabel("left", "count, u gold / v blue", **_AXIS_STYLE)
+            plot.setLabel("bottom", "residual [raw px]", **_AXIS_STYLE)
+            for res, color in ((fit.residual_u, theme.rgba(theme.GOLD_LIGHT, 140)),
+                               (fit.residual_v, theme.rgba(theme.BLUE, 140))):
                 if res.size:
                     # a perfect fit has (near-)zero range; bins must stay
                     # representable against the residuals' magnitude
@@ -2480,7 +2695,8 @@ class TrackModelWindow(QMainWindow):
             if worker is not None:
                 worker.set_source(self._stack)
         self._sync_prefetch()
-        n, n_rows, _ = self._stack.shape
+        n, n_rows, n_cols = self._stack.shape
+        self._refresh_dataset_pill(n, n_rows, n_cols)
         self.slider.setMaximum(n - 1)
         self.view_box.setMaximum(n - 1)
         self.slice_row.setMaximum(n_rows - 1)
@@ -2814,6 +3030,9 @@ def main() -> int:
     args = parser.parse_args()
 
     def build():
+        from PySide6.QtWidgets import QApplication  # noqa: PLC0415
+
+        theme.apply(QApplication.instance())
         source = None
         if args.connect:
             from tktomo.tracking.remote import RemoteStackSource  # noqa: PLC0415

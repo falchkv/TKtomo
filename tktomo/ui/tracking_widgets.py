@@ -39,14 +39,12 @@ from PySide6.QtWidgets import (
 
 from tktomo.ptycho_align.ui.panels.base import StackDisplay
 from tktomo.tracking.coords import CoordinateChain
+from tktomo.ui import theme
 
-# Qualitative palette (ColorBrewer Set1 + extras): distinct on both dark
-# and light image content. Feature id -> color by modulo.
-FEATURE_COLORS = [
-    (228, 26, 28), (55, 126, 184), (77, 175, 74), (152, 78, 163),
-    (255, 127, 0), (255, 255, 51), (166, 86, 40), (247, 129, 191),
-    (153, 153, 153), (0, 210, 210),
-]
+# The theme's feature palette (teal, anodised blue, data gold, orchid,
+# then six more that stay apart on a dark canvas). Feature id -> colour
+# by modulo.
+FEATURE_COLORS = [theme.rgb(c) for c in theme.FEATURE_PALETTE]
 
 
 def feature_color(feature_id: int) -> tuple[int, int, int]:
@@ -118,10 +116,11 @@ class MarkableStackView(StackDisplay):
         # SCREEN px: at data scale it would be the size of the bubble
         self._tangent_scatter = pg.ScatterPlotItem(pxMode=True)
         self._spheres = pg.PlotDataItem(
-            pen=pg.mkPen((255, 255, 255, 110), width=1,
+            pen=pg.mkPen(theme.rgba(theme.BLUE_INFO, 140), width=1,
                          style=Qt.PenStyle.DashLine))
         self._pred_scatter = pg.ScatterPlotItem(
-            size=11, symbol="x", pen=pg.mkPen((255, 255, 255, 200), width=1.5),
+            size=11, symbol="x",
+            pen=pg.mkPen(theme.rgba(theme.GOLD_LIGHTEST, 200), width=1.5),
             brush=None, pxMode=True)
         self._probe_scatter = pg.ScatterPlotItem(
             size=16, symbol="d", pen=pg.mkPen((255, 0, 255), width=2),
@@ -134,11 +133,13 @@ class MarkableStackView(StackDisplay):
             symbol="s", symbolSize=8,
             symbolPen=pg.mkPen((255, 0, 255), width=2),
             symbolBrush=None)
+        # the active feature's path across the views: pale champagne,
+        # dashed 5 on 4 off, as the handoff draws it
         self._trajectory = pg.PlotDataItem(
-            pen=pg.mkPen((255, 255, 0, 160), width=1.5,
-                         style=Qt.PenStyle.DashLine))
+            pen=pg.mkPen(theme.rgba(theme.GOLD_LIGHTER, 204), width=1.5,
+                         style=Qt.PenStyle.CustomDashLine, dash=[5, 4]))
         self._crop_rect = pg.PlotDataItem(
-            pen=pg.mkPen((0, 255, 255, 200), width=1.5))
+            pen=pg.mkPen(theme.rgba(theme.BLUE, 220), width=1.5))
         self._texts: list[pg.TextItem] = []
         for item in (self._trajectory, self._crop_rect, self._spheres,
                      self._ghost_scatter,
@@ -277,6 +278,7 @@ class MarkableStackView(StackDisplay):
                 })
             if not kind:      # auto labels stay untagged: less clutter
                 text = pg.TextItem(str(fid), color=color, anchor=(0.5, 1.3))
+                text.setFont(theme.mono_font(12, 500))
                 text.setPos(u, v)
                 text.setZValue(11)
                 view.addItem(text)

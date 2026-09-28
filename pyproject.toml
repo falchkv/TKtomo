@@ -86,6 +86,8 @@ include = ["tktomo*"]
 
 [tool.setuptools.package-data]
 "tktomo.tracking" = ["data/*.joblib"]
+# the tracking UIs' theme: icons and the bundled Jost / IBM Plex Mono fonts
+"tktomo.ui" = ["assets/*.svg", "assets/fonts/*.ttf", "assets/fonts/*.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

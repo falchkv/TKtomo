@@ -171,8 +171,8 @@ dedicated test.
 ## Auto-completing tracks
 
 Label a feature manually in a handful of views (at least 2), then
-"Auto-complete feature" (or "Auto-complete all" for every feature with
-2+ manual labels) fills the views around each manual label by template
+"Complete feature" in the Auto-track card (or "Complete all" for every
+feature with 2+ manual labels) fills the views around each manual label by template
 matching, on a background worker with progress and cancel. The design
 follows what tilt-series tools (IMOD Beadtrack) and trackers (TrackMate,
 KLT) converge on, tuned with numbers measured on this very dataset in
@@ -277,8 +277,8 @@ Auto labels are drawn as HOLLOW circles (same color and size), carry
 their match quality, and enter the fit at full weight: the Huber loop
 and the Worst-outlier button are the review path. A manual click always
 overwrites an auto label; the auto-tracker never touches a manual one;
-re-running replaces only auto labels; "Clear auto" undoes the machine's
-work in bulk. Not supported on per-view-cropped (feature-isolation)
+re-running replaces only auto labels; "Clear feature" and "Clear all"
+undo the machine's work in bulk. Not supported on per-view-cropped (feature-isolation)
 stacks, whose windows already follow the feature.
 
 A structural benefit: auto-completion populates many features across the
@@ -373,7 +373,7 @@ both):
   the fit; the shifts absorb it (warning W3). Fix the shifts too if you
   want the fixed value to mean something.
 
-`Run diagnostics` fits disjoint halves of the features separately and
+`Diagnostics` (in the Fit card) fits disjoint halves of the features separately and
 reports the disagreement (center, tilts, shift curves, the three rotation
 curves in degrees) plus held-out residuals. The half-split is the number
 to trust; the parametric sigma is shown but loses every argument with it.
